@@ -1928,12 +1928,12 @@ Parser::DeclGroupPtrTy Parser::ParseDeclaration(unsigned Context,
   switch (Tok.getKind()) {
   case tok::kw_template:
     // HLSL Change Starts
-    if (getLangOpts().HLSL) {
+    /*if (getLangOpts().HLSL) {
       Diag(Tok, diag::err_hlsl_reserved_keyword) << Tok.getName();
       SkipMalformedDecl();
       return DeclGroupPtrTy();
     }
-    // HLSL Change Ends
+    // HLSL Change Ends*/
     ProhibitAttributes(attrs);
     SingleDecl = ParseDeclarationStartingWithTemplate(Context, DeclEnd);
     break;

@@ -717,6 +717,8 @@ void SpirvEmitter::doDecl(const Decl *decl) {
     doHLSLBufferDecl(bufferDecl);
   } else if (const auto *recordDecl = dyn_cast<RecordDecl>(decl)) {
     doRecordDecl(recordDecl);
+  } else if (const auto *recordDecl = dyn_cast<ClassTemplateDecl>(decl)) {//zhouhe
+    return;
   } else {
     emitError("decl type %0 unimplemented", decl->getLocation())
         << decl->getDeclKindName();

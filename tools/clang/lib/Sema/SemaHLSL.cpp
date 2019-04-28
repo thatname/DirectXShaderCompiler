@@ -3547,8 +3547,8 @@ public:
         return AR_TOBJ_MATRIX;
       else if (decl == m_vectorTemplateDecl)
         return AR_TOBJ_VECTOR;
-      DXASSERT(decl->isImplicit(), "otherwise object template decl is not set to implicit");
-      return AR_TOBJ_OBJECT;
+      //DXASSERT(decl->isImplicit(), "otherwise object template decl is not set to implicit");//zhouhe
+      return AR_TOBJ_COMPOUND;//zhouhe
     }
 
     if (typeRecordDecl && typeRecordDecl->isImplicit()) {
@@ -10227,12 +10227,16 @@ bool FlattenedTypeIterator::pushTrackerForType(QualType type, MultiExprArg::iter
     m_typeTrackers.push_back(FlattenedTypeIterator::FlattenedTypeTracker(type, 1, expression));
     return true;
   case ArTypeObjectKind::AR_TOBJ_COMPOUND: {
-    recordType = type->getAsStructureType();
+    RecordDecl *cxxRecordDecl = type->getAsCXXRecordDecl(); // zhouhe
+    /*recordType = type->getAsStructureType();
     if (recordType == nullptr)
       recordType = dyn_cast<RecordType>(type.getTypePtr());
-
-    fi = recordType->getDecl()->field_begin();
-    fe = recordType->getDecl()->field_end();
+    if (recordType == nullptr)
+      decl = recordType->getDecl();
+    else
+      decl = type->getAsCXXRecordDecl();*/
+    fi = cxxRecordDecl->field_begin();
+    fe = cxxRecordDecl->field_end();
 
     bool bAddTracker = false;
 
@@ -10244,8 +10248,8 @@ bool FlattenedTypeIterator::pushTrackerForType(QualType type, MultiExprArg::iter
       bAddTracker = true;
     }
 
-    if (CXXRecordDecl *cxxRecordDecl =
-            dyn_cast<CXXRecordDecl>(recordType->getDecl())) {
+    /*if (CXXRecordDecl *cxxRecordDecl =
+            dyn_cast<CXXRecordDecl>(recordType->getDecl())) */{//zhouhe
       // We'll error elsewhere if the record has no definition,
       // just don't attempt to use it.
       if (cxxRecordDecl->hasDefinition()) {
