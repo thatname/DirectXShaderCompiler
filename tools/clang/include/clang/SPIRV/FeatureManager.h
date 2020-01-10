@@ -36,12 +36,15 @@ enum class Extension {
   KHR_post_depth_coverage,
   EXT_descriptor_indexing,
   EXT_fragment_fully_covered,
+  EXT_fragment_invocation_density,
   EXT_shader_stencil_export,
   EXT_shader_viewport_index_layer,
   AMD_gpu_shader_half_float,
   AMD_shader_explicit_vertex_parameter,
   GOOGLE_hlsl_functionality1,
+  GOOGLE_user_type,
   NV_ray_tracing,
+  NV_mesh_shader,
   Unknown,
 };
 

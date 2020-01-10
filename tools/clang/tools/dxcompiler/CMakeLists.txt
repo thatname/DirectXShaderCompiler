@@ -114,6 +114,7 @@ set(GENERATED_HEADERS
   )
 
 add_clang_library(dxcompiler SHARED ${SOURCES})
+add_dependencies(dxcompiler TablegenHLSLOptions) 
 if (WIN32)
   # No DxcEtw on non-Windows platforms.
   add_dependencies(dxcompiler DxcEtw)
@@ -129,5 +130,3 @@ set_target_properties(dxcompiler
   OUTPUT_NAME "dxcompiler"
   VERSION ${LIBCLANG_LIBRARY_VERSION}
   DEFINE_SYMBOL _CINDEX_LIB_)
-
-hlsl_update_product_ver("dxcompiler")

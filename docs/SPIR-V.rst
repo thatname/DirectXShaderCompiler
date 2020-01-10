@@ -234,6 +234,19 @@ To use Vulkan specialization constants, annotate global constants with the
   [[vk::constant_id(2)]] const int   specConstInt   = 42;
   [[vk::constant_id(3)]] const float specConstFloat = 1.5;
 
+Shader Record Buffer
+~~~~~~~~~~~~~~~~~~~~
+
+SPV_NV_ray_tracing exposes user managed buffer in shader binding table by
+using storage class ShaderRecordBufferNV. ConstantBuffer or cbuffer blocks
+can now be mapped to this storage class under HLSL by using
+``[[vk::shader_record_nv]]`` annotation. It is applicable only on ConstantBuffer
+and cbuffer declarations.
+
+Please note as per the requirements of VK_NV_ray_tracing, "there must be no
+more than one shader_record_nv block statically used per shader entry point
+otherwise results are undefined."
+
 Builtin variables
 ~~~~~~~~~~~~~~~~~
 
@@ -251,6 +264,7 @@ Right now the following ``<builtin>`` are supported:
   Need ``SPV_KHR_shader_draw_parameters`` extension.
 * ``DeviceIndex``: The GLSL equivalent is ``gl_DeviceIndex``.
   Need ``SPV_KHR_device_group`` extension.
+* ``ViewportMaskNV``: The GLSL equivalent is ``gl_ViewportMask``.
 
 Please see Vulkan spec. `14.6. Built-In Variables <https://www.khronos.org/registry/vulkan/specs/1.1-extensions/html/vkspec.html#interfaces-builtin-variables>`_
 for detailed explanation of these builtins.
@@ -265,9 +279,11 @@ Supported extensions
 * SPV_KHR_shader_draw_parameters
 * SPV_EXT_descriptor_indexing
 * SPV_EXT_fragment_fully_covered
+* SPV_EXT_fragment_invocation_density
 * SPV_EXT_shader_stencil_support
 * SPV_AMD_shader_explicit_vertex_parameter
 * SPV_GOOGLE_hlsl_functionality1
+* SPV_NV_mesh_shader
 
 Vulkan specific attributes
 --------------------------
@@ -1258,14 +1274,16 @@ some system-value (SV) semantic strings will be translated into SPIR-V
 |                           | HSCPOut     | ``Position``             | N/A                   | ``Shader``                  |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
 |                           | DSCPIn      | ``Position``             | N/A                   | ``Shader``                  |
-| SV_Position               +-------------+--------------------------+-----------------------+-----------------------------+
-|                           | DSOut       | ``Position``             | N/A                   | ``Shader``                  |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+| SV_Position               | DSOut       | ``Position``             | N/A                   | ``Shader``                  |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
 |                           | GSVIn       | ``Position``             | N/A                   | ``Shader``                  |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
 |                           | GSOut       | ``Position``             | N/A                   | ``Shader``                  |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
 |                           | PSIn        | ``FragCoord``            | N/A                   | ``Shader``                  |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+|                           | MSOut       | ``Position``             | N/A                   | ``Shader``                  |
 +---------------------------+-------------+--------------------------+-----------------------+-----------------------------+
 |                           | VSOut       | ``ClipDistance``         | N/A                   | ``ClipDistance``            |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
@@ -1274,14 +1292,16 @@ some system-value (SV) semantic strings will be translated into SPIR-V
 |                           | HSCPOut     | ``ClipDistance``         | N/A                   | ``ClipDistance``            |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
 |                           | DSCPIn      | ``ClipDistance``         | N/A                   | ``ClipDistance``            |
-| SV_ClipDistance           +-------------+--------------------------+-----------------------+-----------------------------+
-|                           | DSOut       | ``ClipDistance``         | N/A                   | ``ClipDistance``            |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+| SV_ClipDistance           | DSOut       | ``ClipDistance``         | N/A                   | ``ClipDistance``            |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
 |                           | GSVIn       | ``ClipDistance``         | N/A                   | ``ClipDistance``            |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
 |                           | GSOut       | ``ClipDistance``         | N/A                   | ``ClipDistance``            |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
 |                           | PSIn        | ``ClipDistance``         | N/A                   | ``ClipDistance``            |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+|                           | MSOut       | ``ClipDistance``         | N/A                   | ``ClipDistance``            |
 +---------------------------+-------------+--------------------------+-----------------------+-----------------------------+
 |                           | VSOut       | ``CullDistance``         | N/A                   | ``CullDistance``            |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
@@ -1290,14 +1310,16 @@ some system-value (SV) semantic strings will be translated into SPIR-V
 |                           | HSCPOut     | ``CullDistance``         | N/A                   | ``CullDistance``            |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
 |                           | DSCPIn      | ``CullDistance``         | N/A                   | ``CullDistance``            |
-| SV_CullDistance           +-------------+--------------------------+-----------------------+-----------------------------+
-|                           | DSOut       | ``CullDistance``         | N/A                   | ``CullDistance``            |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+| SV_CullDistance           | DSOut       | ``CullDistance``         | N/A                   | ``CullDistance``            |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
 |                           | GSVIn       | ``CullDistance``         | N/A                   | ``CullDistance``            |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
 |                           | GSOut       | ``CullDistance``         | N/A                   | ``CullDistance``            |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
 |                           | PSIn        | ``CullDistance``         | N/A                   | ``CullDistance``            |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+|                           | MSOut       | ``CullDistance``         | N/A                   | ``CullDistance``            |
 +---------------------------+-------------+--------------------------+-----------------------+-----------------------------+
 | SV_VertexID               | VSIn        | ``VertexIndex``          | N/A                   | ``Shader``                  |
 +---------------------------+-------------+--------------------------+-----------------------+-----------------------------+
@@ -1311,13 +1333,29 @@ some system-value (SV) semantic strings will be translated into SPIR-V
 +---------------------------+-------------+--------------------------+-----------------------+-----------------------------+
 | SV_IsFrontFace            | PSIn        | ``FrontFacing``          | N/A                   | ``Shader``                  |
 +---------------------------+-------------+--------------------------+-----------------------+-----------------------------+
-| SV_DispatchThreadID       | CSIn        | ``GlobalInvocationId``   | N/A                   | ``Shader``                  |
+|                           | CSIn        | ``GlobalInvocationId``   | N/A                   | ``Shader``                  |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+| SV_DispatchThreadID       | MSIn        | ``GlobalInvocationId``   | N/A                   | ``Shader``                  |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+|                           | ASIn        | ``GlobalInvocationId``   | N/A                   | ``Shader``                  |
 +---------------------------+-------------+--------------------------+-----------------------+-----------------------------+
-| SV_GroupID                | CSIn        | ``WorkgroupId``          | N/A                   | ``Shader``                  |
+|                           | CSIn        | ``WorkgroupId``          | N/A                   | ``Shader``                  |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+| SV_GroupID                | MSIn        | ``WorkgroupId``          | N/A                   | ``Shader``                  |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+|                           | ASIn        | ``WorkgroupId``          | N/A                   | ``Shader``                  |
 +---------------------------+-------------+--------------------------+-----------------------+-----------------------------+
-| SV_GroupThreadID          | CSIn        | ``LocalInvocationId``    | N/A                   | ``Shader``                  |
+|                           | CSIn        | ``LocalInvocationId``    | N/A                   | ``Shader``                  |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+| SV_GroupThreadID          | MSIn        | ``LocalInvocationId``    | N/A                   | ``Shader``                  |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+|                           | ASIn        | ``LocalInvocationId``    | N/A                   | ``Shader``                  |
 +---------------------------+-------------+--------------------------+-----------------------+-----------------------------+
-| SV_GroupIndex             | CSIn        | ``LocalInvocationIndex`` | N/A                   | ``Shader``                  |
+|                           | CSIn        | ``LocalInvocationIndex`` | N/A                   | ``Shader``                  |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+| SV_GroupIndex             | MSIn        | ``LocalInvocationIndex`` | N/A                   | ``Shader``                  |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+|                           | ASIn        | ``LocalInvocationIndex`` | N/A                   | ``Shader``                  |
 +---------------------------+-------------+--------------------------+-----------------------+-----------------------------+
 | SV_OutputControlPointID   | HSIn        | ``InvocationId``         | N/A                   | ``Tessellation``            |
 +---------------------------+-------------+--------------------------+-----------------------+-----------------------------+
@@ -1330,12 +1368,14 @@ some system-value (SV) semantic strings will be translated into SPIR-V
 |                           | PCIn        | ``PrimitiveId``          | N/A                   | ``Tessellation``            |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
 |                           | DsIn        | ``PrimitiveId``          | N/A                   | ``Tessellation``            |
-| SV_PrimitiveID            +-------------+--------------------------+-----------------------+-----------------------------+
-|                           | GSIn        | ``PrimitiveId``          | N/A                   | ``Geometry``                |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+| SV_PrimitiveID            | GSIn        | ``PrimitiveId``          | N/A                   | ``Geometry``                |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
 |                           | GSOut       | ``PrimitiveId``          | N/A                   | ``Geometry``                |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
 |                           | PSIn        | ``PrimitiveId``          | N/A                   | ``Geometry``                |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+|                           | MSOut       | ``PrimitiveId``          | N/A                   | ``MeshShadingNV``           |
 +---------------------------+-------------+--------------------------+-----------------------+-----------------------------+
 |                           | PCOut       | ``TessLevelOuter``       | N/A                   | ``Tessellation``            |
 | SV_TessFactor             +-------------+--------------------------+-----------------------+-----------------------------+
@@ -1352,12 +1392,16 @@ some system-value (SV) semantic strings will be translated into SPIR-V
 | SV_Barycentrics           | PSIn        | ``BaryCoord*AMD``        | N/A                   | ``Shader``                  |
 +---------------------------+-------------+--------------------------+-----------------------+-----------------------------+
 |                           | GSOut       | ``Layer``                | N/A                   | ``Geometry``                |
-| SV_RenderTargetArrayIndex +-------------+--------------------------+-----------------------+-----------------------------+
-|                           | PSIn        | ``Layer``                | N/A                   | ``Geometry``                |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+| SV_RenderTargetArrayIndex | PSIn        | ``Layer``                | N/A                   | ``Geometry``                |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+|                           | MSOut       | ``Layer``                | N/A                   | ``MeshShadingNV``           |
 +---------------------------+-------------+--------------------------+-----------------------+-----------------------------+
 |                           | GSOut       | ``ViewportIndex``        | N/A                   | ``MultiViewport``           |
-| SV_ViewportArrayIndex     +-------------+--------------------------+-----------------------+-----------------------------+
-|                           | PSIn        | ``ViewportIndex``        | N/A                   | ``MultiViewport``           |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+| SV_ViewportArrayIndex     | PSIn        | ``ViewportIndex``        | N/A                   | ``MultiViewport``           |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+|                           | MSOut       | ``ViewportIndex``        | N/A                   | ``MeshShadingNV``           |
 +---------------------------+-------------+--------------------------+-----------------------+-----------------------------+
 |                           | PSIn        | ``SampleMask``           | N/A                   | ``Shader``                  |
 | SV_Coverage               +-------------+--------------------------+-----------------------+-----------------------------+
@@ -1369,11 +1413,15 @@ some system-value (SV) semantic strings will be translated into SPIR-V
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
 |                           | HSIn        | ``ViewIndex``            | N/A                   | ``MultiView``               |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
-| SV_ViewID                 | DSIn        | ``ViewIndex``            | N/A                   | ``MultiView``               |
-|                           +-------------+--------------------------+-----------------------+-----------------------------+
+|                           | DSIn        | ``ViewIndex``            | N/A                   | ``MultiView``               |
+| SV_ViewID                 +-------------+--------------------------+-----------------------+-----------------------------+
 |                           | GSIn        | ``ViewIndex``            | N/A                   | ``MultiView``               |
 |                           +-------------+--------------------------+-----------------------+-----------------------------+
 |                           | PSIn        | ``ViewIndex``            | N/A                   | ``MultiView``               |
+|                           +-------------+--------------------------+-----------------------+-----------------------------+
+|                           | MSIn        | ``ViewIndex``            | N/A                   | ``MultiView``               |
++---------------------------+-------------+--------------------------+-----------------------+-----------------------------+
+| SV_ShadingRate            | PSIn        | ``FragSizeEXT``          | N/A                   | ``FragmentDensityEXT``      |
 +---------------------------+-------------+--------------------------+-----------------------+-----------------------------+
 
 For entities (function parameters, function return values, struct fields) with
@@ -1439,11 +1487,13 @@ Explicit binding number assignment
 
 ``[[vk::binding(X[, Y])]]`` can be attached to global variables to specify the
 descriptor set as ``Y`` and binding number as ``X``. The descriptor set number
-is optional; if missing, it will be zero. RW/append/consume structured buffers
-have associated counters, which will occupy their own Vulkan descriptors.
-``[vk::counter_binding(Z)]`` can be attached to a RW/append/consume structured
-buffers to specify the binding number for the associated counter to ``Z``. Note
-that the set number of the counter is always the same as the main buffer.
+is optional; if missing, it will be zero (If ``-auto-binding-space N`` command
+line option is used, then descriptor set #N will be used instead of descriptor
+set #0). RW/append/consume structured buffers have associated counters, which
+will occupy their own Vulkan descriptors. ``[vk::counter_binding(Z)]`` can be
+attached to a RW/append/consume structured buffers to specify the binding number
+for the associated counter to ``Z``. Note that the set number of the counter is
+always the same as the main buffer.
 
 Implicit binding number assignment
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1463,7 +1513,8 @@ respectively.
 
 If there is no register specification, the corresponding resource will be
 assigned to the next available binding number, starting from 0, in descriptor
-set #0.
+set #0 (If ``-auto-binding-space N`` command line option is used, then
+descriptor set #N will be used instead of descriptor set #0).
 
 Summary
 ~~~~~~~
@@ -1502,7 +1553,48 @@ If we compile with ``-fvk-t-shift 10 0 -fvk-t-shift 20 1``:
 - ``sampler1`` will take binding 1 in set #0, since that's the next available
   binding number in set #0.
 
+HLSL global variables and Vulkan binding
+----------------------------------------
+As mentioned above, all global externally-visible non-resource-type stand-alone
+variables will be collected into a cbuffer named ``$Globals``. By default,
+the ``$Globals`` cbuffer is placed in descriptor set #0, and the binding number
+would be the next available binding number in that set. Meaning, the binding number
+depends on where the very first global variable is in the code.
+
+Example 1:
+
 .. code:: hlsl
+
+  float4 someColors;
+    // $Globals cbuffer placed at DescriptorSet #0, Binding #0
+  Texture2D<float4> texture1;
+    // texture1         placed at DescriptorSet #0, Binding #1
+
+Example 2:
+
+.. code:: hlsl
+
+  Texture2D<float4> texture1;
+    // texture1         placed at DescriptorSet #0, Binding #0
+  float4 someColors;
+    // $Globals cbuffer placed at DescriptorSet #0, Binding #1
+
+In order provide more control over the descriptor set and binding number of the
+``$Globals`` cbuffer, you can use the ``-fvk-bind-globals B S`` command line
+option, which will place this cbuffer at descriptor set ``S``, and binding number ``B``.
+
+Example 3: (compiled with ``-fvk-bind-globals 2 1``)
+
+.. code:: hlsl
+
+  Texture2D<float4> texture1;
+    // texture1         placed at DescriptorSet #0, Binding #0
+  float4 someColors;
+    // $Globals cbuffer placed at DescriptorSet #1, Binding #2
+
+Note that if the developer chooses to use this command line option, it is their
+responsibility to provide proper numbers and avoid binding overlaps.
+
 HLSL Expressions
 ================
 
@@ -3009,6 +3101,88 @@ Callable Stage
     a.color = float4(0.0f,1.0f,0.0f,0.0f);
   }
 
+Mesh and Amplification Shaders
+------------------------------
+
+| DirectX adds 2 new shader stages for using MeshShading pipeline namely Mesh and Amplification.
+| Amplification shaders corresponds to Task Shaders in Vulkan.
+|
+| Refer to following HLSL and SPIR-V specs for details:
+| https://docs.microsoft.com/<TBD>
+| https://github.com/KhronosGroup/SPIRV-Registry/blob/master/extensions/NV/SPV_NV_mesh_shader.asciidoc
+|
+| This section describes how Mesh and Amplification shaders are translated to SPIR-V for Vulkan.
+
+Entry Point Attributes
+~~~~~~~~~~~~~~~~~~~~~~
+The following HLSL attributes are attached to the main entry point of Mesh and/or Amplification
+shaders and are translated to SPIR-V execution modes according to the table below:
+
+.. table:: Mapping from HLSL attribute to SPIR-V execution mode
+
++-------------------+--------------------+-------------------------+
+|  HLSL Attribute   |   Value            | SPIR-V Execution Mode   |
++===================+====================+=========================+
+|``outputtopology`` | ``point``          | ``OutputPoints``        |
+|                   +--------------------+-------------------------+
+|``(Mesh shader)``  | ``line``           | ``OutputLinesNV``       |
+|                   +--------------------+-------------------------+
+|                   | ``triangle``       | ``OutputTrianglesNV``   |
++-------------------+--------------------+-------------------------+
+| ``numthreads``    | ``X, Y, Z``        | ``LocalSize X, Y, Z``   |
+|                   |                    |                         |
+|                   | ``(X*Y*Z <= 128)`` |                         |
++-------------------+--------------------+-------------------------+
+
+Intrinsics
+~~~~~~~~~~
+The following HLSL intrinsics are used in Mesh or Amplification shaders
+and are translated to SPIR-V intrinsics according to the table below:
+
+.. table:: Mapping from HLSL intrinsics to SPIR-V intrinsics
+
++---------------------------+--------------------+-----------------------------------------+
+|  HLSL Intrinsic           |  Parameters        | SPIR-V Intrinsic                        |
++===========================+====================+=========================================+
+| ``SetMeshOutputCounts``   | ``numVertices``    | ``PrimitiveCountNV numPrimitives``      |
+|                           |                    |                                         |
+| ``(Mesh shader)``         | ``numPrimitives``  |                                         |
++---------------------------+--------------------+-----------------------------------------+
+| ``DispatchMesh``          | ``ThreadX``        | ``OpControlBarrier``                    |
+|                           |                    |                                         |
+| ``(Amplification shader)``| ``ThreadY``        | ``TaskCountNV ThreadX*ThreadY*ThreadZ`` |
+|                           |                    |                                         |
+|                           | ``ThreadZ``        |                                         |
+|                           |                    |                                         |
+|                           | ``MeshPayload``    |                                         |
++---------------------------+--------------------+-----------------------------------------+
+
+| Note : For ``DispatchMesh`` intrinsic, we also emit ``MeshPayload`` as output block with ``PerTaskNV`` decoration
+
+Mesh Interface Variables
+~~~~~~~~~~~~~~~~~~~~~~~~
+| Interface variables are defined for Mesh shaders using HLSL modifiers.
+| Following table gives high level overview of the mapping:
+|
+
+.. table:: Mapping from HLSL modifiers to SPIR-V definitions
+
++-----------------+-------------------------------------------------------------------------+
+|  HLSL modifier  | SPIR-V definition                                                       |
++=================+=========================================================================+
+| ``indices``     | Maps to SPIR-V intrinsic ``PrimitiveIndicesNV``                         |  
+|                 |                                                                         |
+|                 | Defines SPIR-V Execution Mode ``OutputPrimitivesNV <array-size>``       |
++-----------------+-------------------------------------------------------------------------+
+| ``vertices``    | Maps to per-vertex out attributes                                       |
+|                 |                                                                         |
+|                 | Defines existing SPIR-V Execution Mode ``OutputVertices <array-size>``  |
++-----------------+-------------------------------------------------------------------------+
+| ``primitives``  | Maps to per-primitive out attributes with ``PerPrimitiveNV`` decoration |
++-----------------+-------------------------------------------------------------------------+
+| ``payload``     | Maps to per-task in attributes with ``PerTaskNV`` decoration            |
++-----------------+-------------------------------------------------------------------------+
+
 
 Raytracing in Vulkan and SPIRV
 ==============================
@@ -3202,6 +3376,9 @@ codegen for Vulkan:
   It requires all source code resources have ``:register()`` attribute and
   all registers have corresponding Vulkan descriptors specified using this
   option.
+- ``-fvk-bind-globals N M``: Places the ``$Globals`` cbuffer at
+  descriptor set #M and binding #N. See `HLSL global variables and Vulkan binding`_
+  for explanation and examples.
 - ``-fvk-use-gl-layout``: Uses strict OpenGL ``std140``/``std430``
   layout rules for resources.
 - ``-fvk-use-dx-layout``: Uses DirectX layout rules for resources.
@@ -3226,6 +3403,15 @@ codegen for Vulkan:
 - ``-fspv-target-env=<env>``: Specifies the target environment for this compilation.
   The current valid options are ``vulkan1.0`` and ``vulkan1.1``. If no target
   environment is provided, ``vulkan1.0`` is used as default.
+- ``-fspv-flatten-resource-arrays``: Flattens arrays of textures and samplers
+  into individual resources, each taking one binding number. For example, an
+  array of 3 textures will become 3 texture resources taking 3 binding numbers.
+  This makes the behavior similar to DX. Without this option, you would get 1
+  array object taking 1 binding number. Note that arrays of
+  {RW|Append|Consume}StructuredBuffers are currently not supported in the
+  SPIR-V backend. Also note that this requires the optimizer to be able to
+  resolve all array accesses with constant indeces. Therefore, all loops using
+  the resource arrays must be marked with ``[unroll]``.
 - ``-Wno-vk-ignored-features``: Does not emit warnings on ignored features
   resulting from no Vulkan support, e.g., cbuffer member initializer.
 

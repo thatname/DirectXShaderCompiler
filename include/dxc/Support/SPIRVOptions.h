@@ -53,9 +53,11 @@ struct SpirvCodeGenOptions {
   bool useDxLayout;
   bool useGlLayout;
   bool useScalarLayout;
+  bool flattenResourceArrays;
   SpirvLayoutRule cBufferLayoutRule;
   SpirvLayoutRule sBufferLayoutRule;
   SpirvLayoutRule tBufferLayoutRule;
+  SpirvLayoutRule ampPayloadLayoutRule;
   llvm::StringRef stageIoOrder;
   llvm::StringRef targetEnv;
   llvm::SmallVector<int32_t, 4> bShift;
@@ -65,6 +67,7 @@ struct SpirvCodeGenOptions {
   llvm::SmallVector<llvm::StringRef, 4> allowedExtensions;
   llvm::SmallVector<llvm::StringRef, 4> optConfig;
   std::vector<std::string> bindRegister;
+  std::vector<std::string> bindGlobals;
 
   // String representation of all command line options.
   std::string clOptions;

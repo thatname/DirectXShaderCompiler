@@ -2332,6 +2332,7 @@ def warn_attribute_wrong_decl_type : Warning<
   "global variables, cbuffers, and tbuffers|"
   "RWStructuredBuffers, AppendStructuredBuffers, and ConsumeStructuredBuffers|"
   "SubpassInput, SubpassInputMS|"
+  "cbuffer or ConstantBuffer|"
   // SPIRV Change Ends
   // HLSL Change Starts - add 3 more enum values
   "variables and parameters|functions, parameters, and fields|"
@@ -7506,6 +7507,10 @@ def err_hlsl_requires_non_aggregate : Error<
   "scalar, vector, or matrix expected">;
 def err_hlsl_require_numeric_base_for_ctor : Error<
   "constructors only defined for numeric base types">;
+def err_hlsl_sizeof_literal : Error<
+  "invalid application of 'sizeof' to literal type %0">;
+def err_hlsl_sizeof_nonnumeric : Error<
+  "invalid application of 'sizeof' to non-numeric type %0">;
 def err_hlsl_typecheck_duplicate_matrix_components_not_mlvalue : Error< // Patterned after err_typecheck_duplicate_matrix_components_not_mlvalue
   "matrix is not assignable (contains duplicate components)">;
 def err_hlsl_typecheck_subscript_value : Error< // Patterned after err_typecheck_subscript_value
@@ -7520,8 +7525,6 @@ def err_hlsl_type_mismatch : Error<
   "type mismatch">;
 def err_hlsl_unsupported_array_equality_op: Error<
   "equality operators cannot be used with array types">;
-def err_hlsl_unsupported_array_size: Error<
-  "array dimension must be between 1 and 65536">;
 def err_hlsl_unsupported_incomplete_array: Error<
   "array dimensions of struct/class members must be explicit">;
 def err_hlsl_unsupported_bool_lvalue_op : Error<
@@ -7530,10 +7533,6 @@ def err_hlsl_unsupported_lvalue_cast_op : Error<
   "cannot truncate lvalue vector/matrix">;
 def err_hlsl_unsupported_buffer_packoffset : Error<
   "packoffset is only allowed within a constant buffer, not on the constant buffer declaration">;
-def err_hlsl_unsupported_cbuffer_register : Error<
-  "invalid register specification, expected 'b' binding">;
-def err_hlsl_unsupported_tbuffer_register : Error<
-  "invalid register specification, expected 't' binding">;
 def err_hlsl_unsupported_buffer_slot_target_specific : Error<
   "user defined constant buffer slots cannot be target specific">;
 def err_hlsl_unsupported_builtin_op: Error<
@@ -7669,24 +7668,30 @@ def err_hlsl_unsupported_for_version_lower : Error<
 def err_hlsl_unsupported_keyword_for_min_precision : Error<
    "%0 is only supported with -enable-16bit-types option">;
 def err_hlsl_intrinsic_template_arg_unsupported: Error<
-   "Explicit template arguments on intrinsic %0 are not supported.">;
+   "Explicit template arguments on intrinsic %0 are not supported">;
 def err_hlsl_intrinsic_template_arg_requires_2018: Error<
-   "Explicit template arguments on intrinsic %0 requires HLSL version 2018 or above.">;
-def err_hlsl_intrinsic_template_arg_scalar_vector: Error<
-   "Explicit template arguments on intrinsic %0 are limited one to scalar or vector type.">;
+   "Explicit template arguments on intrinsic %0 requires HLSL version 2018 or above">;
+def err_hlsl_intrinsic_template_arg_numeric: Error<
+   "Explicit template arguments on intrinsic %0 must be a single numeric type">;
 }
 def err_hlsl_no_struct_user_defined_type: Error<
    "User defined type intrinsic arg must be struct">;
 def err_hlsl_ray_desc_required: Error<
    "Argument type must be struct RayDesc.">;
-def err_hlsl_missing_maxvertexcount_attr: Error<
-   "GS entry point must have the maxvertexcount attribute">;
-def err_hlsl_missing_patchconstantfunc_attr: Error<
-   "HS entry point must have the patchconstantfunc attribute">;
+def err_hlsl_missing_attr: Error<
+   "%0 entry point must have the %1 attribute">;
 def err_hlsl_missing_inout_attr: Error<
    "stream-output object must be an inout parameter">;
 def err_hlsl_unsupported_string_decl: Error<
    "%select{array|parameter|return value}0 of type string is not supported">;
+def err_hlsl_missing_out_attr: Error<
+   "%0 object must be an out parameter">;
+def err_hlsl_missing_in_attr: Error<
+   "%0 object must be an in parameter">;
+def err_hlsl_load_from_mesh_out_arrays: Error<
+   "output arrays of a mesh shader can not be read from">;
+def err_hlsl_out_indices_array_incorrect_access: Error<
+   "a vector in out indices array must be accessed as a whole">;
 // HLSL Change Ends
 
 // SPIRV Change Starts

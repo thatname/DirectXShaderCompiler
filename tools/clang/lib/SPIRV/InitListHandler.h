@@ -111,7 +111,7 @@ private:
 
   /// Decomposes the given SpirvInstruction and puts all elements into the end
   /// of the scalars queue.
-  void decompose(SpirvInstruction *inst);
+  void decompose(SpirvInstruction *inst, const SourceLocation &loc);
 
   /// If the next initializer is a struct, replaces it with OpCompositeExtract
   /// its members and returns true. Otherwise, does nothing and return false.
@@ -130,7 +130,7 @@ private:
                                             SourceLocation);
   SpirvInstruction *createInitForMatrixType(QualType matrixType,
                                             SourceLocation);
-  SpirvInstruction *createInitForStructType(QualType type);
+  SpirvInstruction *createInitForStructType(QualType type, SourceLocation);
   SpirvInstruction *createInitForConstantArrayType(QualType type,
                                                    SourceLocation);
   SpirvInstruction *createInitForSamplerImageType(QualType type,

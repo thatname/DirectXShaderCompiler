@@ -8,24 +8,24 @@
 // CHECK: OpEntryPoint Vertex %main "main" %gl_ClipDistance %gl_CullDistance %gl_ClipDistance_0 %gl_CullDistance_0 %in_var_TEXCOORD %in_var_SV_Position %in_var_SV_ClipDistance %in_var_SV_CullDistance0 %gl_PointSize %out_var_COLOR %gl_Position %out_var_TEXCOORD
 
 // CHECK: OpDecorate %gl_ClipDistance BuiltIn ClipDistance
-// CHECK: OpDecorateStringGOOGLE %gl_ClipDistance HlslSemanticGOOGLE "SV_ClipDistance"
+// CHECK: OpDecorateString %gl_ClipDistance UserSemantic "SV_ClipDistance"
 // CHECK: OpDecorate %gl_CullDistance BuiltIn CullDistance
-// CHECK: OpDecorateStringGOOGLE %gl_CullDistance HlslSemanticGOOGLE "SV_CullDistance0"
+// CHECK: OpDecorateString %gl_CullDistance UserSemantic "SV_CullDistance0"
 // CHECK: OpDecorate %gl_ClipDistance_0 BuiltIn ClipDistance
-// CHECK: OpDecorateStringGOOGLE %gl_ClipDistance_0 HlslSemanticGOOGLE "SV_ClipDistance"
+// CHECK: OpDecorateString %gl_ClipDistance_0 UserSemantic "SV_ClipDistance"
 // CHECK: OpDecorate %gl_CullDistance_0 BuiltIn CullDistance
-// CHECK: OpDecorateStringGOOGLE %gl_CullDistance_0 HlslSemanticGOOGLE "SV_CullDistance"
+// CHECK: OpDecorateString %gl_CullDistance_0 UserSemantic "SV_CullDistance"
 
-// CHECK: OpDecorateStringGOOGLE %in_var_TEXCOORD HlslSemanticGOOGLE "TEXCOORD"
-// CHECK: OpDecorateStringGOOGLE %in_var_SV_Position HlslSemanticGOOGLE "SV_Position"
-// CHECK: OpDecorateStringGOOGLE %in_var_SV_ClipDistance HlslSemanticGOOGLE "SV_ClipDistance"
-// CHECK: OpDecorateStringGOOGLE %in_var_SV_CullDistance0 HlslSemanticGOOGLE "SV_CullDistance0"
+// CHECK: OpDecorateString %in_var_TEXCOORD UserSemantic "TEXCOORD"
+// CHECK: OpDecorateString %in_var_SV_Position UserSemantic "SV_Position"
+// CHECK: OpDecorateString %in_var_SV_ClipDistance UserSemantic "SV_ClipDistance"
+// CHECK: OpDecorateString %in_var_SV_CullDistance0 UserSemantic "SV_CullDistance0"
 // CHECK: OpDecorate %gl_PointSize BuiltIn PointSize
-// CHECK: OpDecorateStringGOOGLE %gl_PointSize HlslSemanticGOOGLE "PSize"
-// CHECK: OpDecorateStringGOOGLE %out_var_COLOR HlslSemanticGOOGLE "COLOR"
+// CHECK: OpDecorateString %gl_PointSize UserSemantic "PSize"
+// CHECK: OpDecorateString %out_var_COLOR UserSemantic "COLOR"
 // CHECK: OpDecorate %gl_Position BuiltIn Position
-// CHECK: OpDecorateStringGOOGLE %gl_Position HlslSemanticGOOGLE "SV_Position"
-// CHECK: OpDecorateStringGOOGLE %out_var_TEXCOORD HlslSemanticGOOGLE "TEXCOORD"
+// CHECK: OpDecorateString %gl_Position UserSemantic "SV_Position"
+// CHECK: OpDecorateString %out_var_TEXCOORD UserSemantic "TEXCOORD"
 
 // CHECK: OpDecorate %in_var_TEXCOORD Location 0
 // CHECK: OpDecorate %in_var_SV_Position Location 1
@@ -117,10 +117,12 @@ float main(out VSOut  vsOut,
 
 // Write out SV_ClipDistance1
 // CHECK-NEXT:    [[clip1:%\d+]] = OpCompositeExtract %v2float [[innerS]] 0
-// CHECK-NEXT: [[clipArr3:%\d+]] = OpAccessChain %_ptr_Output_float %gl_ClipDistance_0 %uint_3
+// CHECK-NEXT:    [[ind10:%\d+]] = OpIAdd %uint %uint_3 %uint_0
+// CHECK-NEXT: [[clipArr3:%\d+]] = OpAccessChain %_ptr_Output_float %gl_ClipDistance_0 [[ind10]]
 // CHECK-NEXT:   [[clip10:%\d+]] = OpCompositeExtract %float [[clip1]] 0
 // CHECK-NEXT:                     OpStore [[clipArr3]] [[clip10]]
-// CHECK-NEXT: [[clipArr4:%\d+]] = OpAccessChain %_ptr_Output_float %gl_ClipDistance_0 %uint_4
+// CHECK-NEXT:    [[ind11:%\d+]] = OpIAdd %uint %uint_3 %uint_1
+// CHECK-NEXT: [[clipArr4:%\d+]] = OpAccessChain %_ptr_Output_float %gl_ClipDistance_0 [[ind11]]
 // CHECK-NEXT:   [[clip11:%\d+]] = OpCompositeExtract %float [[clip1]] 1
 // CHECK-NEXT:                     OpStore [[clipArr4]] [[clip11]]
 
@@ -132,13 +134,16 @@ float main(out VSOut  vsOut,
 
 // Write out SV_ClipDistance0
 // CHECK-NEXT:    [[clip0:%\d+]] = OpLoad %v3float %param_var_clipdis0
-// CHECK-NEXT: [[clipArr0:%\d+]] = OpAccessChain %_ptr_Output_float %gl_ClipDistance_0 %uint_0
+// CHECK-NEXT:    [[ind00:%\d+]] = OpIAdd %uint %uint_0 %uint_0
+// CHECK-NEXT: [[clipArr0:%\d+]] = OpAccessChain %_ptr_Output_float %gl_ClipDistance_0 [[ind00]]
 // CHECK-NEXT:   [[clip00:%\d+]] = OpCompositeExtract %float [[clip0]] 0
 // CHECK-NEXT:                     OpStore [[clipArr0]] [[clip00]]
-// CHECK-NEXT: [[clipArr1:%\d+]] = OpAccessChain %_ptr_Output_float %gl_ClipDistance_0 %uint_1
+// CHECK-NEXT:    [[ind01:%\d+]] = OpIAdd %uint %uint_0 %uint_1
+// CHECK-NEXT: [[clipArr1:%\d+]] = OpAccessChain %_ptr_Output_float %gl_ClipDistance_0 [[ind01]]
 // CHECK-NEXT:   [[clip01:%\d+]] = OpCompositeExtract %float [[clip0]] 1
 // CHECK-NEXT:                     OpStore [[clipArr1]] [[clip01]]
-// CHECK-NEXT: [[clipArr2:%\d+]] = OpAccessChain %_ptr_Output_float %gl_ClipDistance_0 %uint_2
+// CHECK-NEXT:    [[ind02:%\d+]] = OpIAdd %uint %uint_0 %uint_2
+// CHECK-NEXT: [[clipArr2:%\d+]] = OpAccessChain %_ptr_Output_float %gl_ClipDistance_0 [[ind02]]
 // CHECK-NEXT:   [[clip02:%\d+]] = OpCompositeExtract %float [[clip0]] 2
 // CHECK-NEXT:                     OpStore [[clipArr2]] [[clip02]]
 

@@ -28,6 +28,7 @@
 #include <unordered_set>
 
 namespace llvm {
+template<typename T> class ArrayRef;
 class LLVMContext;
 class Module;
 class Function;
@@ -38,6 +39,7 @@ class MDNode;
 class GlobalVariable;
 class DIGlobalVariable;
 class DebugInfoFinder;
+class GetElementPtrInst;
 }
 
 
@@ -177,8 +179,10 @@ public:
   llvm::MDNode *DxilUAVToMDNode(const DxilResource &UAV);
   llvm::MDNode *DxilCBufferToMDNode(const DxilCBuffer &CB);
   void LoadDxilResourceBaseFromMDNode(llvm::MDNode *MD, DxilResourceBase &R);
-  void AddResourceWithGlobalVariableAndMDNode(llvm::Constant *GV,
-                                              llvm::MDNode *MD);
+  DxilResourceBase *AddResourceWithGlobalVariableAndMDNode(llvm::Constant *GV,
+                                                           llvm::MDNode *MD);
+  unsigned GetBindingForResourceInCB(llvm::GetElementPtrInst *CbPtr,
+                                     llvm::GlobalVariable *CbGV);
 
   // Type related methods.
   static bool IsStreamOutputPtrType(llvm::Type *Ty);
@@ -250,6 +254,9 @@ public:
   DxilSubobjects *ReleaseSubobjects();
   void ResetSubobjects(DxilSubobjects *subobjects);
 
+  // Reg binding for resource in cb.
+  void AddRegBinding(unsigned CbID, unsigned ConstantIdx, unsigned Srv, unsigned Uav, unsigned Sampler);
+
 private:
   // Signatures.
   std::vector<uint8_t> m_SerializedRootSignature;
@@ -269,6 +276,11 @@ private:
 
   // Resource type annotation.
   std::unordered_map<llvm::Type *, std::pair<DXIL::ResourceClass, DXIL::ResourceKind>> m_ResTypeAnnotation;
+  // Resource bindings for res in cb.
+  // Key = CbID << 32 | ConstantIdx. Val is reg binding.
+  std::unordered_map<uint64_t, unsigned> m_SrvBindingInCB;
+  std::unordered_map<uint64_t, unsigned> m_UavBindingInCB;
+  std::unordered_map<uint64_t, unsigned> m_SamplerBindingInCB;
 
 private:
   llvm::LLVMContext &m_Ctx;

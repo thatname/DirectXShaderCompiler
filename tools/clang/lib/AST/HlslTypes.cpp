@@ -91,16 +91,19 @@ bool IsHLSLVecType(clang::QualType type) {
   return false;
 }
 
-static bool IsHLSLNumeric(clang::QualType type) {
+bool IsHLSLNumericOrAggregateOfNumericType(clang::QualType type) {
   const clang::Type *Ty = type.getCanonicalType().getTypePtr();
   if (isa<RecordType>(Ty)) {
     if (IsHLSLVecMatType(type))
       return true;
     return IsHLSLNumericUserDefinedType(type);
   } else if (type->isArrayType()) {
-    return IsHLSLNumeric(QualType(type->getArrayElementTypeNoTypeQual(), 0));
+    return IsHLSLNumericOrAggregateOfNumericType(QualType(type->getArrayElementTypeNoTypeQual(), 0));
   }
-  return Ty->isBuiltinType();
+
+  // Chars can only appear as part of strings, which we don't consider numeric.
+  const BuiltinType* BuiltinTy = dyn_cast<BuiltinType>(Ty);
+  return BuiltinTy != nullptr && BuiltinTy->getKind() != BuiltinType::Kind::Char_S;
 }
 
 bool IsHLSLNumericUserDefinedType(clang::QualType type) {
@@ -117,7 +120,7 @@ bool IsHLSLNumericUserDefinedType(clang::QualType type) {
         name == "RaytracingAccelerationStructure")
       return false;
     for (auto member : RD->fields()) {
-      if (!IsHLSLNumeric(member->getType()))
+      if (!IsHLSLNumericOrAggregateOfNumericType(member->getType()))
         return false;
     }
     return true;
@@ -508,6 +511,9 @@ bool IsHLSLResourceType(clang::QualType type) {
     if (name == "TextureCubeArray" || name == "RWTextureCubeArray")
       return true;
 
+    if (name == "FeedbackTexture2D" || name == "FeedbackTexture2DArray")
+      return true;
+
     if (name == "ByteAddressBuffer" || name == "RWByteAddressBuffer")
       return true;
 
@@ -556,6 +562,8 @@ bool GetHLSLSubobjectKind(clang::QualType type, DXIL::SubobjectKind &subobjectKi
       return name == "RaytracingShaderConfig" ? (subobjectKind = DXIL::SubobjectKind::RaytracingShaderConfig, true) : false;
     case 24:
       return name == "RaytracingPipelineConfig" ? (subobjectKind = DXIL::SubobjectKind::RaytracingPipelineConfig, true) : false;
+    case 25:
+      return name == "RaytracingPipelineConfig1" ? (subobjectKind = DXIL::SubobjectKind::RaytracingPipelineConfig1, true) : false;
     case 16:
       if (name == "TriangleHitGroup") {
         subobjectKind = DXIL::SubobjectKind::HitGroup;
@@ -575,21 +583,63 @@ bool GetHLSLSubobjectKind(clang::QualType type, DXIL::SubobjectKind &subobjectKi
   return false;
 }
 
-QualType GetHLSLResourceResultType(QualType type) {
+bool IsHLSLRayQueryType(clang::QualType type) {
   type = type.getCanonicalType();
-  const RecordType *RT = cast<RecordType>(type);
-  StringRef name = RT->getDecl()->getName();
-
-  if (name == "ByteAddressBuffer" || name == "RWByteAddressBuffer") {
-    RecordDecl *RD = RT->getDecl();
-    QualType resultTy = RD->field_begin()->getType();
-    return resultTy;
+  if (const RecordType *RT = dyn_cast<RecordType>(type)) {
+    if (const ClassTemplateSpecializationDecl *templateDecl =
+            dyn_cast<ClassTemplateSpecializationDecl>(
+                RT->getAsCXXRecordDecl())) {
+      StringRef name = templateDecl->getName();
+      if (name == "RayQuery")
+        return true;
+    }
   }
-  const ClassTemplateSpecializationDecl *templateDecl =
-      cast<ClassTemplateSpecializationDecl>(RT->getAsCXXRecordDecl());
-  const TemplateArgumentList &argList = templateDecl->getTemplateArgs();
-  return argList[0].getAsType();
+  return false;
 }
+
+QualType GetHLSLResourceResultType(QualType type) {
+  // Don't canonicalize the type as to not lose snorm in Buffer<snorm float>
+  const RecordType *RT = type->getAs<RecordType>();
+  const RecordDecl* RD = RT->getDecl();
+
+  if (const ClassTemplateSpecializationDecl *templateDecl =
+    dyn_cast<ClassTemplateSpecializationDecl>(RD)) {
+    
+    if (RD->getName().startswith("FeedbackTexture")) {
+      // Feedback textures are write-only and the data is opaque,
+      // so there is no result type per se.
+      return {};
+    }
+    
+    // Type-templated resource types
+
+    // Prefer getting the template argument from the TemplateSpecializationType sugar,
+    // since this preserves 'snorm' from 'Buffer<snorm float>' which is lost on the
+    // ClassTemplateSpecializationDecl since it's considered type sugar.
+    const TemplateArgument* templateArg = &templateDecl->getTemplateArgs()[0];
+    if (const TemplateSpecializationType *specializationType = type->getAs<TemplateSpecializationType>()) {
+      if (specializationType->getNumArgs() >= 1) {
+        templateArg = &specializationType->getArg(0);
+      }
+    }
+
+    if (templateArg->getKind() == TemplateArgument::ArgKind::Type)
+      return templateArg->getAsType();
+  }
+
+  // Non-type-templated resource types like [RW][RasterOrder]ByteAddressBuffer
+  // Get the result type from handle field.
+  FieldDecl* HandleFieldDecl = *(RD->field_begin());
+  DXASSERT(HandleFieldDecl->getName() == "h", "Resource must have a handle field");
+  return HandleFieldDecl->getType();
+}
+
+unsigned GetHLSLResourceTemplateUInt(clang::QualType type) {
+  const ClassTemplateSpecializationDecl* templateDecl = cast<ClassTemplateSpecializationDecl>(
+    type->castAs<RecordType>()->getDecl());
+  return (unsigned)templateDecl->getTemplateArgs()[0].getAsIntegral().getZExtValue();
+}
+
 bool IsIncompleteHLSLResourceArrayType(clang::ASTContext &context,
                                        clang::QualType type) {
   if (type->isIncompleteArrayType()) {

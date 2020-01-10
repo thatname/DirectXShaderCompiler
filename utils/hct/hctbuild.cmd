@@ -46,6 +46,8 @@ set BUILD_CONFIG=Debug
 set DO_SETUP=1
 set DO_BUILD=1
 set CMAKE_OPTS=
+set SPEAK=1
+set PARALLEL_OPT=
 
 if "%1"=="-s" (
   set DO_BUILD=0
@@ -63,9 +65,20 @@ if "%1"=="-analyze" (
   set CMAKE_OPTS=%CMAKE_OPTS% -DHLSL_ENABLE_ANALYZE:BOOL=ON
   shift /1
 )
+if "%1"=="-official" (
+  echo Will generate official version for build
+  set CMAKE_OPTS=%CMAKE_OPTS% -DHLSL_OFFICIAL_BUILD:BOOL=ON
+  shift /1
+)
 if "%1"=="-fv" (
   echo Fixed version flag set for build.
   set CMAKE_OPTS=%CMAKE_OPTS% -DHLSL_ENABLE_FIXED_VER:BOOL=ON
+  shift /1
+)
+if "%1"=="-fvloc" (
+  echo Fixed version flag set for build, version file location: %2
+  set CMAKE_OPTS=%CMAKE_OPTS% -DHLSL_ENABLE_FIXED_VER:BOOL=ON -DHLSL_FIXED_VERSION_LOCATION:STRING=%2
+  shift /1
   shift /1
 )
 if "%1"=="-cv" (
@@ -110,6 +123,11 @@ if "%1"=="-vs2015" (
   set BUILD_VS_VER=2015
   shift /1
 )
+if "%1"=="-vs2019" (
+  set BUILD_GENERATOR=Visual Studio 16 2019
+  set BUILD_VS_VER=2019
+  shift /1
+)
 
 if "%1"=="-tblgen" (
   if "%2" == "" (
@@ -118,6 +136,16 @@ if "%1"=="-tblgen" (
   ) 
   set BUILD_TBLGEN_PATH=%2
   shift /1
+  shift /1
+)
+
+if "%1"=="-dont-speak" (
+  set SPEAK=0
+  shift /1
+)
+
+if "%1"=="-parallel" (
+  set PARALLEL_OPT=/m
   shift /1
 )
 
@@ -148,6 +176,10 @@ set BUILD_ARM_CROSSCOMPILING=0
 
 if /i "%BUILD_ARCH%"=="x64" (
   set BUILD_GENERATOR=%BUILD_GENERATOR% %BUILD_ARCH:x64=Win64%
+  if "%BUILD_VS_VER%"=="2019" (
+    set BUILD_GENERATOR=%BUILD_GENERATOR%
+    set VS2019ARCH=-Ax64
+  )
 )
 
 if /i "%BUILD_ARCH%"=="arm" (
@@ -224,7 +256,7 @@ if /i "%BUILD_ARCH%"=="Win32" (
   set BUILD_TOOLS=amd64_arm64
 )
 
-call :configandbuild %BUILD_CONFIG% %BUILD_ARCH% %HLSL_BLD_DIR% "%BUILD_GENERATOR%"
+call :configandbuild %BUILD_CONFIG% %BUILD_ARCH% %HLSL_BLD_DIR% "%BUILD_GENERATOR%" "%VS2019ARCH%"
 if errorlevel 1 exit /b 1
 
 if "%BUILD_GENERATOR%"=="Ninja" (
@@ -239,16 +271,19 @@ exit /b 0
 echo Builds HLSL solutions and the product and test binaries for the current
 echo flavor and architecture.
 echo.
-echo hctbuild [-s or -b] [-alldef] [-analyze] [-fv] [-rel] [-arm or -arm64 or -x86 or -x64] [-Release] [-Debug] [-vs2015] [-ninja] [-tblgen path]
+echo hctbuild [-s or -b] [-alldef] [-analyze] [-official] [-fv] [-fvloc <path>] [-rel] [-arm or -arm64 or -x86 or -x64] [-Release] [-Debug] [-vs2015] [-ninja] [-tblgen path] [-dont-speak] [-parallel]
 echo.
 echo   -s   creates the projects only, without building
 echo   -b   builds the existing project
 echo.
-echo   -alldef  adds optional projects to the default build
-echo   -analyze adds /analyze option
-echo   -fv      fixes the resource version for release
-echo.
-echo   -rel builds release rather than debug
+echo   -alldef        adds optional projects to the default build
+echo   -analyze       adds /analyze option
+echo   -official      will generate official version for build
+echo   -fv            fixes the resource version for release (utils\version\version.inc)
+echo   -fvloc <path>  directory with the version.inc file
+echo   -rel           builds release rather than debug
+echo   -dont-speak    disables audible build confirmation
+echo   -parallel      enables parallel build
 echo.
 echo current BUILD_ARCH=%BUILD_ARCH%.  Override with:
 echo   -x86 targets an x86 build (aka. Win32)
@@ -296,8 +331,13 @@ if "%DO_SETUP%"=="1" (
     cmake -DCMAKE_BUILD_TYPE:STRING=%1 %CMAKE_OPTS% -G %4 %HLSL_SRC_DIR% >> %3\cmake-log.txt 2>&1
   ) else (
     rem -DCMAKE_BUILD_TYPE:STRING=%1 is not necessary for multi-config generators like VS
-    echo Running cmake %CMAKE_OPTS% -G %4 %HLSL_SRC_DIR% > %3\cmake-log.txt
-    cmake %CMAKE_OPTS% -G %4 %HLSL_SRC_DIR% >> %3\cmake-log.txt 2>&1
+    if "%BUILD_VS_VER%"=="2019" (
+      echo Running cmake %CMAKE_OPTS% -G %4 %5 %HLSL_SRC_DIR% > %3\cmake-log.txt
+      cmake %CMAKE_OPTS% -G %4 %5 %HLSL_SRC_DIR% >> %3\cmake-log.txt 2>&1
+    ) else (
+      echo Running cmake %CMAKE_OPTS% -G %4 %HLSL_SRC_DIR% > %3\cmake-log.txt
+      cmake %CMAKE_OPTS% -G %4 %5 %HLSL_SRC_DIR% >> %3\cmake-log.txt 2>&1
+    )
   )
   if errorlevel 1 (
     echo Failed to configure cmake projects.
@@ -339,7 +379,7 @@ if "%BUILD_GENERATOR%" NEQ "Ninja" (
 )
 
 rem Just defer to cmake for now.
-cmake --build . --config %1
+cmake --build . --config %1 -- %PARALLEL_OPT%
 goto :donebuild
 
 :donebuild
@@ -376,9 +416,13 @@ if exist %1\clang-tblgen.exe (
 exit /b 1
 
 :handlefail
-cscript.exe //Nologo %HLSL_SRC_DIR%\utils\hct\hctspeak.js /say:"build failed"
+if %SPEAK%==1 (
+  cscript.exe //Nologo %HLSL_SRC_DIR%\utils\hct\hctspeak.js /say:"build failed"
+)
 exit /b 0
 
 :handlesuccess
-cscript.exe //Nologo %HLSL_SRC_DIR%\utils\hct\hctspeak.js /say:"build succeeded"
+if %SPEAK%==1 (
+  cscript.exe //Nologo %HLSL_SRC_DIR%\utils\hct\hctspeak.js /say:"build succeeded"
+)
 exit /b 0

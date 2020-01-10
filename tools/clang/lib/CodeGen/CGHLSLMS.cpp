@@ -102,6 +102,10 @@ private:
   llvm::DenseMap<HLSLBufferDecl *, uint32_t> constantBufMap;
   // Map for resource type to resource metadata value.
   std::unordered_map<llvm::Type *, MDNode*> resMetadataMap;
+  // Map from Constant to register bindings.
+  llvm::DenseMap<llvm::Constant *,
+                 llvm::SmallVector<std::pair<DXIL::ResourceClass, unsigned>, 1>>
+      constantRegBindingMap;
 
   bool  m_bDebugInfo;
   bool  m_bIsLib;
@@ -116,7 +120,7 @@ private:
   uint32_t AddSampler(VarDecl *samplerDecl);
   uint32_t AddUAVSRV(VarDecl *decl, hlsl::DxilResourceBase::Class resClass);
   bool SetUAVSRV(SourceLocation loc, hlsl::DxilResourceBase::Class resClass,
-                 DxilResource *hlslRes, const RecordDecl *RD);
+                 DxilResource *hlslRes, QualType QualTy);
   uint32_t AddCBuffer(HLSLBufferDecl *D);
   hlsl::DxilResourceBase::Class TypeToClass(clang::QualType Ty);
 
@@ -366,6 +370,22 @@ CGMSHLSLRuntime::CGMSHLSLRuntime(CodeGenModule &CGM)
     Diags.Report(DiagID) << CGM.getCodeGenOpts().HLSLProfile;
     return;
   }
+  if (CGM.getCodeGenOpts().HLSLValidatorMajorVer != 0) {
+    // Check validator version against minimum for target profile:
+    unsigned MinMajor, MinMinor;
+    SM->GetMinValidatorVersion(MinMajor, MinMinor);
+    if (DXIL::CompareVersions(CGM.getCodeGenOpts().HLSLValidatorMajorVer,
+                              CGM.getCodeGenOpts().HLSLValidatorMinorVer,
+                              MinMajor, MinMinor) < 0) {
+      DiagnosticsEngine &Diags = CGM.getDiags();
+      unsigned DiagID =
+          Diags.getCustomDiagID(DiagnosticsEngine::Error,
+            "validator version %0,%1 does not support target profile.");
+      Diags.Report(DiagID) << CGM.getCodeGenOpts().HLSLValidatorMajorVer
+                           << CGM.getCodeGenOpts().HLSLValidatorMinorVer;
+      return;
+    }
+  }
   m_bIsLib = SM->IsLib();
   // TODO: add AllResourceBound.
   if (CGM.getCodeGenOpts().HLSLAvoidControlFlow && !CGM.getCodeGenOpts().HLSLAllResourcesBound) {
@@ -545,6 +565,15 @@ StringToTessOutputPrimitive(StringRef primitive) {
   return DXIL::TessellatorOutputPrimitive::Undefined;
 }
 
+static DXIL::MeshOutputTopology
+StringToMeshOutputTopology(StringRef topology) {
+  if (topology == "line")
+    return DXIL::MeshOutputTopology::Line;
+  if (topology == "triangle")
+    return DXIL::MeshOutputTopology::Triangle;
+  return DXIL::MeshOutputTopology::Undefined;
+}
+
 static unsigned RoundToAlign(unsigned num, unsigned mod) {
   // round num to next highest mod
   if (mod != 0)
@@ -581,6 +610,8 @@ static unsigned AlignBaseOffset(unsigned baseOffset, unsigned size,
 
     needNewAlign |= !bRowMajor && col > 1;
     needNewAlign |= bRowMajor && row > 1;
+  } else if (Ty->isStructureOrClassType() && ! hlsl::IsHLSLVecType(Ty)) {
+    needNewAlign = true;
   }
 
   unsigned scalarSizeInBytes = 4;
@@ -739,7 +770,7 @@ MDNode *CGMSHLSLRuntime::GetOrAddResTypeMD(QualType resTy) {
   case DXIL::ResourceClass::UAV: {
     DxilResource UAV;
     // TODO: save globalcoherent to variable in EmitHLSLBuiltinCallExpr.
-    SetUAVSRV(loc, resClass, &UAV, RD);
+    SetUAVSRV(loc, resClass, &UAV, resTy);
     // Set global symbol to save type.
     UAV.SetGlobalSymbol(UndefValue::get(Ty));
     MDNode *MD = m_pHLModule->DxilUAVToMDNode(UAV);
@@ -748,7 +779,7 @@ MDNode *CGMSHLSLRuntime::GetOrAddResTypeMD(QualType resTy) {
   } break;
   case DXIL::ResourceClass::SRV: {
     DxilResource SRV;
-    SetUAVSRV(loc, resClass, &SRV, RD);
+    SetUAVSRV(loc, resClass, &SRV, resTy);
     // Set global symbol to save type.
     SRV.SetGlobalSymbol(UndefValue::get(Ty));
     MDNode *MD = m_pHLModule->DxilSRVToMDNode(SRV);
@@ -857,6 +888,27 @@ unsigned CGMSHLSLRuntime::ConstructStructAnnotation(DxilStructAnnotation *annota
   unsigned offset = 0;
   bool bDefaultRowMajor = m_pHLModule->GetHLOptions().bDefaultRowMajor;
   if (const CXXRecordDecl *CXXRD = dyn_cast<CXXRecordDecl>(RD)) {
+
+    // If template, save template args
+    if (const ClassTemplateSpecializationDecl *templateSpecializationDecl =
+          dyn_cast<ClassTemplateSpecializationDecl>(CXXRD)) {
+      const clang::TemplateArgumentList &args = templateSpecializationDecl->getTemplateInstantiationArgs();
+      for (unsigned i = 0; i < args.size(); ++i) {
+        DxilTemplateArgAnnotation &argAnnotation = annotation->GetTemplateArgAnnotation(i);
+        const clang::TemplateArgument &arg = args[i];
+        switch (arg.getKind()) {
+        case clang::TemplateArgument::ArgKind::Type:
+          argAnnotation.SetType(CGM.getTypes().ConvertType(arg.getAsType()));
+        break;
+        case clang::TemplateArgument::ArgKind::Integral:
+          argAnnotation.SetIntegral(arg.getAsIntegral().getExtValue());
+          break;
+        default:
+          break;
+        }
+      }
+    }
+
     if (CXXRD->getNumBases()) {
       // Add base as field.
       for (const auto &I : CXXRD->bases()) {
@@ -963,6 +1015,17 @@ static bool IsElementInputOutputType(QualType Ty) {
   return Ty->isBuiltinType() || hlsl::IsHLSLVecMatType(Ty) || Ty->isEnumeralType();
 }
 
+static unsigned GetNumTemplateArgsForRecordDecl(const RecordDecl *RD) {
+  if (const CXXRecordDecl *CXXRD = dyn_cast<CXXRecordDecl>(RD)) {
+    if (const ClassTemplateSpecializationDecl *templateSpecializationDecl =
+          dyn_cast<ClassTemplateSpecializationDecl>(CXXRD)) {
+      const clang::TemplateArgumentList &args = templateSpecializationDecl->getTemplateInstantiationArgs();
+      return args.size();
+    }
+  }
+  return 0;
+}
+
 // Return the size for constant buffer of each decl.
 unsigned CGMSHLSLRuntime::AddTypeAnnotation(QualType Ty,
                                             DxilTypeSystem &dxilTypeSys,
@@ -1001,7 +1064,8 @@ unsigned CGMSHLSLRuntime::AddTypeAnnotation(QualType Ty,
       unsigned structSize = annotation->GetCBufferSize();
       return structSize;
     }
-    DxilStructAnnotation *annotation = dxilTypeSys.AddStructAnnotation(ST);
+    DxilStructAnnotation *annotation = dxilTypeSys.AddStructAnnotation(ST,
+      GetNumTemplateArgsForRecordDecl(RT->getDecl()));
 
     return ConstructStructAnnotation(annotation, RD, dxilTypeSys);
   } else if (const RecordType *RT = dyn_cast<RecordType>(paramTy)) {
@@ -1013,7 +1077,8 @@ unsigned CGMSHLSLRuntime::AddTypeAnnotation(QualType Ty,
       unsigned structSize = annotation->GetCBufferSize();
       return structSize;
     }
-    DxilStructAnnotation *annotation = dxilTypeSys.AddStructAnnotation(ST);
+    DxilStructAnnotation *annotation = dxilTypeSys.AddStructAnnotation(ST,
+      GetNumTemplateArgsForRecordDecl(RT->getDecl()));
 
     return ConstructStructAnnotation(annotation, RD, dxilTypeSys);
   } else if (IsHLSLResourceType(Ty)) {
@@ -1062,6 +1127,8 @@ static DxilResource::Kind KeywordToKind(StringRef keyword) {
     return DxilResource::Kind::Texture2D;
   if (keyword == "Texture2DMS" || keyword == "RWTexture2DMS")
     return DxilResource::Kind::Texture2DMS;
+  if (keyword == "FeedbackTexture2D")
+    return DxilResource::Kind::FeedbackTexture2D;
   if (keyword == "Texture3D" || keyword == "RWTexture3D" || keyword == "RasterizerOrderedTexture3D")
     return DxilResource::Kind::Texture3D;
   if (keyword == "TextureCube" || keyword == "RWTextureCube")
@@ -1071,6 +1138,8 @@ static DxilResource::Kind KeywordToKind(StringRef keyword) {
     return DxilResource::Kind::Texture1DArray;
   if (keyword == "Texture2DArray" || keyword == "RWTexture2DArray" || keyword == "RasterizerOrderedTexture2DArray")
     return DxilResource::Kind::Texture2DArray;
+  if (keyword == "FeedbackTexture2DArray")
+    return DxilResource::Kind::FeedbackTexture2DArray;
   if (keyword == "Texture2DMSArray" || keyword == "RWTexture2DMSArray")
     return DxilResource::Kind::Texture2DMSArray;
   if (keyword == "TextureCubeArray" || keyword == "RWTextureCubeArray")
@@ -1180,6 +1249,8 @@ void CGMSHLSLRuntime::AddHLSLFunctionInfo(Function *F, const FunctionDecl *FD) {
   bool isVS = false;
   bool isPS = false;
   bool isRay = false;
+  bool isMS = false;
+  bool isAS = false;
   if (const HLSLShaderAttr *Attr = FD->getAttr<HLSLShaderAttr>()) {
     // Stage is already validate in HandleDeclAttributeForHLSL.
     // Here just check first letter (or two).
@@ -1231,12 +1302,32 @@ void CGMSHLSLRuntime::AddHLSLFunctionInfo(Function *F, const FunctionDecl *FD) {
       funcProps->shaderKind = DXIL::ShaderKind::Intersection;
       break;
     case 'a':
-      isRay = true;
-      funcProps->shaderKind = DXIL::ShaderKind::AnyHit;
+      switch (Attr->getStage()[1]) {
+      case 'm':
+        isAS = true;
+        funcProps->shaderKind = DXIL::ShaderKind::Amplification;
+        break;
+      case 'n':
+        isRay = true;
+        funcProps->shaderKind = DXIL::ShaderKind::AnyHit;
+        break;
+      default:
+        break;
+      }
       break;
     case 'm':
-      isRay = true;
-      funcProps->shaderKind = DXIL::ShaderKind::Miss;
+      switch (Attr->getStage()[1]) {
+      case 'e':
+        isMS = true;
+        funcProps->shaderKind = DXIL::ShaderKind::Mesh;
+        break;
+      case 'i':
+        isRay = true;
+        funcProps->shaderKind = DXIL::ShaderKind::Miss;
+        break;
+      default:
+        break;
+      }
       break;
     default:
       break;
@@ -1287,6 +1378,12 @@ void CGMSHLSLRuntime::AddHLSLFunctionInfo(Function *F, const FunctionDecl *FD) {
   const ShaderModel *SM = m_pHLModule->GetShaderModel();
   if (isEntry) {
     funcProps->shaderKind = SM->GetKind();
+    if (funcProps->shaderKind == DXIL::ShaderKind::Mesh) {
+      isMS = true;
+    }
+    else if (funcProps->shaderKind == DXIL::ShaderKind::Amplification) {
+      isAS = true;
+    }
   }
 
   // Geometry shader.
@@ -1321,18 +1418,28 @@ void CGMSHLSLRuntime::AddHLSLFunctionInfo(Function *F, const FunctionDecl *FD) {
       funcProps->ShaderProps.GS.instanceCount = 1;
   }
 
-  // Computer shader.
+  // Compute shader
   if (const HLSLNumThreadsAttr *Attr = FD->getAttr<HLSLNumThreadsAttr>()) {
-    isCS = true;
-    funcProps->shaderKind = DXIL::ShaderKind::Compute;
+    if (isMS) {
+      funcProps->ShaderProps.MS.numThreads[0] = Attr->getX();
+      funcProps->ShaderProps.MS.numThreads[1] = Attr->getY();
+      funcProps->ShaderProps.MS.numThreads[2] = Attr->getZ();
+    } else if (isAS) {
+      funcProps->ShaderProps.AS.numThreads[0] = Attr->getX();
+      funcProps->ShaderProps.AS.numThreads[1] = Attr->getY();
+      funcProps->ShaderProps.AS.numThreads[2] = Attr->getZ();
+    } else {
+      isCS = true;
+      funcProps->shaderKind = DXIL::ShaderKind::Compute;
 
-    funcProps->ShaderProps.CS.numThreads[0] = Attr->getX();
-    funcProps->ShaderProps.CS.numThreads[1] = Attr->getY();
-    funcProps->ShaderProps.CS.numThreads[2] = Attr->getZ();
+      funcProps->ShaderProps.CS.numThreads[0] = Attr->getX();
+      funcProps->ShaderProps.CS.numThreads[1] = Attr->getY();
+      funcProps->ShaderProps.CS.numThreads[2] = Attr->getZ();
+    }
 
-    if (isEntry && !SM->IsCS()) {
+    if (isEntry && !SM->IsCS() && !SM->IsMS() && !SM->IsAS()) {
       unsigned DiagID = Diags.getCustomDiagID(
-          DiagnosticsEngine::Error, "attribute numthreads only valid for CS.");
+          DiagnosticsEngine::Error, "attribute numthreads only valid for CS/MS/AS.");
       Diags.Report(Attr->getLocation(), DiagID);
       return;
     }
@@ -1396,10 +1503,16 @@ void CGMSHLSLRuntime::AddHLSLFunctionInfo(Function *F, const FunctionDecl *FD) {
       DXIL::TessellatorOutputPrimitive primitive =
           StringToTessOutputPrimitive(Attr->getTopology());
       funcProps->ShaderProps.HS.outputPrimitive = primitive;
-    } else if (isEntry && !SM->IsHS()) {
+    }
+    else if (isMS) {
+      DXIL::MeshOutputTopology topology =
+          StringToMeshOutputTopology(Attr->getTopology());
+      funcProps->ShaderProps.MS.outputTopology = topology;
+    }
+    else if (isEntry && !SM->IsHS() && !SM->IsMS()) {
       unsigned DiagID =
           Diags.getCustomDiagID(DiagnosticsEngine::Warning,
-                                "attribute outputtopology only valid for HS.");
+                                "attribute outputtopology only valid for HS and MS.");
       Diags.Report(Attr->getLocation(), DiagID);
     }
   }
@@ -1476,7 +1589,7 @@ void CGMSHLSLRuntime::AddHLSLFunctionInfo(Function *F, const FunctionDecl *FD) {
     funcProps->shaderKind = DXIL::ShaderKind::Pixel;
   }
 
-  const unsigned profileAttributes = isCS + isHS + isDS + isGS + isVS + isPS + isRay;
+  const unsigned profileAttributes = isCS + isHS + isDS + isGS + isVS + isPS + isRay + isMS + isAS;
 
   // TODO: check this in front-end and report error.
   DXASSERT(profileAttributes < 2, "profile attributes are mutual exclusive");
@@ -1489,6 +1602,8 @@ void CGMSHLSLRuntime::AddHLSLFunctionInfo(Function *F, const FunctionDecl *FD) {
     case ShaderModel::Kind::Geometry:
     case ShaderModel::Kind::Vertex:
     case ShaderModel::Kind::Pixel:
+    case ShaderModel::Kind::Mesh:
+    case ShaderModel::Kind::Amplification:
       DXASSERT(funcProps->shaderKind == SM->GetKind(),
                "attribute profile not match entry function profile");
       break;
@@ -1559,6 +1674,10 @@ void CGMSHLSLRuntime::AddHLSLFunctionInfo(Function *F, const FunctionDecl *FD) {
     funcProps->ShaderProps.Ray.attributeSizeInBytes = 0;
   }
 
+  bool hasOutIndices = false;
+  bool hasOutVertices = false;
+  bool hasOutPrimitives = false;
+  bool hasInPayload = false;
   for (; ArgNo < F->arg_size(); ++ArgNo, ++ParmIdx) {
     DxilParameterAnnotation &paramAnnotation =
         FuncAnnotation->GetParameterAnnotation(ArgNo);
@@ -1588,6 +1707,158 @@ void CGMSHLSLRuntime::AddHLSLFunctionInfo(Function *F, const FunctionDecl *FD) {
       dxilInputQ = DxilParamInputQual::Out;
     if (parmDecl->hasAttr<HLSLOutAttr>() && parmDecl->hasAttr<HLSLInAttr>())
       dxilInputQ = DxilParamInputQual::Inout;
+
+    if (parmDecl->hasAttr<HLSLOutAttr>() && parmDecl->hasAttr<HLSLIndicesAttr>()) {
+      if (hasOutIndices) {
+        unsigned DiagID = Diags.getCustomDiagID(
+            DiagnosticsEngine::Error,
+            "multiple out indices parameters not allowed");
+        Diags.Report(parmDecl->getLocation(), DiagID);
+        continue;
+      }
+      const ConstantArrayType *CAT = dyn_cast<ConstantArrayType>(fieldTy.getCanonicalType());
+      if (CAT == nullptr) {
+        unsigned DiagID = Diags.getCustomDiagID(
+          DiagnosticsEngine::Error,
+          "indices output is not an constant-length array");
+        Diags.Report(parmDecl->getLocation(), DiagID);
+        continue;
+      }
+      unsigned count = CAT->getSize().getZExtValue();
+      if (count > DXIL::kMaxMSOutputPrimitiveCount) {
+        unsigned DiagID = Diags.getCustomDiagID(
+            DiagnosticsEngine::Error,
+            "max primitive count should not exceed %0");
+        Diags.Report(parmDecl->getLocation(), DiagID) << DXIL::kMaxMSOutputPrimitiveCount;
+        continue;
+      }
+      if (funcProps->ShaderProps.MS.maxPrimitiveCount != 0 &&
+        funcProps->ShaderProps.MS.maxPrimitiveCount != count) {
+        unsigned DiagID = Diags.getCustomDiagID(
+            DiagnosticsEngine::Error,
+            "max primitive count mismatch");
+        Diags.Report(parmDecl->getLocation(), DiagID);
+        continue;
+      }
+      // Get element type.
+      QualType arrayEleTy = CAT->getElementType();
+
+      if (hlsl::IsHLSLVecType(arrayEleTy)) {
+        QualType vecEltTy = hlsl::GetHLSLVecElementType(arrayEleTy);
+        if (!vecEltTy->isUnsignedIntegerType() || CGM.getContext().getTypeSize(vecEltTy) != 32) {
+          unsigned DiagID = Diags.getCustomDiagID(
+              DiagnosticsEngine::Error,
+              "the element of out_indices array must be uint2 for line output or uint3 for triangle output");
+          Diags.Report(parmDecl->getLocation(), DiagID);
+          continue;
+        }
+        unsigned vecEltCount = hlsl::GetHLSLVecSize(arrayEleTy);
+        if (funcProps->ShaderProps.MS.outputTopology == DXIL::MeshOutputTopology::Line && vecEltCount != 2) {
+          unsigned DiagID = Diags.getCustomDiagID(
+              DiagnosticsEngine::Error,
+              "the element of out_indices array in a mesh shader whose output topology is line must be uint2");
+          Diags.Report(parmDecl->getLocation(), DiagID);
+          continue;
+        }
+        if (funcProps->ShaderProps.MS.outputTopology == DXIL::MeshOutputTopology::Triangle && vecEltCount != 3) {
+          unsigned DiagID = Diags.getCustomDiagID(
+              DiagnosticsEngine::Error,
+              "the element of out_indices array in a mesh shader whose output topology is triangle must be uint3");
+          Diags.Report(parmDecl->getLocation(), DiagID);
+          continue;
+        }
+      } else {
+        unsigned DiagID = Diags.getCustomDiagID(
+            DiagnosticsEngine::Error,
+            "the element of out_indices array must be uint2 for line output or uint3 for triangle output");
+        Diags.Report(parmDecl->getLocation(), DiagID);
+        continue;
+      }
+
+      dxilInputQ = DxilParamInputQual::OutIndices;
+      funcProps->ShaderProps.MS.maxPrimitiveCount = count;
+      hasOutIndices = true;
+    }
+    if (parmDecl->hasAttr<HLSLOutAttr>() && parmDecl->hasAttr<HLSLVerticesAttr>()) {
+      if (hasOutVertices) {
+        unsigned DiagID = Diags.getCustomDiagID(
+            DiagnosticsEngine::Error,
+            "multiple out vertices parameters not allowed");
+        Diags.Report(parmDecl->getLocation(), DiagID);
+        continue;
+      }
+      const ConstantArrayType *CAT = dyn_cast<ConstantArrayType>(fieldTy.getCanonicalType());
+      if (CAT == nullptr) {
+        unsigned DiagID = Diags.getCustomDiagID(
+            DiagnosticsEngine::Error,
+            "vertices output is not an constant-length array");
+        Diags.Report(parmDecl->getLocation(), DiagID);
+        continue;
+      }
+      unsigned count = CAT->getSize().getZExtValue();
+      if (count > DXIL::kMaxMSOutputVertexCount) {
+        unsigned DiagID = Diags.getCustomDiagID(
+            DiagnosticsEngine::Error,
+            "max vertex count should not exceed %0");
+        Diags.Report(parmDecl->getLocation(), DiagID) << DXIL::kMaxMSOutputVertexCount;
+        continue;
+      }
+
+      dxilInputQ = DxilParamInputQual::OutVertices;
+      funcProps->ShaderProps.MS.maxVertexCount = count;
+      hasOutVertices = true;
+    }
+    if (parmDecl->hasAttr<HLSLOutAttr>() && parmDecl->hasAttr<HLSLPrimitivesAttr>()) {
+      if (hasOutPrimitives) {
+        unsigned DiagID = Diags.getCustomDiagID(
+            DiagnosticsEngine::Error,
+            "multiple out primitives parameters not allowed");
+        Diags.Report(parmDecl->getLocation(), DiagID);
+        continue;
+      }
+      const ConstantArrayType *CAT = dyn_cast<ConstantArrayType>(fieldTy.getCanonicalType());
+      if (CAT == nullptr) {
+        unsigned DiagID = Diags.getCustomDiagID(
+            DiagnosticsEngine::Error,
+            "primitives output is not an constant-length array");
+        Diags.Report(parmDecl->getLocation(), DiagID);
+        continue;
+      }
+      unsigned count = CAT->getSize().getZExtValue();
+      if (count > DXIL::kMaxMSOutputPrimitiveCount) {
+        unsigned DiagID = Diags.getCustomDiagID(
+            DiagnosticsEngine::Error,
+            "max primitive count should not exceed %0");
+        Diags.Report(parmDecl->getLocation(), DiagID) << DXIL::kMaxMSOutputPrimitiveCount;
+        continue;
+      }
+      if (funcProps->ShaderProps.MS.maxPrimitiveCount != 0 &&
+        funcProps->ShaderProps.MS.maxPrimitiveCount != count) {
+        unsigned DiagID = Diags.getCustomDiagID(
+            DiagnosticsEngine::Error,
+            "max primitive count mismatch");
+        Diags.Report(parmDecl->getLocation(), DiagID);
+        continue;
+      }
+
+      dxilInputQ = DxilParamInputQual::OutPrimitives;
+      funcProps->ShaderProps.MS.maxPrimitiveCount = count;
+      hasOutPrimitives = true;
+    }
+    if (parmDecl->hasAttr<HLSLInAttr>() && parmDecl->hasAttr<HLSLPayloadAttr>()) {
+      if (hasInPayload) {
+        unsigned DiagID = Diags.getCustomDiagID(
+            DiagnosticsEngine::Error,
+            "multiple in payload parameters not allowed");
+        Diags.Report(parmDecl->getLocation(), DiagID);
+        continue;
+      }
+      dxilInputQ = DxilParamInputQual::InPayload;
+      DataLayout DL(&this->TheModule);
+      funcProps->ShaderProps.MS.payloadSizeInBytes = DL.getTypeAllocSize(
+        F->getFunctionType()->getFunctionParamType(ArgNo)->getPointerElementType());
+      hasInPayload = true;
+    }
 
     DXIL::InputPrimitive inputPrimitive = DXIL::InputPrimitive::Undefined;
 
@@ -2150,11 +2421,18 @@ void CGMSHLSLRuntime::addResource(Decl *D) {
           staticConstGlobalInitMap[InitExp] = GV;
         }
       }
+      // Add type annotation for static global variable.
+      DxilTypeSystem &typeSys = m_pHLModule->GetTypeSystem();
+      unsigned arrayEltSize = 0;
+      AddTypeAnnotation(VD->getType(), typeSys, arrayEltSize);
       return;
     }
 
     if (D->hasAttr<HLSLGroupSharedAttr>()) {
       GlobalVariable *GV = cast<GlobalVariable>(CGM.GetAddrOfGlobalVar(VD));
+      DxilTypeSystem &dxilTypeSys = m_pHLModule->GetTypeSystem();
+      unsigned arraySize = 0;
+      AddTypeAnnotation(VD->getType(), dxilTypeSys, arraySize);
       m_pHLModule->AddGroupSharedVariable(GV);
       return;
     }
@@ -2185,15 +2463,6 @@ void CGMSHLSLRuntime::addSubobject(Decl *D) {
   VarDecl *VD = dyn_cast<VarDecl>(D);
   DXASSERT(VD != nullptr, "must be a global variable");
 
-  if (CGM.getCodeGenOpts().HLSLValidatorMajorVer == 1 &&
-      CGM.getCodeGenOpts().HLSLValidatorMinorVer < 4) {
-    // subobjects unsupported with this validator
-    DiagnosticsEngine &Diags = CGM.getDiags();
-    unsigned DiagID = Diags.getCustomDiagID(DiagnosticsEngine::Error, "subobjects are not supported by current validator version");
-    Diags.Report(D->getLocStart(), DiagID);
-    return;
-  }
- 
   DXIL::SubobjectKind subobjKind;
   DXIL::HitGroupType hgType;
   if (!hlsl::GetHLSLSubobjectKind(VD->getType(), subobjKind, hgType)) {
@@ -2281,6 +2550,8 @@ static DxilResourceBase::Class KeywordToClass(const std::string &keyword) {
   isUAV |= keyword == "RasterizerOrderedTexture2D";
   isUAV |= keyword == "RasterizerOrderedTexture2DArray";
   isUAV |= keyword == "RasterizerOrderedTexture3D";
+  isUAV |= keyword == "FeedbackTexture2D";
+  isUAV |= keyword == "FeedbackTexture2DArray";
   if (isUAV)
     return DxilResourceBase::Class::UAV;
 
@@ -2314,7 +2585,8 @@ hlsl::DxilResourceBase::Class CGMSHLSLRuntime::TypeToClass(clang::QualType Ty) {
 namespace {
   void GetResourceDeclElemTypeAndRangeSize(CodeGenModule &CGM, HLModule &HL, VarDecl &VD,
     QualType &ElemType, unsigned& rangeSize) {
-    ElemType = VD.getType().getCanonicalType();
+    // We can't canonicalize nor desugar the type without losing the 'snorm' in Buffer<snorm float>
+    ElemType = VD.getType();
     rangeSize = 1;
     while (const clang::ArrayType *arrayType = CGM.getContext().getAsArrayType(ElemType)) {
       if (rangeSize != UINT_MAX) {
@@ -2336,12 +2608,43 @@ namespace {
   }
 }
 
+static void InitFromUnusualAnnotations(DxilResourceBase &Resource, NamedDecl &Decl) {
+  for (hlsl::UnusualAnnotation* It : Decl.getUnusualAnnotations()) {
+    switch (It->getKind()) {
+    case hlsl::UnusualAnnotation::UA_RegisterAssignment: {
+      hlsl::RegisterAssignment* RegAssign = cast<hlsl::RegisterAssignment>(It);
+      if (RegAssign->RegisterType) {
+        Resource.SetLowerBound(RegAssign->RegisterNumber);
+        // For backcompat, don't auto-assign the register space if there's an
+        // explicit register type.
+        Resource.SetSpaceID(RegAssign->RegisterSpace.getValueOr(0));
+      }
+      else {
+        Resource.SetSpaceID(RegAssign->RegisterSpace.getValueOr(UINT_MAX));
+      }
+      break;
+    }
+    case hlsl::UnusualAnnotation::UA_SemanticDecl:
+      // Ignore Semantics
+      break;
+    case hlsl::UnusualAnnotation::UA_ConstantPacking:
+      // Should be handled by front-end
+      llvm_unreachable("packoffset on resource");
+      break;
+    default:
+      llvm_unreachable("unknown UnusualAnnotation on resource");
+      break;
+    }
+  }
+}
+
 uint32_t CGMSHLSLRuntime::AddSampler(VarDecl *samplerDecl) {
   llvm::GlobalVariable *val =
     cast<llvm::GlobalVariable>(CGM.GetAddrOfGlobalVar(samplerDecl));
 
   unique_ptr<DxilSampler> hlslRes(new DxilSampler);
   hlslRes->SetLowerBound(UINT_MAX);
+  hlslRes->SetSpaceID(UINT_MAX);
   hlslRes->SetGlobalSymbol(val);
   hlslRes->SetGlobalName(samplerDecl->getName());
 
@@ -2355,27 +2658,7 @@ uint32_t CGMSHLSLRuntime::AddSampler(VarDecl *samplerDecl) {
   DxilSampler::SamplerKind kind = KeywordToSamplerKind(RT->getDecl()->getName());
 
   hlslRes->SetSamplerKind(kind);
-
-  for (hlsl::UnusualAnnotation *it : samplerDecl->getUnusualAnnotations()) {
-    switch (it->getKind()) {
-    case hlsl::UnusualAnnotation::UA_RegisterAssignment: {
-      hlsl::RegisterAssignment *ra = cast<hlsl::RegisterAssignment>(it);
-      hlslRes->SetLowerBound(ra->RegisterNumber);
-      hlslRes->SetSpaceID(ra->RegisterSpace);
-      break;
-    }
-    case hlsl::UnusualAnnotation::UA_SemanticDecl:
-      // Ignore Semantics
-      break;
-    case hlsl::UnusualAnnotation::UA_ConstantPacking:
-      // Should be handled by front-end
-      llvm_unreachable("packoffset on sampler");
-      break;
-    default:
-      llvm_unreachable("unknown UnusualAnnotation on sampler");
-      break;
-    }
-  }
+  InitFromUnusualAnnotations(*hlslRes, *samplerDecl);
 
   hlslRes->SetID(m_pHLModule->GetSamplers().size());
   return m_pHLModule->AddSampler(std::move(hlslRes));
@@ -2540,6 +2823,19 @@ void CGMSHLSLRuntime::CreateSubobject(DXIL::SubobjectKind kind, const StringRef 
       }
       break;
     }
+    case DXIL::SubobjectKind::RaytracingPipelineConfig1: {
+      DXASSERT_NOMSG(argCount == 2);
+      uint32_t maxTraceRecursionDepth;
+      uint32_t raytracingPipelineFlags;
+      if (!GetAsConstantUInt32(args[0], &maxTraceRecursionDepth))
+        return;
+
+      if (!GetAsConstantUInt32(args[1], &raytracingPipelineFlags))
+        return;
+
+      subobjects->CreateRaytracingPipelineConfig1(name, maxTraceRecursionDepth, raytracingPipelineFlags);
+      break;
+    }
     default:
       llvm_unreachable("unknown SubobjectKind");
       break;
@@ -2594,14 +2890,15 @@ static void CollectScalarTypes(std::vector<QualType> &ScalarTys, QualType Ty) {
 
 bool CGMSHLSLRuntime::SetUAVSRV(SourceLocation loc,
                                 hlsl::DxilResourceBase::Class resClass,
-                                DxilResource *hlslRes, const RecordDecl *RD) {
-  hlsl::DxilResource::Kind kind = KeywordToKind(RD->getName());
-  hlslRes->SetKind(kind);
+                                DxilResource *hlslRes, QualType QualTy) {
 
-  // Get the result type from handle field.
-  FieldDecl *FD = *(RD->field_begin());
-  DXASSERT(FD->getName() == "h", "must be handle field");
-  QualType resultTy = FD->getType();
+  RecordDecl *RD = QualTy->getAs<RecordType>()->getDecl();
+
+  hlsl::DxilResource::Kind kind = KeywordToKind(RD->getName());
+  DXASSERT_NOMSG(kind != hlsl::DxilResource::Kind::Invalid);
+
+  hlslRes->SetKind(kind);
+  
   // Type annotation for result type of resource.
   DxilTypeSystem &dxilTypeSys = m_pHLModule->GetTypeSystem();
   unsigned arrayEltSize = 0;
@@ -2631,7 +2928,8 @@ bool CGMSHLSLRuntime::SetUAVSRV(SourceLocation loc,
     }
   }
 
-  if (kind != hlsl::DxilResource::Kind::StructuredBuffer) {
+  QualType resultTy = hlsl::GetHLSLResourceResultType(QualTy);
+  if (kind != hlsl::DxilResource::Kind::StructuredBuffer && !resultTy.isNull()) {
     QualType Ty = resultTy;
     QualType EltTy = Ty;
     if (hlsl::IsHLSLVecType(Ty)) {
@@ -2673,12 +2971,10 @@ bool CGMSHLSLRuntime::SetUAVSRV(SourceLocation loc,
       }
     }
 
-    EltTy = EltTy.getCanonicalType();
     bool bSNorm = false;
     bool bHasNormAttribute = hlsl::HasHLSLUNormSNorm(Ty, &bSNorm);
 
-    if (EltTy->isBuiltinType()) {
-      const BuiltinType *BTy = EltTy->getAs<BuiltinType>();
+    if (const BuiltinType *BTy = EltTy->getAs<BuiltinType>()) {
       CompType::Kind kind = BuiltinTyToCompTy(BTy, bHasNormAttribute && bSNorm, bHasNormAttribute && !bSNorm);
       // 64bits types are implemented with u32.
       if (kind == CompType::Kind::U64 || kind == CompType::Kind::I64 ||
@@ -2690,6 +2986,11 @@ bool CGMSHLSLRuntime::SetUAVSRV(SourceLocation loc,
     } else {
       DXASSERT(!bHasNormAttribute, "snorm/unorm on invalid type");
     }
+  }
+
+  if (hlslRes->IsFeedbackTexture()) {
+    hlslRes->SetSamplerFeedbackType(
+      static_cast<DXIL::SamplerFeedbackType>(hlsl::GetHLSLResourceTemplateUInt(QualTy)));
   }
 
   hlslRes->SetROV(RD->getName().startswith("RasterizerOrdered"));
@@ -2733,6 +3034,7 @@ uint32_t CGMSHLSLRuntime::AddUAVSRV(VarDecl *decl,
 
   unique_ptr<HLResource> hlslRes(new HLResource);
   hlslRes->SetLowerBound(UINT_MAX);
+  hlslRes->SetSpaceID(UINT_MAX);
   hlslRes->SetGlobalSymbol(val);
   hlslRes->SetGlobalName(decl->getName());
 
@@ -2741,36 +3043,13 @@ uint32_t CGMSHLSLRuntime::AddUAVSRV(VarDecl *decl,
   GetResourceDeclElemTypeAndRangeSize(CGM, *m_pHLModule, *decl,
     VarTy, rangeSize);
   hlslRes->SetRangeSize(rangeSize);
-
-  for (hlsl::UnusualAnnotation *it : decl->getUnusualAnnotations()) {
-    switch (it->getKind()) {
-    case hlsl::UnusualAnnotation::UA_RegisterAssignment: {
-      hlsl::RegisterAssignment *ra = cast<hlsl::RegisterAssignment>(it);
-      hlslRes->SetLowerBound(ra->RegisterNumber);
-      hlslRes->SetSpaceID(ra->RegisterSpace);
-      break;
-    }
-    case hlsl::UnusualAnnotation::UA_SemanticDecl:
-      // Ignore Semantics
-      break;
-    case hlsl::UnusualAnnotation::UA_ConstantPacking:
-      // Should be handled by front-end
-      llvm_unreachable("packoffset on uav/srv");
-      break;
-    default:
-      llvm_unreachable("unknown UnusualAnnotation on uav/srv");
-      break;
-    }
-  }
-
-  const RecordType *RT = VarTy->getAs<RecordType>();
-  RecordDecl *RD = RT->getDecl();
+  InitFromUnusualAnnotations(*hlslRes, *decl);
 
   if (decl->hasAttr<HLSLGloballyCoherentAttr>()) {
     hlslRes->SetGloballyCoherent(true);
   }
 
-  if (!SetUAVSRV(decl->getLocation(), resClass, hlslRes.get(), RD))
+  if (!SetUAVSRV(decl->getLocation(), resClass, hlslRes.get(), VarTy))
     return 0;
 
   if (resClass == hlsl::DxilResourceBase::Class::SRV) {
@@ -2829,6 +3108,7 @@ void CGMSHLSLRuntime::AddConstant(VarDecl *constDecl, HLCBuffer &CB) {
     return;
   }
   llvm::Constant *constVal = CGM.GetAddrOfGlobalVar(constDecl);
+  auto &regBindings = constantRegBindingMap[constVal];
 
   bool isGlobalCB = CB.GetID() == globalCBIndex;
   uint32_t offset = 0;
@@ -2855,12 +3135,35 @@ void CGMSHLSLRuntime::AddConstant(VarDecl *constDecl, HLCBuffer &CB) {
       break;
     }
     case hlsl::UnusualAnnotation::UA_RegisterAssignment: {
+      RegisterAssignment *ra = cast<RegisterAssignment>(it);
       if (isGlobalCB) {
-        RegisterAssignment *ra = cast<RegisterAssignment>(it);
+        if (ra->RegisterSpace.hasValue()) {
+          DiagnosticsEngine& Diags = CGM.getDiags();
+          unsigned DiagID = Diags.getCustomDiagID(
+            DiagnosticsEngine::Error,
+            "register space cannot be specified on global constants.");
+          Diags.Report(it->Loc, DiagID);
+        }
         offset = ra->RegisterNumber << 2;
         // Change to byte.
         offset <<= 2;
         userOffset = true;
+      }
+      switch (ra->RegisterType) {
+      default:
+        break;
+      case 't':
+        regBindings.emplace_back(
+            std::make_pair(DXIL::ResourceClass::SRV, ra->RegisterNumber));
+        break;
+      case 'u':
+        regBindings.emplace_back(
+            std::make_pair(DXIL::ResourceClass::UAV, ra->RegisterNumber));
+        break;
+      case 's':
+        regBindings.emplace_back(
+            std::make_pair(DXIL::ResourceClass::Sampler, ra->RegisterNumber));
+        break;
       }
       break;
     }
@@ -2872,6 +3175,7 @@ void CGMSHLSLRuntime::AddConstant(VarDecl *constDecl, HLCBuffer &CB) {
 
   std::unique_ptr<DxilResourceBase> pHlslConst = llvm::make_unique<DxilResourceBase>(DXIL::ResourceClass::Invalid);
   pHlslConst->SetLowerBound(UINT_MAX);
+  pHlslConst->SetSpaceID(0);
   pHlslConst->SetGlobalSymbol(cast<llvm::GlobalVariable>(constVal));
   pHlslConst->SetGlobalName(constDecl->getName());
 
@@ -2917,6 +3221,7 @@ uint32_t CGMSHLSLRuntime::AddCBuffer(HLSLBufferDecl *D) {
   // setup the CB
   CB->SetGlobalSymbol(nullptr);
   CB->SetGlobalName(D->getNameAsString());
+  CB->SetSpaceID(UINT_MAX);
   CB->SetLowerBound(UINT_MAX);
   if (!D->isCBuffer()) {
     CB->SetKind(DXIL::ResourceKind::TBuffer);
@@ -2925,24 +3230,7 @@ uint32_t CGMSHLSLRuntime::AddCBuffer(HLSLBufferDecl *D) {
   // the global variable will only used once by the createHandle?
   // SetHandle(llvm::Value *pHandle);
 
-  for (hlsl::UnusualAnnotation *it : D->getUnusualAnnotations()) {
-    switch (it->getKind()) {
-    case hlsl::UnusualAnnotation::UA_RegisterAssignment: {
-      hlsl::RegisterAssignment *ra = cast<hlsl::RegisterAssignment>(it);
-      uint32_t regNum = ra->RegisterNumber;
-      uint32_t regSpace = ra->RegisterSpace;
-      CB->SetSpaceID(regSpace);
-      CB->SetLowerBound(regNum);
-      break;
-    }
-    case hlsl::UnusualAnnotation::UA_SemanticDecl:
-      // skip semantic on constant buffer
-      break;
-    case hlsl::UnusualAnnotation::UA_ConstantPacking:
-      llvm_unreachable("no packoffset on constant buffer");
-      break;
-    }
-  }
+  InitFromUnusualAnnotations(*CB, *D);
 
   // Add constant
   if (D->isConstantBufferView()) {
@@ -3020,16 +3308,27 @@ void CGMSHLSLRuntime::SetEntryFunction() {
   m_pHLModule->SetEntryFunction(Entry.Func);
 }
 
-// Here the size is CB size. So don't need check type.
-static unsigned AlignCBufferOffset(unsigned offset, unsigned size, llvm::Type *Ty) {
+// Here the size is CB size.
+// Offset still needs to be aligned based on type since this
+// is the legacy cbuffer global path.
+static unsigned AlignCBufferOffset(unsigned offset, unsigned size, llvm::Type *Ty, bool bRowMajor) {
   DXASSERT(!(offset & 1), "otherwise we have an invalid offset.");
   bool bNeedNewRow = Ty->isArrayTy();
+  if (!bNeedNewRow && Ty->isStructTy()) {
+    if (HLMatrixType mat = HLMatrixType::dyn_cast(Ty)) {
+      bNeedNewRow |= !bRowMajor && mat.getNumColumns() > 1;
+      bNeedNewRow |= bRowMajor && mat.getNumRows() > 1;
+    } else {
+      bNeedNewRow = true;
+    }
+  }
   unsigned scalarSizeInBytes = Ty->getScalarSizeInBits() / 8;
 
   return AlignBufferOffsetInLegacy(offset, size, scalarSizeInBytes, bNeedNewRow);
 }
 
-static unsigned AllocateDxilConstantBuffer(HLCBuffer &CB) {
+static unsigned AllocateDxilConstantBuffer(HLCBuffer &CB,
+  std::unordered_map<Constant*, DxilFieldAnnotation> &constVarAnnotationMap) {
   unsigned offset = 0;
 
   // Scan user allocated constants first.
@@ -3050,8 +3349,12 @@ static unsigned AllocateDxilConstantBuffer(HLCBuffer &CB) {
 
     unsigned size = C->GetRangeSize();
     llvm::Type *Ty = C->GetGlobalSymbol()->getType()->getPointerElementType();
+    auto fieldAnnotation = constVarAnnotationMap.at(C->GetGlobalSymbol());
+    bool bRowMajor = HLMatrixType::isa(Ty)
+      ? fieldAnnotation.GetMatrixAnnotation().Orientation == MatrixOrientation::RowMajor
+      : false;
     // Align offset.
-    offset = AlignCBufferOffset(offset, size, Ty);
+    offset = AlignCBufferOffset(offset, size, Ty, bRowMajor);
     if (C->GetLowerBound() == UINT_MAX) {
       C->SetLowerBound(offset);
     }
@@ -3060,10 +3363,50 @@ static unsigned AllocateDxilConstantBuffer(HLCBuffer &CB) {
   return offset;
 }
 
-static void AllocateDxilConstantBuffers(HLModule *pHLModule) {
+static void AddRegBindingsForResourceInConstantBuffer(
+    HLModule *pHLModule,
+    llvm::DenseMap<llvm::Constant *,
+                   llvm::SmallVector<std::pair<DXIL::ResourceClass, unsigned>,
+                                     1>> &constantRegBindingMap) {
+  for (unsigned i = 0; i < pHLModule->GetCBuffers().size(); i++) {
+    HLCBuffer &CB = *static_cast<HLCBuffer *>(&(pHLModule->GetCBuffer(i)));
+    auto &Constants = CB.GetConstants();
+    for (unsigned j = 0; j < Constants.size(); j++) {
+      const std::unique_ptr<DxilResourceBase> &C = Constants[j];
+      Constant *CGV = C->GetGlobalSymbol();
+      auto &regBindings = constantRegBindingMap[CGV];
+      if (regBindings.empty())
+        continue;
+      unsigned Srv = UINT_MAX;
+      unsigned Uav = UINT_MAX;
+      unsigned Sampler = UINT_MAX;
+      for (auto it : regBindings) {
+        unsigned RegNum = it.second;
+        switch (it.first) {
+        case DXIL::ResourceClass::SRV:
+          Srv = RegNum;
+          break;
+        case DXIL::ResourceClass::UAV:
+          Uav = RegNum;
+          break;
+        case DXIL::ResourceClass::Sampler:
+          Sampler = RegNum;
+          break;
+        default:
+          DXASSERT(0, "invalid resource class");
+          break;
+        }
+      }
+      pHLModule->AddRegBinding(CB.GetID(), j, Srv, Uav, Sampler);
+    }
+  }
+}
+
+static void AllocateDxilConstantBuffers(HLModule *pHLModule,
+  std::unordered_map<Constant*, DxilFieldAnnotation> &constVarAnnotationMap) {
   for (unsigned i = 0; i < pHLModule->GetCBuffers().size(); i++) {
     HLCBuffer &CB = *static_cast<HLCBuffer*>(&(pHLModule->GetCBuffer(i)));
-    unsigned size = AllocateDxilConstantBuffer(CB);
+    unsigned size = AllocateDxilConstantBuffer(CB, constVarAnnotationMap);
     CB.SetSize(size);
   }
 }
@@ -3632,10 +3975,8 @@ static void AddOpcodeParamForIntrinsic(HLModule &HLM, Function *F,
     llvm::Type *Ty = paramTyList[i];
     if (Ty->isPointerTy()) {
       Ty = Ty->getPointerElementType();
-      if (dxilutil::IsHLSLObjectType(Ty) &&
-          // StreamOutput don't need handle.
-          !HLModule::IsStreamOutputType(Ty)) {
-        // Use handle type for object type.
+      if (dxilutil::IsHLSLResourceType(Ty)) {
+        // Use handle type for resource type.
         // This will make sure temp object variable only used by createHandle.
         paramTyList[i] = HandleTy;
       }
@@ -3693,7 +4034,7 @@ static void AddOpcodeParamForIntrinsic(HLModule &HLM, Function *F,
     gep_type_iterator GEPIt = gep_type_begin(objGEP), E = gep_type_end(objGEP);
     llvm::Type *resTy = nullptr;
     while (GEPIt != E) {
-      if (dxilutil::IsHLSLObjectType(*GEPIt)) {
+      if (dxilutil::IsHLSLResourceType(*GEPIt)) {
         resTy = *GEPIt;
         break;
       }
@@ -3776,9 +4117,7 @@ static void AddOpcodeParamForIntrinsic(HLModule &HLM, Function *F,
       llvm::Type *Ty = arg->getType();
       if (Ty->isPointerTy()) {
         Ty = Ty->getPointerElementType();
-        if (dxilutil::IsHLSLObjectType(Ty) &&
-          // StreamOutput don't need handle.
-          !HLModule::IsStreamOutputType(Ty)) {
+        if (dxilutil::IsHLSLResourceType(Ty)) {
           // Use object type directly, not by pointer.
           // This will make sure temp object variable only used by ld/st.
           if (GEPOperator *argGEP = dyn_cast<GEPOperator>(arg)) {
@@ -4054,6 +4393,7 @@ static void SimplifyBitCast(BitCastOperator *BC, SmallInstSet &deadInsts) {
 typedef float(__cdecl *FloatUnaryEvalFuncType)(float);
 typedef double(__cdecl *DoubleUnaryEvalFuncType)(double);
 
+typedef APInt(__cdecl *IntBinaryEvalFuncType)(const APInt&, const APInt&);
 typedef float(__cdecl *FloatBinaryEvalFuncType)(float, float);
 typedef double(__cdecl *DoubleBinaryEvalFuncType)(double, double);
 
@@ -4075,21 +4415,34 @@ static Value * EvalUnaryIntrinsic(ConstantFP *fpV,
   return Result;
 }
 
-static Value * EvalBinaryIntrinsic(ConstantFP *fpV0, ConstantFP *fpV1,
+static Value * EvalBinaryIntrinsic(Constant *cV0, Constant *cV1,
                                FloatBinaryEvalFuncType floatEvalFunc,
-                               DoubleBinaryEvalFuncType doubleEvalFunc) {
-  llvm::Type *Ty = fpV0->getType();
+                               DoubleBinaryEvalFuncType doubleEvalFunc,
+                               IntBinaryEvalFuncType intEvalFunc) {
+  llvm::Type *Ty = cV0->getType();
   Value *Result = nullptr;
   if (Ty->isDoubleTy()) {
+    ConstantFP *fpV0 = cast<ConstantFP>(cV0);
+    ConstantFP *fpV1 = cast<ConstantFP>(cV1);
     double dV0 = fpV0->getValueAPF().convertToDouble();
     double dV1 = fpV1->getValueAPF().convertToDouble();
     Value *dResult = ConstantFP::get(Ty, doubleEvalFunc(dV0, dV1));
     Result = dResult;
-  } else {
-    DXASSERT_NOMSG(Ty->isFloatTy());
+  } else if (Ty->isFloatTy()) {
+    ConstantFP *fpV0 = cast<ConstantFP>(cV0);
+    ConstantFP *fpV1 = cast<ConstantFP>(cV1);
     float fV0 = fpV0->getValueAPF().convertToFloat();
     float fV1 = fpV1->getValueAPF().convertToFloat();
     Value *dResult = ConstantFP::get(Ty, floatEvalFunc(fV0, fV1));
+    Result = dResult;
+  } else {
+    DXASSERT_NOMSG(Ty->isIntegerTy());
+    DXASSERT_NOMSG(intEvalFunc);
+    ConstantInt *ciV0 = cast<ConstantInt>(cV0);
+    ConstantInt *ciV1 = cast<ConstantInt>(cV1);
+    const APInt& iV0 = ciV0->getValue();
+    const APInt& iV1 = ciV1->getValue();
+    Value *dResult = ConstantInt::get(Ty, intEvalFunc(iV0, iV1));
     Result = dResult;
   }
   return Result;
@@ -4121,7 +4474,8 @@ static Value * EvalUnaryIntrinsic(CallInst *CI,
 
 static Value * EvalBinaryIntrinsic(CallInst *CI,
                                FloatBinaryEvalFuncType floatEvalFunc,
-                               DoubleBinaryEvalFuncType doubleEvalFunc) {
+                               DoubleBinaryEvalFuncType doubleEvalFunc,
+                               IntBinaryEvalFuncType intEvalFunc = nullptr) {
   Value *V0 = CI->getArgOperand(0);
   Value *V1 = CI->getArgOperand(1);
   llvm::Type *Ty = CI->getType();
@@ -4132,15 +4486,15 @@ static Value * EvalBinaryIntrinsic(CallInst *CI,
     Constant *CV1 = cast<Constant>(V1);
     IRBuilder<> Builder(CI);
     for (unsigned i=0;i<VT->getNumElements();i++) {
-      ConstantFP *fpV0 = cast<ConstantFP>(CV0->getAggregateElement(i));
-      ConstantFP *fpV1 = cast<ConstantFP>(CV1->getAggregateElement(i));
-      Value *EltResult = EvalBinaryIntrinsic(fpV0, fpV1, floatEvalFunc, doubleEvalFunc);
+      Constant *cV0 = cast<Constant>(CV0->getAggregateElement(i));
+      Constant *cV1 = cast<Constant>(CV1->getAggregateElement(i));
+      Value *EltResult = EvalBinaryIntrinsic(cV0, cV1, floatEvalFunc, doubleEvalFunc, intEvalFunc);
       Result = Builder.CreateInsertElement(Result, EltResult, i);
     }
   } else {
-    ConstantFP *fpV0 = cast<ConstantFP>(V0);
-    ConstantFP *fpV1 = cast<ConstantFP>(V1);
-    Result = EvalBinaryIntrinsic(fpV0, fpV1, floatEvalFunc, doubleEvalFunc);
+    Constant *cV0 = cast<Constant>(V0);
+    Constant *cV1 = cast<Constant>(V1);
+    Result = EvalBinaryIntrinsic(cV0, cV1, floatEvalFunc, doubleEvalFunc, intEvalFunc);
   }
   CI->replaceAllUsesWith(Result);
   CI->eraseFromParent();
@@ -4235,18 +4589,24 @@ static Value * TryEvalIntrinsic(CallInst *CI, IntrinsicOp intriOp) {
   case IntrinsicOp::IOP_max: {
     auto maxF = [](float a, float b) -> float { return a > b ? a:b; };
     auto maxD = [](double a, double b) -> double { return a > b ? a:b; };
-    // Handled in DXIL constant folding
-    if (CI->getArgOperand(0)->getType()->getScalarType()->isIntegerTy())
-      return nullptr;
-    return EvalBinaryIntrinsic(CI, maxF, maxD);
+    auto imaxI = [](const APInt &a, const APInt &b) -> APInt { return a.sgt(b) ? a : b; };
+    return EvalBinaryIntrinsic(CI, maxF, maxD, imaxI);
   } break;
   case IntrinsicOp::IOP_min: {
     auto minF = [](float a, float b) -> float { return a < b ? a:b; };
     auto minD = [](double a, double b) -> double { return a < b ? a:b; };
-    // Handled in DXIL constant folding
-    if (CI->getArgOperand(0)->getType()->getScalarType()->isIntegerTy())
-      return nullptr;
-    return EvalBinaryIntrinsic(CI, minF, minD);
+    auto iminI = [](const APInt &a, const APInt &b) -> APInt { return a.slt(b) ? a : b; };
+    return EvalBinaryIntrinsic(CI, minF, minD, iminI);
+  } break;
+  case IntrinsicOp::IOP_umax: {
+    DXASSERT_NOMSG(CI->getArgOperand(0)->getType()->getScalarType()->isIntegerTy());
+    auto umaxI = [](const APInt &a, const APInt &b) -> APInt { return a.ugt(b) ? a : b; };
+    return EvalBinaryIntrinsic(CI, nullptr, nullptr, umaxI);
+  } break;
+  case IntrinsicOp::IOP_umin: {
+    DXASSERT_NOMSG(CI->getArgOperand(0)->getType()->getScalarType()->isIntegerTy());
+    auto uminI = [](const APInt &a, const APInt &b) -> APInt { return a.ult(b) ? a : b; };
+    return EvalBinaryIntrinsic(CI, nullptr, nullptr, uminI);
   } break;
   case IntrinsicOp::IOP_rcp: {
     auto rcpF = [](float v) -> float { return 1.0 / v; };
@@ -4268,12 +4628,10 @@ static Value * TryEvalIntrinsic(CallInst *CI, IntrinsicOp intriOp) {
   } break;
   case IntrinsicOp::IOP_frac: {
     auto fracF = [](float v) -> float {
-      int exp = 0;
-      return frexpf(v, &exp);
+      return v - floor(v);
     };
     auto fracD = [](double v) -> double {
-      int exp = 0;
-      return frexp(v, &exp);
+      return v - floor(v);
     };
 
     return EvalUnaryIntrinsic(CI, fracF, fracD);
@@ -4790,7 +5148,56 @@ static void CreateWriteEnabledStaticGlobals(llvm::Module *M,
   }
 }
 
+// Translate RayQuery constructor.  From:
+//  %call = call %"RayQuery<flags>" @<constructor>(%"RayQuery<flags>" %ptr)
+// To:
+//  i32 %handle = AllocateRayQuery(i32 <IntrinsicOp::IOP_AllocateRayQuery>, i32 %flags)
+//  %gep = GEP %"RayQuery<flags>" %ptr, 0, 0
+//  store i32* %gep, i32 %handle
+//  ; and replace uses of %call with %ptr
+void TranslateRayQueryConstructor(llvm::Module &M) {
+  SmallVector<Function*, 4> Constructors;
+  for (auto &F : M.functions()) {
+    // Match templated RayQuery constructor instantiation by prefix and signature.
+    // It should be impossible to achieve the same signature from HLSL.
+    if (!F.getName().startswith("\01??0?$RayQuery@$"))
+      continue;
+    llvm::Type *Ty = F.getReturnType();
+    if (!Ty->isPointerTy() || !dxilutil::IsHLSLRayQueryType(Ty->getPointerElementType()))
+      continue;
+    if (F.arg_size() != 1 || Ty != F.arg_begin()->getType())
+      continue;
+    Constructors.emplace_back(&F);
+  }
 
+  for (auto pConstructorFunc : Constructors) {
+    llvm::IntegerType *i32Ty = llvm::Type::getInt32Ty(M.getContext());
+    llvm::ConstantInt *i32Zero = llvm::ConstantInt::get(i32Ty, (uint64_t)0, false);
+    llvm::FunctionType *funcTy = llvm::FunctionType::get(i32Ty, {i32Ty, i32Ty}, false);
+    unsigned opcode = (unsigned)IntrinsicOp::IOP_AllocateRayQuery;
+    llvm::ConstantInt *opVal = llvm::ConstantInt::get(i32Ty, opcode, false);
+    Function *opFunc = GetOrCreateHLFunction(M, funcTy, HLOpcodeGroup::HLIntrinsic, opcode);
+
+    while (!pConstructorFunc->user_empty()) {
+      Value *V = *pConstructorFunc->user_begin();
+      llvm::CallInst *CI = cast<CallInst>(V); // Must be call
+      llvm::Value *pThis = CI->getArgOperand(0);
+      llvm::StructType *pRQType = cast<llvm::StructType>(pThis->getType()->getPointerElementType());
+      DxilStructAnnotation *SA = M.GetHLModule().GetTypeSystem().GetStructAnnotation(pRQType);
+      DXASSERT(SA, "otherwise, could not find type annoation for RayQuery specialization");
+      DXASSERT(SA->GetNumTemplateArgs() == 1 && SA->GetTemplateArgAnnotation(0).IsIntegral(),
+                "otherwise, RayQuery has changed, or lacks template args");
+      llvm::IRBuilder<> Builder(CI);
+      llvm::Value *rayFlags = Builder.getInt32(SA->GetTemplateArgAnnotation(0).GetIntegral());
+      llvm::Value *Call = Builder.CreateCall(opFunc, {opVal, rayFlags}, pThis->getName());
+      llvm::Value *GEP = Builder.CreateInBoundsGEP(pThis, {i32Zero, i32Zero});
+      Builder.CreateStore(Call, GEP);
+      CI->replaceAllUsesWith(pThis);
+      CI->eraseFromParent();
+    }
+    pConstructorFunc->eraseFromParent();
+  }
+}
 
 void CGMSHLSLRuntime::FinishCodeGen() {
   // Library don't have entry.
@@ -4856,12 +5263,18 @@ void CGMSHLSLRuntime::FinishCodeGen() {
     }
   }
 
+  // Add Reg bindings for resource in cb.
+  AddRegBindingsForResourceInConstantBuffer(m_pHLModule, constantRegBindingMap);
+
   // Allocate constant buffers.
-  AllocateDxilConstantBuffers(m_pHLModule);
+  AllocateDxilConstantBuffers(m_pHLModule, m_ConstVarAnnotationMap);
   // TODO: create temp variable for constant which has store use.
 
   // Create Global variable and type annotation for each CBuffer.
   ConstructCBuffer(m_pHLModule, CBufferType, m_ConstVarAnnotationMap);
+
+  // Translate calls to RayQuery constructor into hl Allocate calls
+  TranslateRayQueryConstructor(*m_pHLModule->GetModule());
 
   if (!m_bIsLib) {
     // need this for "llvm.global_dtors"?
@@ -6167,7 +6580,7 @@ Value *CGMSHLSLRuntime::EmitHLSLLiteralCast(CodeGenFunction &CGF, Value *Src,
                                             QualType DstType) {
   auto &Builder = CGF.Builder;
   llvm::Type *DstTy = CGF.ConvertType(DstType);
-  bool bDstSigned = DstType->isSignedIntegerType();
+  bool bSrcSigned = SrcType->isSignedIntegerType();
 
   if (ConstantInt *CI = dyn_cast<ConstantInt>(Src)) {
     APInt v = CI->getValue();
@@ -6195,7 +6608,7 @@ Value *CGMSHLSLRuntime::EmitHLSLLiteralCast(CodeGenFunction &CGF, Value *Src,
       else if (DstTy->isFloatTy())
         return ConstantFP::get(DstTy, (float)val);
       else {
-        if (bDstSigned)
+        if (bSrcSigned)
           return Builder.CreateSIToFP(Src, DstTy);
         else
           return Builder.CreateUIToFP(Src, DstTy);
@@ -6290,7 +6703,7 @@ Value *CGMSHLSLRuntime::EmitHLSLLiteralCast(CodeGenFunction &CGF, Value *Src,
               return Builder.CreateZExtOrTrunc(CastResult, DstTy);
           }
         } else {
-          if (bDstSigned)
+          if (bSrcSigned)
             return Builder.CreateSIToFP(CastResult, DstTy);
           else
             return Builder.CreateUIToFP(CastResult, DstTy);
@@ -6301,6 +6714,33 @@ Value *CGMSHLSLRuntime::EmitHLSLLiteralCast(CodeGenFunction &CGF, Value *Src,
     return nullptr;
   }
 }
+
+// For case like ((float3xfloat3)mat4x4).m21 or ((float3xfloat3)mat4x4)[1], just
+// treat it like mat4x4.m21 or mat4x4[1].
+static Value *GetOriginMatrixOperandAndUpdateMatSize(Value *Ptr, unsigned &row,
+                                                     unsigned &col) {
+  if (CallInst *Mat = dyn_cast<CallInst>(Ptr)) {
+    HLOpcodeGroup OpcodeGroup =
+        GetHLOpcodeGroupByName(Mat->getCalledFunction());
+    if (OpcodeGroup == HLOpcodeGroup::HLCast) {
+      HLCastOpcode castOpcode = static_cast<HLCastOpcode>(GetHLOpcode(Mat));
+      if (castOpcode == HLCastOpcode::DefaultCast) {
+        Ptr = Mat->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
+        // Remove the cast which is useless now.
+        Mat->eraseFromParent();
+        // Update row and col.
+        HLMatrixType matTy =
+            HLMatrixType::cast(Ptr->getType()->getPointerElementType());
+        row = matTy.getNumRows();
+        col = matTy.getNumColumns();
+        // Don't update RetTy and DxilGeneration pass will do the right thing.
+        return Ptr;
+      }
+    }
+  }
+  return nullptr;
+}
+
 
 Value *CGMSHLSLRuntime::EmitHLSLMatrixSubscript(CodeGenFunction &CGF,
                                                 llvm::Type *RetType,
@@ -6320,11 +6760,19 @@ Value *CGMSHLSLRuntime::EmitHLSLMatrixSubscript(CodeGenFunction &CGF,
       llvm::PointerType::get(RetType->getPointerElementType(),
                              matBase->getType()->getPointerAddressSpace());
 
+  unsigned row, col;
+  hlsl::GetHLSLMatRowColCount(Ty, row, col);
+  unsigned resultCol = col;
+  if (Value *OriginPtr = GetOriginMatrixOperandAndUpdateMatSize(Ptr, row, col)) {
+    Ptr = OriginPtr;
+    // Update col to result col to get correct result size.
+    col = resultCol;
+  }
+
   // Lower mat[Idx] into real idx.
   SmallVector<Value *, 8> args;
   args.emplace_back(Ptr);
-  unsigned row, col;
-  hlsl::GetHLSLMatRowColCount(Ty, row, col);
+
   if (isRowMajor) {
     Value *cCol = ConstantInt::get(Idx->getType(), col);
     Value *Base = CGF.Builder.CreateMul(cCol, Idx);
@@ -6374,6 +6822,14 @@ Value *CGMSHLSLRuntime::EmitHLSLMatrixElement(CodeGenFunction &CGF,
   // -1 to avoid opcode param which is added in EmitHLSLMatrixOperationCallImp.
   Value *args[] = {paramList[HLOperandIndex::kMatSubscriptMatOpIdx - 1],
                    paramList[HLOperandIndex::kMatSubscriptSubOpIdx - 1]};
+
+  unsigned row, col;
+  hlsl::GetHLSLMatRowColCount(Ty, row, col);
+  Value *Ptr = paramList[0];
+  if (Value *OriginPtr = GetOriginMatrixOperandAndUpdateMatSize(Ptr, row, col)) {
+    args[0] = OriginPtr;
+  }
+
   // For all zero idx. Still all zero idx.
   if (ConstantAggregateZero *zeros = dyn_cast<ConstantAggregateZero>(idx)) {
     Constant *zero = zeros->getAggregateElement((unsigned)0);
@@ -6382,8 +6838,6 @@ Value *CGMSHLSLRuntime::EmitHLSLMatrixElement(CodeGenFunction &CGF,
   } else {
     ConstantDataSequential *elts = cast<ConstantDataSequential>(idx);
     unsigned count = elts->getNumElements();
-    unsigned row, col;
-    hlsl::GetHLSLMatRowColCount(Ty, row, col);
     std::vector<Constant *> idxs(count >> 1);
     for (unsigned i = 0; i < count; i += 2) {
       unsigned rowIdx = elts->getElementAsInteger(i);
@@ -6683,6 +7137,17 @@ static bool AreMatrixArrayOrientationMatching(ASTContext& Context,
   return LhsRowMajor == RhsRowMajor;
 }
 
+static llvm::Value *CreateInBoundsGEPIfNeeded(llvm::Value *Ptr, ArrayRef<Value*> IdxList, CGBuilderTy &Builder) {
+  DXASSERT(IdxList.size() > 0, "Invalid empty GEP index list");
+  // If the GEP list is a single zero, it's a no-op, so save us the trouble.
+  if (IdxList.size() == 1) {
+    if (ConstantInt *FirstIdx = dyn_cast<ConstantInt>(IdxList[0])) {
+      if (FirstIdx->isZero()) return Ptr;
+    }
+  }
+  return Builder.CreateInBoundsGEP(Ptr, IdxList);
+}
+
 // Copy data from SrcPtr to DestPtr.
 // For matrix, use MatLoad/MatStore.
 // For matrix array, EmitHLSLAggregateCopy on each element.
@@ -6703,29 +7168,29 @@ void CGMSHLSLRuntime::EmitHLSLAggregateCopy(
     idxList.pop_back();
   } else if (HLMatrixType::isa(Ty)) {
     // Use matLd/St for matrix.
-    Value *srcGEP = CGF.Builder.CreateInBoundsGEP(SrcPtr, idxList);
-    Value *dstGEP = CGF.Builder.CreateInBoundsGEP(DestPtr, idxList);
-    Value *ldMat = EmitHLSLMatrixLoad(CGF, srcGEP, SrcType);
-    EmitHLSLMatrixStore(CGF, ldMat, dstGEP, DestType);
+    Value *SrcMatPtr = CreateInBoundsGEPIfNeeded(SrcPtr, idxList, CGF.Builder);
+    Value *DestMatPtr = CreateInBoundsGEPIfNeeded(DestPtr, idxList, CGF.Builder);
+    Value *ldMat = EmitHLSLMatrixLoad(CGF, SrcMatPtr, SrcType);
+    EmitHLSLMatrixStore(CGF, ldMat, DestMatPtr, DestType);
   } else if (StructType *ST = dyn_cast<StructType>(Ty)) {
     if (dxilutil::IsHLSLObjectType(ST)) {
       // Avoid split HLSL object.
       SimpleCopy(DestPtr, SrcPtr, idxList, CGF.Builder);
       return;
     }
-    Value *srcGEP = CGF.Builder.CreateInBoundsGEP(SrcPtr, idxList);
-    Value *dstGEP = CGF.Builder.CreateInBoundsGEP(DestPtr, idxList);
+    Value *SrcStructPtr = CreateInBoundsGEPIfNeeded(SrcPtr, idxList, CGF.Builder);
+    Value *DestStructPtr = CreateInBoundsGEPIfNeeded(DestPtr, idxList, CGF.Builder);
     unsigned size = this->TheModule.getDataLayout().getTypeAllocSize(ST);
     // Memcpy struct.
-    CGF.Builder.CreateMemCpy(dstGEP, srcGEP, size, 1);
+    CGF.Builder.CreateMemCpy(DestStructPtr, SrcStructPtr, size, 1);
   } else if (llvm::ArrayType *AT = dyn_cast<llvm::ArrayType>(Ty)) {
     if (!HLMatrixType::isMatrixArray(Ty)
       || AreMatrixArrayOrientationMatching(CGF.getContext(), *m_pHLModule, SrcType, DestType)) {
-      Value *srcGEP = CGF.Builder.CreateInBoundsGEP(SrcPtr, idxList);
-      Value *dstGEP = CGF.Builder.CreateInBoundsGEP(DestPtr, idxList);
+      Value *SrcArrayPtr = CreateInBoundsGEPIfNeeded(SrcPtr, idxList, CGF.Builder);
+      Value *DestArrayPtr = CreateInBoundsGEPIfNeeded(DestPtr, idxList, CGF.Builder);
       unsigned size = this->TheModule.getDataLayout().getTypeAllocSize(AT);
       // Memcpy non-matrix array.
-      CGF.Builder.CreateMemCpy(dstGEP, srcGEP, size, 1);
+      CGF.Builder.CreateMemCpy(DestArrayPtr, SrcArrayPtr, size, 1);
     } else {
       // Copy matrix arrays elementwise if orientation changes are needed.
       llvm::Type *ET = AT->getElementType();
@@ -6754,6 +7219,30 @@ void CGMSHLSLRuntime::EmitHLSLAggregateCopy(CodeGenFunction &CGF, llvm::Value *S
     SmallVector<Value *, 4> idxList;
     EmitHLSLAggregateCopy(CGF, SrcPtr, DestPtr, idxList, Ty, Ty, SrcPtr->getType());
 }
+
+// Make sure all element type of struct is same type.
+static bool IsStructWithSameElementType(llvm::StructType *ST, llvm::Type *Ty) {
+  for (llvm::Type *EltTy : ST->elements()) {
+    if (StructType *EltSt = dyn_cast<StructType>(EltTy)) {
+      if (!IsStructWithSameElementType(EltSt, Ty))
+        return false;
+    } else if (llvm::ArrayType *AT = dyn_cast<llvm::ArrayType>(EltTy)) {
+      llvm::Type *ArrayEltTy = dxilutil::GetArrayEltTy(AT);
+      if (ArrayEltTy == Ty) {
+        continue;
+      } else if (StructType *EltSt = dyn_cast<StructType>(EltTy)) {
+        if (!IsStructWithSameElementType(EltSt, Ty))
+          return false;
+      } else {
+        return false;
+      }
+
+    } else if (EltTy != Ty)
+      return false;
+  }
+  return true;
+}
+
 // To memcpy, need element type match.
 // For struct type, the layout should match in cbuffer layout.
 // struct { float2 x; float3 y; } will not match struct { float3 x; float2 y; }.
@@ -6784,11 +7273,8 @@ static bool IsTypeMatchForMemcpy(llvm::Type *SrcTy, llvm::Type *DestTy) {
       return false;
     if (Ty->getVectorNumElements() != 4)
       return false;
-    for (llvm::Type *EltTy : ST->elements()) {
-      if (EltTy != Ty)
-        return false;
-    }
-    return true;
+
+    return IsStructWithSameElementType(ST, Ty);
   }
 }
 

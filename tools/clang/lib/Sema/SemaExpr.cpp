@@ -608,6 +608,32 @@ static void DiagnoseDirectIsaAccess(Sema &S, const ObjCIvarRefExpr *OIRE,
     }
 }
 
+static bool IsExprAccessingMeshOutArray(Expr* BaseExpr) {
+  switch (BaseExpr->getStmtClass()) {
+  case Stmt::ArraySubscriptExprClass: {
+    ArraySubscriptExpr* ase = cast<ArraySubscriptExpr>(BaseExpr);
+    return IsExprAccessingMeshOutArray(ase->getBase());
+  }
+  case Stmt::ImplicitCastExprClass: {
+    ImplicitCastExpr* ice = cast<ImplicitCastExpr>(BaseExpr);
+    return IsExprAccessingMeshOutArray(ice->getSubExpr());
+  }
+  case Stmt::DeclRefExprClass: {
+    DeclRefExpr* dre = cast<DeclRefExpr>(BaseExpr);
+    ValueDecl* vd = dre->getDecl();
+    if (vd->getAttr<HLSLOutAttr>() &&
+        (vd->getAttr<HLSLIndicesAttr>() ||
+         vd->getAttr<HLSLVerticesAttr>() ||
+         vd->getAttr<HLSLPrimitivesAttr>())) {
+      return true;
+    }
+    return false;
+  }
+  default:
+    return false;
+  }
+}
+
 ExprResult Sema::DefaultLvalueConversion(Expr *E) {
   // Handle any placeholder expressions which made it here.
   if (E->getType()->isPlaceholderType()) {
@@ -665,6 +691,12 @@ ExprResult Sema::DefaultLvalueConversion(Expr *E) {
   else if (const ObjCIvarRefExpr *OIRE =
             dyn_cast<ObjCIvarRefExpr>(E->IgnoreParenCasts()))
     DiagnoseDirectIsaAccess(*this, OIRE, SourceLocation(), /* Expr*/nullptr);
+
+  // check the access to mesh shader output arrays
+  if (isa<ArraySubscriptExpr>(E) && IsExprAccessingMeshOutArray(E)) {
+    Diag(E->getExprLoc(), diag::err_hlsl_load_from_mesh_out_arrays);
+    return ExprError();
+  }
 
   // C++ [conv.lval]p1:
   //   [...] If T is a non-class type, the type of the prvalue is the
@@ -3661,6 +3693,27 @@ static void warnOnSizeofOnArrayDecay(Sema &S, SourceLocation Loc, QualType T,
                                              << ICE->getSubExpr()->getType();
 }
 
+// HLSL Change Begins
+bool Sema::CheckHLSLUnaryExprOrTypeTraitOperand(QualType ExprType, SourceLocation Loc,
+                                                UnaryExprOrTypeTrait ExprKind) {
+  assert(ExprKind == UnaryExprOrTypeTrait::UETT_SizeOf);
+
+  // "sizeof 42" is ill-defined because HLSL has literal int type which can decay to an int of any size.
+  const BuiltinType* BuiltinTy = ExprType->getAs<BuiltinType>();
+  if (BuiltinTy != nullptr && (BuiltinTy->getKind() == BuiltinType::LitInt || BuiltinTy->getKind() == BuiltinType::LitFloat)) {
+    Diag(Loc, diag::err_hlsl_sizeof_literal) << ExprType;
+    return true;
+  }
+
+  if (!hlsl::IsHLSLNumericOrAggregateOfNumericType(ExprType)) {
+    Diag(Loc, diag::err_hlsl_sizeof_nonnumeric) << ExprType;
+    return true;
+  }
+
+  return false;
+}
+// HLSL Change Ends
+
 /// \brief Check the constraints on expression operands to unary type expression
 /// and type traits.
 ///
@@ -3701,6 +3754,10 @@ bool Sema::CheckUnaryExprOrTypeTraitOperand(Expr *E,
   // Completing the expression's type may have changed it.
   ExprTy = E->getType();
   assert(!ExprTy->isReferenceType());
+
+  if (getLangOpts().HLSL && CheckHLSLUnaryExprOrTypeTraitOperand(ExprTy, E->getExprLoc(), ExprKind)) {
+    return true;
+  }
 
   if (ExprTy->isFunctionType()) {
     Diag(E->getExprLoc(), diag::err_sizeof_alignof_function_type)
@@ -3775,6 +3832,10 @@ bool Sema::CheckUnaryExprOrTypeTraitOperand(QualType ExprType,
   //     shall be the alignment of the referenced type.
   if (const ReferenceType *Ref = ExprType->getAs<ReferenceType>())
     ExprType = Ref->getPointeeType();
+
+  if (getLangOpts().HLSL && CheckHLSLUnaryExprOrTypeTraitOperand(ExprType, OpLoc, ExprKind)) {
+    return true;
+  }
 
   // C11 6.5.3.4/3, C++11 [expr.alignof]p3:
   //   When alignof or _Alignof is applied to an array type, the result

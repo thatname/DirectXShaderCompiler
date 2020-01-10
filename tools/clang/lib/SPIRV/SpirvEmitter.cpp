@@ -14,6 +14,7 @@
 #include "SpirvEmitter.h"
 
 #include "AlignmentSizeCalculator.h"
+#include "RawBufferMethods.h"
 #include "dxc/HlslIntrinsicOp.h"
 #include "spirv-tools/optimizer.hpp"
 #include "clang/SPIRV/AstTypeProbe.h"
@@ -163,7 +164,7 @@ bool spirvToolsLegalize(spv_target_env env, std::vector<uint32_t> *module,
 }
 
 bool spirvToolsOptimize(spv_target_env env, std::vector<uint32_t> *module,
-                        const llvm::SmallVector<llvm::StringRef, 4> &flags,
+                        clang::spirv::SpirvCodeGenOptions &spirvOptions,
                         std::string *messages) {
   spvtools::Optimizer optimizer(env);
 
@@ -175,14 +176,16 @@ bool spirvToolsOptimize(spv_target_env env, std::vector<uint32_t> *module,
   spvtools::OptimizerOptions options;
   options.set_run_validator(false);
 
-  if (flags.empty()) {
+  if (spirvOptions.optConfig.empty()) {
     optimizer.RegisterPerformancePasses();
+    if (spirvOptions.flattenResourceArrays)
+      optimizer.RegisterPass(spvtools::CreateDescriptorScalarReplacementPass());
     optimizer.RegisterPass(spvtools::CreateCompactIdsPass());
   } else {
     // Command line options use llvm::SmallVector and llvm::StringRef, whereas
     // SPIR-V optimizer uses std::vector and std::string.
     std::vector<std::string> stdFlags;
-    for (const auto &f : flags)
+    for (const auto &f : spirvOptions.optConfig)
       stdFlags.push_back(f.str());
     if (!optimizer.RegisterPassesFromFlags(stdFlags))
       return false;
@@ -192,8 +195,8 @@ bool spirvToolsOptimize(spv_target_env env, std::vector<uint32_t> *module,
 }
 
 bool spirvToolsValidate(spv_target_env env, const SpirvCodeGenOptions &opts,
-                        bool relaxLogicalPointer, std::vector<uint32_t> *module,
-                        std::string *messages) {
+                        bool beforeHlslLegalization,
+                        std::vector<uint32_t> *module, std::string *messages) {
   spvtools::SpirvTools tools(env);
 
   tools.SetMessageConsumer(
@@ -202,12 +205,12 @@ bool spirvToolsValidate(spv_target_env env, const SpirvCodeGenOptions &opts,
                  const char *message) { *messages += message; });
 
   spvtools::ValidatorOptions options;
-  options.SetRelaxLogicalPointer(relaxLogicalPointer);
+  options.SetBeforeHlslLegalization(beforeHlslLegalization);
   // GL: strict block layout rules
   // VK: relaxed block layout rules
   // DX: Skip block layout rules
   if (opts.useScalarLayout || opts.useDxLayout) {
-    options.SetSkipBlockLayout(true);
+    options.SetScalarBlockLayout(true);
   } else if (opts.useGlLayout) {
     // spirv-val by default checks this.
   } else {
@@ -486,7 +489,7 @@ SpirvEmitter::SpirvEmitter(CompilerInstance &ci)
                    spirvOptions),
       entryFunction(nullptr), curFunction(nullptr), curThis(nullptr),
       seenPushConstantAt(), isSpecConstantMode(false), needsLegalization(false),
-      mainSourceFile(nullptr) {
+      beforeHlslLegalization(false), mainSourceFile(nullptr) {
 
   // Get ShaderModel from command line hlsl profile option.
   const hlsl::ShaderModel *shaderModel =
@@ -511,28 +514,34 @@ SpirvEmitter::SpirvEmitter(CompilerInstance &ci)
     spirvOptions.cBufferLayoutRule = SpirvLayoutRule::FxcCTBuffer;
     spirvOptions.tBufferLayoutRule = SpirvLayoutRule::FxcCTBuffer;
     spirvOptions.sBufferLayoutRule = SpirvLayoutRule::FxcSBuffer;
+    spirvOptions.ampPayloadLayoutRule = SpirvLayoutRule::FxcSBuffer;
   } else if (spirvOptions.useGlLayout) {
     spirvOptions.cBufferLayoutRule = SpirvLayoutRule::GLSLStd140;
     spirvOptions.tBufferLayoutRule = SpirvLayoutRule::GLSLStd430;
     spirvOptions.sBufferLayoutRule = SpirvLayoutRule::GLSLStd430;
+    spirvOptions.ampPayloadLayoutRule = SpirvLayoutRule::GLSLStd430;
   } else if (spirvOptions.useScalarLayout) {
     spirvOptions.cBufferLayoutRule = SpirvLayoutRule::Scalar;
     spirvOptions.tBufferLayoutRule = SpirvLayoutRule::Scalar;
     spirvOptions.sBufferLayoutRule = SpirvLayoutRule::Scalar;
+    spirvOptions.ampPayloadLayoutRule = SpirvLayoutRule::Scalar;
   } else {
     spirvOptions.cBufferLayoutRule = SpirvLayoutRule::RelaxedGLSLStd140;
     spirvOptions.tBufferLayoutRule = SpirvLayoutRule::RelaxedGLSLStd430;
     spirvOptions.sBufferLayoutRule = SpirvLayoutRule::RelaxedGLSLStd430;
+    spirvOptions.ampPayloadLayoutRule = SpirvLayoutRule::RelaxedGLSLStd430;
   }
 
   // Set shader module version, source file name, and source file content (if
   // needed).
   llvm::StringRef source = "";
-  llvm::StringRef fileName = "";
+  std::vector<llvm::StringRef> fileNames;
   const auto &inputFiles = ci.getFrontendOpts().Inputs;
   // File name
   if (spirvOptions.debugInfoFile && !inputFiles.empty()) {
-    fileName = inputFiles.front().getFile();
+    for (const auto &inputFile : inputFiles) {
+      fileNames.push_back(inputFile.getFile());
+    }
   }
   // Source code
   if (spirvOptions.debugInfoSource) {
@@ -541,9 +550,9 @@ SpirvEmitter::SpirvEmitter(CompilerInstance &ci)
         sm.getBuffer(sm.getMainFileID(), SourceLocation());
     source = StringRef(mainFile->getBufferStart(), mainFile->getBufferSize());
   }
-  mainSourceFile =
-      spvBuilder.setDebugSource(spvContext.getMajorVersion(),
-                                spvContext.getMinorVersion(), fileName, source);
+  mainSourceFile = spvBuilder.setDebugSource(spvContext.getMajorVersion(),
+                                             spvContext.getMinorVersion(),
+                                             fileNames, source);
 
   if (spirvOptions.debugInfoTool && spirvOptions.targetEnv == "vulkan1.1") {
     // Emit OpModuleProcessed to indicate the commit information.
@@ -637,6 +646,10 @@ void SpirvEmitter::HandleTranslationUnit(ASTContext &context) {
   std::vector<uint32_t> m = spvBuilder.takeModule();
 
   if (!spirvOptions.codeGenHighLevel) {
+    // In order to flatten resource arrays, we must also unroll loops. Therefore
+    // we should run legalization before optimization.
+    needsLegalization = needsLegalization || spirvOptions.flattenResourceArrays;
+
     // Run legalization passes
     if (needsLegalization || declIdMapper.requiresLegalization()) {
       std::string messages;
@@ -655,8 +668,7 @@ void SpirvEmitter::HandleTranslationUnit(ASTContext &context) {
     // Run optimization passes
     if (theCompilerInstance.getCodeGenOpts().OptimizationLevel > 0) {
       std::string messages;
-      if (!spirvToolsOptimize(targetEnv, &m, spirvOptions.optConfig,
-                              &messages)) {
+      if (!spirvToolsOptimize(targetEnv, &m, spirvOptions, &messages)) {
         emitFatalError("failed to optimize SPIR-V: %0", {}) << messages;
         emitNote("please file a bug report on "
                  "https://github.com/Microsoft/DirectXShaderCompiler/issues "
@@ -671,8 +683,9 @@ void SpirvEmitter::HandleTranslationUnit(ASTContext &context) {
   if (!spirvOptions.disableValidation) {
     std::string messages;
     if (!spirvToolsValidate(targetEnv, spirvOptions,
-                            declIdMapper.requiresLegalization(), &m,
-                            &messages)) {
+                            needsLegalization ||
+                                declIdMapper.requiresLegalization(),
+                            &m, &messages)) {
       emitFatalError("generated SPIR-V is invalid: %0", {}) << messages;
       emitNote("please file a bug report on "
                "https://github.com/Microsoft/DirectXShaderCompiler/issues "
@@ -719,6 +732,8 @@ void SpirvEmitter::doDecl(const Decl *decl) {
     doRecordDecl(recordDecl);
   } else if (const auto *recordDecl = dyn_cast<ClassTemplateDecl>(decl)) { // Accept user defined templates
     return;
+  } else if (const auto *enumDecl = dyn_cast<EnumDecl>(decl)) {
+    doEnumDecl(enumDecl);
   } else {
     emitError("decl type %0 unimplemented", decl->getLocation())
         << decl->getDeclKindName();
@@ -772,7 +787,8 @@ SpirvInstruction *SpirvEmitter::doExpr(const Expr *expr) {
   expr = expr->IgnoreParens();
 
   if (const auto *declRefExpr = dyn_cast<DeclRefExpr>(expr)) {
-    result = declIdMapper.getDeclEvalInfo(declRefExpr->getDecl());
+    result = declIdMapper.getDeclEvalInfo(declRefExpr->getDecl(),
+                                          expr->getLocStart());
   } else if (const auto *memberExpr = dyn_cast<MemberExpr>(expr)) {
     result = doMemberExpr(memberExpr);
   } else if (const auto *castExpr = dyn_cast<CastExpr>(expr)) {
@@ -831,6 +847,8 @@ SpirvInstruction *SpirvEmitter::loadIfGLValue(const Expr *expr) {
 
 SpirvInstruction *SpirvEmitter::loadIfGLValue(const Expr *expr,
                                               SpirvInstruction *info) {
+  const auto exprType = expr->getType();
+
   // Do nothing if this is already rvalue
   if (!info || info->isRValue())
     return info;
@@ -839,7 +857,7 @@ SpirvInstruction *SpirvEmitter::loadIfGLValue(const Expr *expr,
   // If true, we are likely to copy it as a whole. To assist per-element
   // copying, avoid the load here and return the pointer directly.
   // TODO: consider moving this hack into SPIRV-Tools as a transformation.
-  if (isOpaqueArrayType(expr->getType()))
+  if (isOpaqueArrayType(exprType))
     return info;
 
   // Check whether we are trying to load an externally visible structured/byte
@@ -869,9 +887,10 @@ SpirvInstruction *SpirvEmitter::loadIfGLValue(const Expr *expr,
   // type translation path won't work.
   if (const auto *declContext = isConstantTextureBufferDeclRef(expr)) {
     loadedInstr = spvBuilder.createLoad(
-        declIdMapper.getCTBufferPushConstantType(declContext), info);
+        declIdMapper.getCTBufferPushConstantType(declContext), info,
+        expr->getExprLoc());
   } else {
-    loadedInstr = spvBuilder.createLoad(expr->getType(), info);
+    loadedInstr = spvBuilder.createLoad(exprType, info, expr->getExprLoc());
   }
   assert(loadedInstr);
 
@@ -882,37 +901,29 @@ SpirvInstruction *SpirvEmitter::loadIfGLValue(const Expr *expr,
   {
     uint32_t vecSize = 1, numRows = 0, numCols = 0;
     if (info->getLayoutRule() != SpirvLayoutRule::Void &&
-        isBoolOrVecMatOfBoolType(expr->getType())) {
-      const auto exprType = expr->getType();
+        isBoolOrVecMatOfBoolType(exprType)) {
       QualType uintType = astContext.UnsignedIntTy;
-      QualType boolType = astContext.BoolTy;
       if (isScalarType(exprType) || isVectorType(exprType, nullptr, &vecSize)) {
         const auto fromType =
             vecSize == 1 ? uintType
                          : astContext.getExtVectorType(uintType, vecSize);
-        const auto toType =
-            vecSize == 1 ? boolType
-                         : astContext.getExtVectorType(boolType, vecSize);
-        loadedInstr = castToBool(loadedInstr, fromType, toType);
+        loadedInstr =
+            castToBool(loadedInstr, fromType, exprType, expr->getLocStart());
       } else {
         const bool isMat = isMxNMatrix(exprType, nullptr, &numRows, &numCols);
         assert(isMat);
         (void)isMat;
-        const auto uintRowQualType =
-            astContext.getExtVectorType(uintType, numCols);
-        const auto boolRowQualType =
-            astContext.getExtVectorType(boolType, numCols);
-        const SpirvType *resultType = spvContext.getMatrixType(
-            spvContext.getVectorType(spvContext.getBoolType(), numCols),
-            numRows);
-
-        llvm::SmallVector<SpirvInstruction *, 4> rows;
-        for (uint32_t i = 0; i < numRows; ++i) {
-          auto *row = spvBuilder.createCompositeExtract(uintRowQualType,
-                                                        loadedInstr, {i});
-          rows.push_back(castToBool(row, uintRowQualType, boolRowQualType));
-        }
-        loadedInstr = spvBuilder.createCompositeConstruct(resultType, rows);
+        const clang::Type *type = exprType.getCanonicalType().getTypePtr();
+        const RecordType *RT = cast<RecordType>(type);
+        const ClassTemplateSpecializationDecl *templateSpecDecl =
+            cast<ClassTemplateSpecializationDecl>(RT->getDecl());
+        ClassTemplateDecl *templateDecl =
+            templateSpecDecl->getSpecializedTemplate();
+        const auto fromType = getHLSLMatrixType(
+            astContext, theCompilerInstance.getSema(), templateDecl,
+            astContext.UnsignedIntTy, numRows, numCols);
+        loadedInstr =
+            castToBool(loadedInstr, fromType, exprType, expr->getLocStart());
       }
       // Now that it is converted to Bool, it has no layout rule.
       // This result-id should be evaluated as bool from here on out.
@@ -937,8 +948,10 @@ bool SpirvEmitter::loadIfAliasVarRef(const Expr *varExpr,
       isAKindOfStructuredOrByteBuffer(varExpr->getType())) {
     // Load the pointer of the aliased-to-variable if the expression has a
     // pointer to pointer type.
-    if (varExpr->isGLValue())
-      *instr = spvBuilder.createLoad(varExpr->getType(), *instr);
+    if (varExpr->isGLValue()) {
+      *instr = spvBuilder.createLoad(varExpr->getType(), *instr,
+                                     varExpr->getExprLoc());
+    }
     return true;
   }
   return false;
@@ -955,7 +968,7 @@ SpirvInstruction *SpirvEmitter::castToType(SpirvInstruction *value,
   // will also return true. We need to check bool before uint. The opposite is
   // not true.
   if (isBoolOrVecMatOfBoolType(toType))
-    return castToBool(value, fromType, toType);
+    return castToBool(value, fromType, toType, srcLoc);
 
   if (isSintOrVecMatOfSintType(toType) || isUintOrVecMatOfUintType(toType))
     return castToInt(value, fromType, toType, srcLoc);
@@ -1032,15 +1045,18 @@ void SpirvEmitter::doFunctionDecl(const FunctionDecl *decl) {
     paramTypes.push_back(valueType);
   }
 
-  auto *funcType = spvContext.getFunctionType(retType, paramTypes);
-  spvBuilder.beginFunction(retType, funcType, decl->getLocation(), funcName,
+  spvBuilder.beginFunction(retType, paramTypes, decl->getLocStart(), funcName,
                            decl->hasAttr<HLSLPreciseAttr>(), func);
 
   if (isNonStaticMemberFn) {
     // Remember the parameter for the 'this' object so later we can handle
     // CXXThisExpr correctly.
     curThis = spvBuilder.addFnParam(paramTypes[0], /*isPrecise*/ false,
-                                    /*SourceLocation*/ {}, "param.this");
+                                    decl->getLocStart(), "param.this");
+    if (isOrContainsAKindOfStructuredOrByteBuffer(paramTypes[0])) {
+      curThis->setContainsAliasComponent(true);
+      needsLegalization = true;
+    }
   }
 
   // Create all parameters.
@@ -1153,6 +1169,30 @@ bool SpirvEmitter::validateVKAttributes(const NamedDecl *decl) {
     }
   }
 
+  // vk::shader_record_nv is supported only on cbuffer/ConstantBuffer
+  if (const auto *srbAttr = decl->getAttr<VKShaderRecordNVAttr>()) {
+    const auto loc = srbAttr->getLocation();
+    const HLSLBufferDecl *bufDecl = nullptr;
+    bool isValidType = false;
+    if (bufDecl = dyn_cast<HLSLBufferDecl>(decl))
+      isValidType = bufDecl->isCBuffer();
+    else if (bufDecl = dyn_cast<HLSLBufferDecl>(decl->getDeclContext()))
+      isValidType = bufDecl->isCBuffer();
+
+    if (!isValidType) {
+      emitError(
+          "vk::shader_record_nv can be applied only to cbuffer/ConstantBuffer",
+          loc);
+      success = false;
+    }
+    if (decl->hasAttr<VKBindingAttr>()) {
+      emitError("vk::shader_record_nv attribute cannot be used together with "
+                "vk::binding attribute",
+                loc);
+      success = false;
+    }
+  }
+
   return success;
 }
 
@@ -1181,7 +1221,11 @@ void SpirvEmitter::doHLSLBufferDecl(const HLSLBufferDecl *bufferDecl) {
   }
   if (!validateVKAttributes(bufferDecl))
     return;
-  (void)declIdMapper.createCTBuffer(bufferDecl);
+  if (bufferDecl->hasAttr<VKShaderRecordNVAttr>()) {
+    (void)declIdMapper.createShaderRecordBufferNV(bufferDecl);
+  } else {
+    (void)declIdMapper.createCTBuffer(bufferDecl);
+  }
 }
 
 void SpirvEmitter::doImplicitDecl(const Decl *decl) {
@@ -1213,6 +1257,11 @@ void SpirvEmitter::doRecordDecl(const RecordDecl *recordDecl) {
     if (auto *varDecl = dyn_cast<VarDecl>(subDecl))
       if (varDecl->isStaticDataMember() && varDecl->hasInit())
         doVarDecl(varDecl);
+}
+
+void SpirvEmitter::doEnumDecl(const EnumDecl *decl) {
+  for (auto it = decl->enumerator_begin(); it != decl->enumerator_end(); ++it)
+    declIdMapper.createEnumConstant(*it);
 }
 
 void SpirvEmitter::doVarDecl(const VarDecl *decl) {
@@ -1252,6 +1301,11 @@ void SpirvEmitter::doVarDecl(const VarDecl *decl) {
   if (decl->hasAttr<VKPushConstantAttr>()) {
     // This is a VarDecl for PushConstant block.
     (void)declIdMapper.createPushConstant(decl);
+    return;
+  }
+
+  if (decl->hasAttr<VKShaderRecordNVAttr>()) {
+    (void)declIdMapper.createShaderRecordBufferNV(decl);
     return;
   }
 
@@ -1297,10 +1351,12 @@ void SpirvEmitter::doVarDecl(const VarDecl *decl) {
     }
     // Function local variables. Just emit OpStore at the current insert point.
     else if (const Expr *init = decl->getInit()) {
-      if (auto *constInit = tryToEvaluateAsConst(init))
-        spvBuilder.createStore(var, constInit);
-      else
-        storeValue(var, loadIfGLValue(init), decl->getType());
+      if (auto *constInit = tryToEvaluateAsConst(init)) {
+        spvBuilder.createStore(var, constInit, decl->getLocation());
+      } else {
+        storeValue(var, loadIfGLValue(init), decl->getType(),
+                   decl->getLocation());
+      }
 
       // Update counter variable associated with local variables
       tryToAssignCounterVar(decl, init);
@@ -1398,13 +1454,16 @@ void SpirvEmitter::doDoStmt(const DoStmt *theDoStmt,
   breakStack.push(mergeBB);
 
   // Branch from the current insert point to the header block.
-  spvBuilder.createBranch(headerBB);
+  spvBuilder.createBranch(headerBB, theDoStmt->getLocStart());
   spvBuilder.addSuccessor(headerBB);
 
   // Process the <header> block
   // The header block must always branch to the body.
   spvBuilder.setInsertPoint(headerBB);
-  spvBuilder.createBranch(bodyBB, mergeBB, continueBB, loopControl);
+  const Stmt *body = theDoStmt->getBody();
+  spvBuilder.createBranch(bodyBB,
+                          body ? body->getLocStart() : theDoStmt->getLocStart(),
+                          mergeBB, continueBB, loopControl);
   spvBuilder.addSuccessor(bodyBB);
   // The current basic block has OpLoopMerge instruction. We need to set its
   // continue and merge target.
@@ -1413,11 +1472,13 @@ void SpirvEmitter::doDoStmt(const DoStmt *theDoStmt,
 
   // Process the <body> block
   spvBuilder.setInsertPoint(bodyBB);
-  if (const Stmt *body = theDoStmt->getBody()) {
+  if (body) {
     doStmt(body);
   }
-  if (!spvBuilder.isCurrentBasicBlockTerminated())
-    spvBuilder.createBranch(continueBB);
+  if (!spvBuilder.isCurrentBasicBlockTerminated()) {
+    spvBuilder.createBranch(continueBB, body ? body->getLocEnd()
+                                             : theDoStmt->getLocStart());
+  }
   spvBuilder.addSuccessor(continueBB);
 
   // Process the <continue> block. The check for whether the loop should
@@ -1428,12 +1489,12 @@ void SpirvEmitter::doDoStmt(const DoStmt *theDoStmt,
   spvBuilder.setInsertPoint(continueBB);
   SpirvInstruction *condition = nullptr;
   if (const Expr *check = theDoStmt->getCond()) {
-    emitDebugLine(check->getLocStart());
     condition = doExpr(check);
   } else {
     condition = spvBuilder.getConstantBool(true);
   }
-  spvBuilder.createConditionalBranch(condition, headerBB, mergeBB);
+  spvBuilder.createConditionalBranch(condition, headerBB, mergeBB,
+                                     theDoStmt->getLocEnd());
   spvBuilder.addSuccessor(headerBB);
   spvBuilder.addSuccessor(mergeBB);
 
@@ -1448,7 +1509,7 @@ void SpirvEmitter::doDoStmt(const DoStmt *theDoStmt,
 void SpirvEmitter::doContinueStmt(const ContinueStmt *continueStmt) {
   assert(!spvBuilder.isCurrentBasicBlockTerminated());
   auto *continueTargetBB = continueStack.top();
-  spvBuilder.createBranch(continueTargetBB);
+  spvBuilder.createBranch(continueTargetBB, continueStmt->getLocStart());
   spvBuilder.addSuccessor(continueTargetBB);
 
   // Some statements that alter the control flow (break, continue, return, and
@@ -1515,7 +1576,7 @@ void SpirvEmitter::doWhileStmt(const WhileStmt *whileStmt,
   breakStack.push(mergeBB);
 
   // Process the <check> block
-  spvBuilder.createBranch(checkBB);
+  spvBuilder.createBranch(checkBB, whileStmt->getLocStart());
   spvBuilder.addSuccessor(checkBB);
   spvBuilder.setInsertPoint(checkBB);
 
@@ -1527,17 +1588,17 @@ void SpirvEmitter::doWhileStmt(const WhileStmt *whileStmt,
     doStmt(condVarDecl);
 
   SpirvInstruction *condition = nullptr;
-  if (const Expr *check = whileStmt->getCond()) {
-    emitDebugLine(check->getLocStart());
+  const Expr *check = whileStmt->getCond();
+  if (check) {
     condition = doExpr(check);
   } else {
     condition = spvBuilder.getConstantBool(true);
   }
-  spvBuilder.createConditionalBranch(condition, bodyBB,
-                                     /*false branch*/ mergeBB,
-                                     /*merge*/ mergeBB, continueBB,
-                                     spv::SelectionControlMask::MaskNone,
-                                     loopControl);
+  spvBuilder.createConditionalBranch(
+      condition, bodyBB,
+      /*false branch*/ mergeBB, whileStmt->getLocStart(),
+      /*merge*/ mergeBB, continueBB, spv::SelectionControlMask::MaskNone,
+      loopControl);
   spvBuilder.addSuccessor(bodyBB);
   spvBuilder.addSuccessor(mergeBB);
   // The current basic block has OpLoopMerge instruction. We need to set its
@@ -1547,17 +1608,18 @@ void SpirvEmitter::doWhileStmt(const WhileStmt *whileStmt,
 
   // Process the <body> block
   spvBuilder.setInsertPoint(bodyBB);
-  if (const Stmt *body = whileStmt->getBody()) {
+  const Stmt *body = whileStmt->getBody();
+  if (body) {
     doStmt(body);
   }
   if (!spvBuilder.isCurrentBasicBlockTerminated())
-    spvBuilder.createBranch(continueBB);
+    spvBuilder.createBranch(continueBB, whileStmt->getLocEnd());
   spvBuilder.addSuccessor(continueBB);
 
   // Process the <continue> block. While loops do not have an explicit
   // continue block. The continue block just branches to the <check> block.
   spvBuilder.setInsertPoint(continueBB);
-  spvBuilder.createBranch(checkBB);
+  spvBuilder.createBranch(checkBB, whileStmt->getLocEnd());
   spvBuilder.addSuccessor(checkBB);
 
   // Set insertion point to the <merge> block for subsequent statements
@@ -1620,26 +1682,29 @@ void SpirvEmitter::doForStmt(const ForStmt *forStmt,
 
   // Process the <init> block
   if (const Stmt *initStmt = forStmt->getInit()) {
-    emitDebugLine(initStmt->getLocStart());
     doStmt(initStmt);
   }
-  spvBuilder.createBranch(checkBB);
+  const Expr *check = forStmt->getCond();
+  spvBuilder.createBranch(checkBB, check ? check->getLocStart()
+                                         : forStmt->getLocStart());
   spvBuilder.addSuccessor(checkBB);
 
   // Process the <check> block
   spvBuilder.setInsertPoint(checkBB);
   SpirvInstruction *condition = nullptr;
-  if (const Expr *check = forStmt->getCond()) {
-    emitDebugLine(check->getLocStart());
+  if (check) {
     condition = doExpr(check);
   } else {
     condition = spvBuilder.getConstantBool(true);
   }
-  spvBuilder.createConditionalBranch(condition, bodyBB,
-                                     /*false branch*/ mergeBB,
-                                     /*merge*/ mergeBB, continueBB,
-                                     spv::SelectionControlMask::MaskNone,
-                                     loopControl);
+  const Stmt *body = forStmt->getBody();
+  spvBuilder.createConditionalBranch(
+      condition, bodyBB,
+      /*false branch*/ mergeBB,
+      check ? check->getLocEnd()
+            : (body ? body->getLocStart() : forStmt->getLocStart()),
+      /*merge*/ mergeBB, continueBB, spv::SelectionControlMask::MaskNone,
+      loopControl);
   spvBuilder.addSuccessor(bodyBB);
   spvBuilder.addSuccessor(mergeBB);
   // The current basic block has OpLoopMerge instruction. We need to set its
@@ -1649,20 +1714,20 @@ void SpirvEmitter::doForStmt(const ForStmt *forStmt,
 
   // Process the <body> block
   spvBuilder.setInsertPoint(bodyBB);
-  if (const Stmt *body = forStmt->getBody()) {
+  if (body) {
     doStmt(body);
   }
   if (!spvBuilder.isCurrentBasicBlockTerminated())
-    spvBuilder.createBranch(continueBB);
+    spvBuilder.createBranch(continueBB, forStmt->getLocEnd());
   spvBuilder.addSuccessor(continueBB);
 
   // Process the <continue> block
   spvBuilder.setInsertPoint(continueBB);
   if (const Expr *cont = forStmt->getInc()) {
-    emitDebugLine(cont->getLocStart());
     doExpr(cont);
   }
-  spvBuilder.createBranch(checkBB); // <continue> should jump back to header
+  // <continue> should jump back to header
+  spvBuilder.createBranch(checkBB, forStmt->getLocEnd());
   spvBuilder.addSuccessor(checkBB);
 
   // Set insertion point to the <merge> block for subsequent statements
@@ -1735,7 +1800,6 @@ void SpirvEmitter::doIfStmt(const IfStmt *ifStmt,
   if (const auto *declStmt = ifStmt->getConditionVariableDeclStmt())
     doDeclStmt(declStmt);
 
-  emitDebugLine(ifStmt->getCond()->getLocStart());
   // First emit the instruction for evaluating the condition.
   auto *condition = doExpr(ifStmt->getCond());
 
@@ -1747,7 +1811,9 @@ void SpirvEmitter::doIfStmt(const IfStmt *ifStmt,
   auto *elseBB = hasElse ? spvBuilder.createBasicBlock("if.false") : mergeBB;
 
   // Create the branch instruction. This will end the current basic block.
-  spvBuilder.createConditionalBranch(condition, thenBB, elseBB, mergeBB,
+  const auto *then = ifStmt->getThen();
+  spvBuilder.createConditionalBranch(condition, thenBB, elseBB,
+                                     then->getLocStart(), mergeBB,
                                      /*continue*/ 0, selectionControl);
   spvBuilder.addSuccessor(thenBB);
   spvBuilder.addSuccessor(elseBB);
@@ -1757,17 +1823,18 @@ void SpirvEmitter::doIfStmt(const IfStmt *ifStmt,
 
   // Handle the then branch
   spvBuilder.setInsertPoint(thenBB);
-  doStmt(ifStmt->getThen());
+  doStmt(then);
   if (!spvBuilder.isCurrentBasicBlockTerminated())
-    spvBuilder.createBranch(mergeBB);
+    spvBuilder.createBranch(mergeBB, ifStmt->getLocEnd());
   spvBuilder.addSuccessor(mergeBB);
 
   // Handle the else branch (if exists)
   if (hasElse) {
     spvBuilder.setInsertPoint(elseBB);
-    doStmt(ifStmt->getElse());
+    const auto *elseStmt = ifStmt->getElse();
+    doStmt(elseStmt);
     if (!spvBuilder.isCurrentBasicBlockTerminated())
-      spvBuilder.createBranch(mergeBB);
+      spvBuilder.createBranch(mergeBB, elseStmt->getLocEnd());
     spvBuilder.addSuccessor(mergeBB);
   }
 
@@ -1791,10 +1858,11 @@ void SpirvEmitter::doReturnStmt(const ReturnStmt *stmt) {
       // create a temporary variable to "convert" the value to Function storage
       // class and then return.
       auto *tempVar =
-          spvBuilder.addFnVar(retType, stmt->getReturnLoc(), "temp.var.ret");
-      storeValue(tempVar, retInfo, retType);
-      spvBuilder.createReturnValue(spvBuilder.createLoad(retType, tempVar),
-                                   stmt->getReturnLoc());
+          spvBuilder.addFnVar(retType, retVal->getLocEnd(), "temp.var.ret");
+      storeValue(tempVar, retInfo, retType, retVal->getLocEnd());
+      spvBuilder.createReturnValue(
+          spvBuilder.createLoad(retType, tempVar, retVal->getLocEnd()),
+          stmt->getReturnLoc());
     } else {
       spvBuilder.createReturnValue(retInfo, stmt->getReturnLoc());
     }
@@ -1821,7 +1889,7 @@ void SpirvEmitter::doBreakStmt(const BreakStmt *breakStmt) {
   assert(!spvBuilder.isCurrentBasicBlockTerminated());
   auto *breakTargetBB = breakStack.top();
   spvBuilder.addSuccessor(breakTargetBB);
-  spvBuilder.createBranch(breakTargetBB);
+  spvBuilder.createBranch(breakTargetBB, breakStmt->getLocStart());
 
   // Some statements that alter the control flow (break, continue, return, and
   // discard), require creation of a new basic block to hold any statement that
@@ -1899,7 +1967,8 @@ SpirvEmitter::doArraySubscriptExpr(const ArraySubscriptExpr *expr) {
   auto *info = loadIfAliasVarRef(base);
 
   if (!indices.empty()) {
-    info = turnIntoElementPtr(base->getType(), info, expr->getType(), indices);
+    info = turnIntoElementPtr(base->getType(), info, expr->getType(), indices,
+                              base->getExprLoc());
   }
 
   return info;
@@ -1928,12 +1997,10 @@ SpirvInstruction *SpirvEmitter::doBinaryOperator(const BinaryOperator *expr) {
 
   return processBinaryOp(expr->getLHS(), expr->getRHS(), opcode,
                          expr->getLHS()->getType(), expr->getType(),
-                         expr->getSourceRange());
+                         expr->getSourceRange(), expr->getOperatorLoc());
 }
 
 SpirvInstruction *SpirvEmitter::doCallExpr(const CallExpr *callExpr) {
-  emitDebugLine(callExpr->getLocStart());
-
   if (const auto *operatorCall = dyn_cast<CXXOperatorCallExpr>(callExpr))
     return doCXXOperatorCallExpr(operatorCall);
 
@@ -1979,7 +2046,6 @@ SpirvInstruction *SpirvEmitter::processCall(const CallExpr *callExpr) {
   bool isNonStaticMemberCall = false;
   QualType objectType = {};             // Type of the object (if exists)
   SpirvInstruction *objInstr = nullptr; // EvalInfo for the object (if exists)
-  bool needsTempVar = false;            // Whether we need temporary variable.
 
   llvm::SmallVector<SpirvInstruction *, 4> vars; // Variables for function call
   llvm::SmallVector<bool, 4> isTempVar;          // Temporary variable or not
@@ -2006,15 +2072,18 @@ SpirvInstruction *SpirvEmitter::processCall(const CallExpr *callExpr) {
       // getObject().objectMethod();
       // Also, any parameter passed to the member function must be of Function
       // storage class.
-      needsTempVar = objInstr->isRValue() ||
-                     objInstr->getStorageClass() != spv::StorageClass::Function;
-
-      if (needsTempVar) {
-        args.push_back(
-            createTemporaryVar(objectType, getAstTypeName(objectType),
-                               // May need to load to use as initializer
-                               loadIfGLValue(object, objInstr)));
+      if (objInstr->isRValue()) {
+        args.push_back(createTemporaryVar(
+            objectType, getAstTypeName(objectType),
+            // May need to load to use as initializer
+            loadIfGLValue(object, objInstr), object->getLocStart()));
       } else {
+        // Based on SPIR-V spec, function parameter must always be in Function
+        // scope. If we pass a non-function scope argument, we need
+        // the legalization.
+        if (objInstr->getStorageClass() != spv::StorageClass::Function)
+          beforeHlslLegalization = true;
+
         args.push_back(objInstr);
       }
 
@@ -2035,18 +2104,32 @@ SpirvInstruction *SpirvEmitter::processCall(const CallExpr *callExpr) {
 
     // Get the evaluation info if this argument is referencing some variable
     // *as a whole*, in which case we can avoid creating the temporary variable
-    // for it if it is Function scope and can act as out parameter.
+    // for it if it can act as out parameter.
     SpirvInstruction *argInfo = nullptr;
     if (const auto *declRefExpr = dyn_cast<DeclRefExpr>(arg)) {
-      argInfo = declIdMapper.getDeclEvalInfo(declRefExpr->getDecl());
+      argInfo = declIdMapper.getDeclEvalInfo(declRefExpr->getDecl(),
+                                             arg->getLocStart());
     }
 
-    if (argInfo && argInfo->getStorageClass() == spv::StorageClass::Function &&
+    auto *argInst = doExpr(arg);
+    auto argType = arg->getType();
+
+    // If argInfo is nullptr and argInst is a rvalue, we do not have a proper
+    // pointer to pass to the function. we need a temporary variable in that
+    // case.
+    if ((argInfo || (argInst && !argInst->isRValue())) &&
         canActAsOutParmVar(param) &&
         paramTypeMatchesArgType(param->getType(), arg->getType())) {
-      vars.push_back(argInfo);
+      // Based on SPIR-V spec, function parameter must be always Function
+      // scope. In addition, we must pass memory object declaration argument
+      // to function. If we pass an argument that is not function scope
+      // or not memory object declaration, we need the legalization.
+      if (!argInfo || argInfo->getStorageClass() != spv::StorageClass::Function)
+        beforeHlslLegalization = true;
+
       isTempVar.push_back(false);
-      args.push_back(doExpr(arg));
+      args.push_back(argInst);
+      vars.push_back(argInfo ? argInfo : argInst);
     } else {
       // We need to create variables for holding the values to be used as
       // arguments. The variables themselves are of pointer types.
@@ -2059,12 +2142,12 @@ SpirvInstruction *SpirvEmitter::processCall(const CallExpr *callExpr) {
       // do not need to mark the "param.var.*" variables as precise.
       const bool isPrecise = false;
 
-      auto *tempVar = spvBuilder.addFnVar(varType, param->getLocation(),
-                                          varName, isPrecise);
+      auto *tempVar =
+          spvBuilder.addFnVar(varType, arg->getLocStart(), varName, isPrecise);
 
       vars.push_back(tempVar);
       isTempVar.push_back(true);
-      args.push_back(doExpr(arg));
+      args.push_back(argInst);
 
       // Update counter variable associated with function parameters
       tryToAssignCounterVar(param, arg);
@@ -2087,13 +2170,16 @@ SpirvInstruction *SpirvEmitter::processCall(const CallExpr *callExpr) {
         if (const auto *refType = paramType->getAs<ReferenceType>())
           paramType = refType->getPointeeType();
         rhsVal =
-            castToType(rhsVal, arg->getType(), paramType, arg->getExprLoc());
+            castToType(rhsVal, arg->getType(), paramType, arg->getLocStart());
       }
 
       // Initialize the temporary variables using the contents of the arguments
-      storeValue(tempVar, rhsVal, param->getType());
+      storeValue(tempVar, rhsVal, param->getType(), arg->getLocStart());
     }
   }
+
+  if (beforeHlslLegalization)
+    needsLegalization = true;
 
   assert(vars.size() == isTempVar.size());
   assert(vars.size() == args.size());
@@ -2107,24 +2193,19 @@ SpirvInstruction *SpirvEmitter::processCall(const CallExpr *callExpr) {
   // Get or forward declare the function <result-id>
   SpirvFunction *func = declIdMapper.getOrRegisterFn(callee);
 
-  auto *retVal = spvBuilder.createFunctionCall(retType, func, vars);
-
-  // If we created a temporary variable for the lvalue object this method is
-  // invoked upon, we need to copy the contents in the temporary variable back
-  // to the original object's variable in case there are side effects.
-  if (needsTempVar && !objInstr->isRValue()) {
-    auto *value = spvBuilder.createLoad(objectType, vars.front());
-    storeValue(objInstr, value, objectType);
-  }
+  auto *retVal = spvBuilder.createFunctionCall(
+      retType, func, vars, callExpr->getCallee()->getExprLoc());
 
   // Go through all parameters and write those marked as out/inout
   for (uint32_t i = 0; i < numParams; ++i) {
     const auto *param = callee->getParamDecl(i);
-    if (isTempVar[i] && canActAsOutParmVar(param)) {
+    // If it calls a non-static member function, the object itself is argument
+    // 0, and therefore all other argument positions are shifted by 1.
+    const uint32_t index = i + isNonStaticMemberCall;
+    if (isTempVar[index] && canActAsOutParmVar(param)) {
       const auto *arg = callExpr->getArg(i);
-      const uint32_t index = i + isNonStaticMemberCall;
-      SpirvInstruction *value =
-          spvBuilder.createLoad(param->getType(), vars[index]);
+      SpirvInstruction *value = spvBuilder.createLoad(
+          param->getType(), vars[index], arg->getLocStart());
 
       // Now we want to assign 'value' to arg. But first, in rare cases when
       // using 'out' or 'inout' where the parameter and argument have a type
@@ -2134,7 +2215,8 @@ SpirvInstruction *SpirvEmitter::processCall(const CallExpr *callExpr) {
         auto paramType = param->getType();
         if (const auto *refType = paramType->getAs<ReferenceType>())
           paramType = refType->getPointeeType();
-        value = castToType(value, paramType, arg->getType(), arg->getExprLoc());
+        value =
+            castToType(value, paramType, arg->getType(), arg->getLocStart());
       }
 
       processAssignment(arg, value, false, args[index]);
@@ -2171,7 +2253,7 @@ SpirvInstruction *SpirvEmitter::doCastExpr(const CastExpr *expr) {
     }
 
     auto *value = castToInt(loadIfGLValue(subExpr), subExprType, toType,
-                            subExpr->getExprLoc());
+                            subExpr->getLocStart());
     value->setRValue();
     return value;
   }
@@ -2187,7 +2269,7 @@ SpirvInstruction *SpirvEmitter::doCastExpr(const CastExpr *expr) {
     }
 
     auto *value = castToFloat(loadIfGLValue(subExpr), subExprType, toType,
-                              subExpr->getExprLoc());
+                              subExpr->getLocStart());
     value->setRValue();
     return value;
   }
@@ -2201,7 +2283,8 @@ SpirvInstruction *SpirvEmitter::doCastExpr(const CastExpr *expr) {
       return value;
     }
 
-    auto *value = castToBool(loadIfGLValue(subExpr), subExprType, toType);
+    auto *value = castToBool(loadIfGLValue(subExpr), subExprType, toType,
+                             subExpr->getLocStart());
     value->setRValue();
     return value;
   }
@@ -2217,13 +2300,15 @@ SpirvInstruction *SpirvEmitter::doCastExpr(const CastExpr *expr) {
     llvm::SmallVector<SpirvInstruction *, 4> elements;
 
     for (uint32_t i = 0; i < toSize; ++i) {
-      elements.push_back(
-          spvBuilder.createCompositeExtract(elemType, composite, {i}));
+      elements.push_back(spvBuilder.createCompositeExtract(
+          elemType, composite, {i}, expr->getExprLoc()));
     }
 
     auto *value = elements.front();
-    if (toSize > 1)
-      value = spvBuilder.createCompositeConstruct(toVecType, elements);
+    if (toSize > 1) {
+      value = spvBuilder.createCompositeConstruct(toVecType, elements,
+                                                  expr->getExprLoc());
+    }
 
     value->setRValue();
     return value;
@@ -2249,9 +2334,12 @@ SpirvInstruction *SpirvEmitter::doCastExpr(const CastExpr *expr) {
     assert(isMat && rowCount == 2 && colCount == 2);
     (void)isMat;
     QualType vec2Type = astContext.getExtVectorType(elemType, 2);
-    auto *subVec1 = spvBuilder.createVectorShuffle(vec2Type, vec, vec, {0, 1});
-    auto *subVec2 = spvBuilder.createVectorShuffle(vec2Type, vec, vec, {2, 3});
-    auto *mat = spvBuilder.createCompositeConstruct(toType, {subVec1, subVec2});
+    auto *subVec1 = spvBuilder.createVectorShuffle(vec2Type, vec, vec, {0, 1},
+                                                   expr->getLocStart());
+    auto *subVec2 = spvBuilder.createVectorShuffle(vec2Type, vec, vec, {2, 3},
+                                                   expr->getLocStart());
+    auto *mat = spvBuilder.createCompositeConstruct(toType, {subVec1, subVec2},
+                                                    expr->getLocStart());
     mat->setRValue();
     return mat;
   }
@@ -2280,7 +2368,8 @@ SpirvInstruction *SpirvEmitter::doCastExpr(const CastExpr *expr) {
     } else {
       llvm::SmallVector<SpirvInstruction *, 4> vectors(size_t(rowCount),
                                                        vecSplat);
-      auto *value = spvBuilder.createCompositeConstruct(toType, vectors);
+      auto *value = spvBuilder.createCompositeConstruct(toType, vectors,
+                                                        expr->getLocEnd());
       value->setRValue();
       return value;
     }
@@ -2300,7 +2389,8 @@ SpirvInstruction *SpirvEmitter::doCastExpr(const CastExpr *expr) {
           isVectorType(toType, nullptr, &dstVecSize)) {
         for (uint32_t i = 0; i < dstVecSize; ++i)
           indexes.push_back(i);
-        auto *val = spvBuilder.createVectorShuffle(toType, src, src, indexes);
+        auto *val = spvBuilder.createVectorShuffle(toType, src, src, indexes,
+                                                   expr->getLocStart());
         val->setRValue();
         return val;
       }
@@ -2319,23 +2409,25 @@ SpirvInstruction *SpirvEmitter::doCastExpr(const CastExpr *expr) {
     llvm::SmallVector<SpirvInstruction *, 4> extractedVecs;
     for (uint32_t row = 0; row < dstRows; ++row) {
       // Extract a row
-      SpirvInstruction *rowInstr =
-          spvBuilder.createCompositeExtract(srcRowType, src, {row});
+      SpirvInstruction *rowInstr = spvBuilder.createCompositeExtract(
+          srcRowType, src, {row}, expr->getExprLoc());
       // Extract the necessary columns from that row.
       // The front-end ensures dstCols <= srcCols.
       // If dstCols equals srcCols, we can use the whole row directly.
       if (dstCols == 1) {
-        rowInstr = spvBuilder.createCompositeExtract(elemType, rowInstr, {0});
+        rowInstr = spvBuilder.createCompositeExtract(elemType, rowInstr, {0},
+                                                     expr->getLocStart());
       } else if (dstCols < srcCols) {
-        rowInstr = spvBuilder.createVectorShuffle(dstRowType, rowInstr,
-                                                  rowInstr, indexes);
+        rowInstr = spvBuilder.createVectorShuffle(
+            dstRowType, rowInstr, rowInstr, indexes, expr->getLocStart());
       }
       extractedVecs.push_back(rowInstr);
     }
 
     auto *val = extractedVecs.front();
     if (extractedVecs.size() > 1) {
-      val = spvBuilder.createCompositeConstruct(toType, extractedVecs);
+      val = spvBuilder.createCompositeConstruct(toType, extractedVecs,
+                                                expr->getExprLoc());
     }
     val->setRValue();
     return val;
@@ -2464,7 +2556,7 @@ SpirvInstruction *SpirvEmitter::doCastExpr(const CastExpr *expr) {
 
     auto *derivedInfo = doExpr(subExpr);
     return turnIntoElementPtr(subExpr->getType(), derivedInfo, expr->getType(),
-                              baseIndexInstructions);
+                              baseIndexInstructions, subExpr->getExprLoc());
   }
   default:
     emitError("implicit cast kind '%0' unimplemented", expr->getExprLoc())
@@ -2493,7 +2585,7 @@ SpirvInstruction *SpirvEmitter::processFlatConversion(
           return 0;
         }
         case BuiltinType::Bool:
-          return castToBool(initInstr, initType, ty);
+          return castToBool(initInstr, initType, ty, srcLoc);
         // Target type is an integer variant.
         case BuiltinType::Int:
         case BuiltinType::Short:
@@ -2531,7 +2623,7 @@ SpirvInstruction *SpirvEmitter::processFlatConversion(
       auto *elem = processFlatConversion(elemType, initType, initInstr, srcLoc);
       llvm::SmallVector<SpirvInstruction *, 4> constituents(size_t(elemCount),
                                                             elem);
-      return spvBuilder.createCompositeConstruct(type, constituents);
+      return spvBuilder.createCompositeConstruct(type, constituents, srcLoc);
     }
   }
 
@@ -2547,10 +2639,11 @@ SpirvInstruction *SpirvEmitter::processFlatConversion(
       auto *elem = processFlatConversion(elemType, initType, initInstr, srcLoc);
       const llvm::SmallVector<SpirvInstruction *, 4> constituents(
           size_t(colCount), elem);
-      auto *col = spvBuilder.createCompositeConstruct(vecType, constituents);
+      auto *col =
+          spvBuilder.createCompositeConstruct(vecType, constituents, srcLoc);
       const llvm::SmallVector<SpirvInstruction *, 4> rows(size_t(rowCount),
                                                           col);
-      return spvBuilder.createCompositeConstruct(type, rows);
+      return spvBuilder.createCompositeConstruct(type, rows, srcLoc);
     }
   }
 
@@ -2572,7 +2665,7 @@ SpirvInstruction *SpirvEmitter::processFlatConversion(
       }
     }
 
-    return spvBuilder.createCompositeConstruct(type, fields);
+    return spvBuilder.createCompositeConstruct(type, fields, srcLoc);
   }
 
   // Array type
@@ -2582,7 +2675,7 @@ SpirvInstruction *SpirvEmitter::processFlatConversion(
     auto *elem = processFlatConversion(arrayType->getElementType(), initType,
                                        initInstr, srcLoc);
     llvm::SmallVector<SpirvInstruction *, 4> constituents(size_t(size), elem);
-    return spvBuilder.createCompositeConstruct(type, constituents);
+    return spvBuilder.createCompositeConstruct(type, constituents, srcLoc);
   }
 
   emitError("flat conversion of type %0 unimplemented", {})
@@ -2607,9 +2700,9 @@ SpirvEmitter::doCompoundAssignOperator(const CompoundAssignOperator *expr) {
   const auto *lhs = expr->getLHS();
 
   SpirvInstruction *lhsPtr = nullptr;
-  auto *result =
-      processBinaryOp(lhs, rhs, opcode, expr->getComputationLHSType(),
-                      expr->getType(), expr->getSourceRange(), &lhsPtr);
+  auto *result = processBinaryOp(
+      lhs, rhs, opcode, expr->getComputationLHSType(), expr->getType(),
+      expr->getSourceRange(), expr->getOperatorLoc(), &lhsPtr);
   return processAssignment(lhs, result, true, lhsPtr);
 }
 
@@ -2639,7 +2732,8 @@ SpirvEmitter::doConditionalOperator(const ConditionalOperator *expr) {
       const llvm::SmallVector<SpirvInstruction *, 4> components(size_t(count),
                                                                 condition);
       condition = spvBuilder.createCompositeConstruct(
-          astContext.getExtVectorType(astContext.BoolTy, count), components);
+          astContext.getExtVectorType(astContext.BoolTy, count), components,
+          expr->getCond()->getLocEnd());
     }
 
     auto *value =
@@ -2649,30 +2743,32 @@ SpirvEmitter::doConditionalOperator(const ConditionalOperator *expr) {
   }
 
   // If we can't use OpSelect, we need to create if-else control flow.
-  auto *tempVar =
-      spvBuilder.addFnVar(type, /*SourceLocation*/ {}, "temp.var.ternary");
+  auto *tempVar = spvBuilder.addFnVar(type, loc, "temp.var.ternary");
   auto *thenBB = spvBuilder.createBasicBlock("if.true");
   auto *mergeBB = spvBuilder.createBasicBlock("if.merge");
   auto *elseBB = spvBuilder.createBasicBlock("if.false");
 
   // Create the branch instruction. This will end the current basic block.
-  spvBuilder.createConditionalBranch(condition, thenBB, elseBB, mergeBB);
+  spvBuilder.createConditionalBranch(condition, thenBB, elseBB,
+                                     expr->getCond()->getLocEnd(), mergeBB);
   spvBuilder.addSuccessor(thenBB);
   spvBuilder.addSuccessor(elseBB);
   spvBuilder.setMergeTarget(mergeBB);
   // Handle the then branch
   spvBuilder.setInsertPoint(thenBB);
-  spvBuilder.createStore(tempVar, trueBranch);
-  spvBuilder.createBranch(mergeBB);
+  spvBuilder.createStore(tempVar, trueBranch,
+                         expr->getTrueExpr()->getLocStart());
+  spvBuilder.createBranch(mergeBB, expr->getTrueExpr()->getLocEnd());
   spvBuilder.addSuccessor(mergeBB);
   // Handle the else branch
   spvBuilder.setInsertPoint(elseBB);
-  spvBuilder.createStore(tempVar, falseBranch);
-  spvBuilder.createBranch(mergeBB);
+  spvBuilder.createStore(tempVar, falseBranch,
+                         expr->getFalseExpr()->getLocStart());
+  spvBuilder.createBranch(mergeBB, expr->getFalseExpr()->getLocEnd());
   spvBuilder.addSuccessor(mergeBB);
   // From now on, emit instructions into the merge block.
   spvBuilder.setInsertPoint(mergeBB);
-  auto *result = spvBuilder.createLoad(type, tempVar);
+  auto *result = spvBuilder.createLoad(type, tempVar, expr->getLocEnd());
   result->setRValue();
   return result;
 }
@@ -2700,10 +2796,13 @@ SpirvEmitter::processByteAddressBufferStructuredBufferGetDimensions(
   if (isBABuf) {
     length = spvBuilder.createBinaryOp(
         spv::Op::OpIMul, astContext.UnsignedIntTy, length,
+        // TODO(jaebaek): What line info we should emit for constants?
         spvBuilder.getConstantInt(astContext.UnsignedIntTy,
-                                  llvm::APInt(32, 4u)));
+                                  llvm::APInt(32, 4u)),
+        expr->getExprLoc());
   }
-  spvBuilder.createStore(doExpr(expr->getArg(0)), length);
+  spvBuilder.createStore(doExpr(expr->getArg(0)), length,
+                         expr->getArg(0)->getLocStart());
 
   if (isStructuredBuf) {
     // For (RW)StructuredBuffer, the stride of the runtime array (which is the
@@ -2715,7 +2814,8 @@ SpirvEmitter::processByteAddressBufferStructuredBufferGetDimensions(
                                           /*isRowMajor*/ llvm::None, &stride);
     auto *sizeInstr = spvBuilder.getConstantInt(astContext.UnsignedIntTy,
                                                 llvm::APInt(32, size));
-    spvBuilder.createStore(doExpr(expr->getArg(1)), sizeInstr);
+    spvBuilder.createStore(doExpr(expr->getArg(1)), sizeInstr,
+                           expr->getArg(1)->getLocStart());
   }
 
   return nullptr;
@@ -2728,7 +2828,6 @@ SpirvInstruction *SpirvEmitter::processRWByteAddressBufferAtomicMethods(
   // void Interlocked*(in UINT dest, in UINT value, out UINT original_value);
 
   const auto *object = expr->getImplicitObjectArgument();
-  const auto srcLoc = expr->getExprLoc();
   auto *objectInfo = loadIfAliasVarRef(object);
 
   auto *zero =
@@ -2738,11 +2837,11 @@ SpirvInstruction *SpirvEmitter::processRWByteAddressBufferAtomicMethods(
   // Right shift by 2 to convert the byte offset to uint32_t offset
   auto *address = spvBuilder.createBinaryOp(
       spv::Op::OpShiftRightLogical, astContext.UnsignedIntTy, offset,
-      spvBuilder.getConstantInt(astContext.UnsignedIntTy, llvm::APInt(32, 2)));
-  auto *ptr = spvBuilder.createAccessChain(
-      spvContext.getPointerType(astContext.UnsignedIntTy,
-                                objectInfo->getStorageClass()),
-      objectInfo, {zero, address});
+      spvBuilder.getConstantInt(astContext.UnsignedIntTy, llvm::APInt(32, 2)),
+      expr->getExprLoc());
+  auto *ptr =
+      spvBuilder.createAccessChain(astContext.UnsignedIntTy, objectInfo,
+                                   {zero, address}, object->getLocStart());
 
   const bool isCompareExchange =
       opcode == hlsl::IntrinsicOp::MOP_InterlockedCompareExchange;
@@ -2754,20 +2853,23 @@ SpirvInstruction *SpirvEmitter::processRWByteAddressBufferAtomicMethods(
     auto *originalVal = spvBuilder.createAtomicCompareExchange(
         astContext.UnsignedIntTy, ptr, spv::Scope::Device,
         spv::MemorySemanticsMask::MaskNone, spv::MemorySemanticsMask::MaskNone,
-        doExpr(expr->getArg(2)), comparator, srcLoc);
+        doExpr(expr->getArg(2)), comparator, expr->getCallee()->getExprLoc());
     if (isCompareExchange)
-      spvBuilder.createStore(doExpr(expr->getArg(3)), originalVal);
+      spvBuilder.createStore(doExpr(expr->getArg(3)), originalVal,
+                             expr->getArg(3)->getLocStart());
   } else {
     auto *value = doExpr(expr->getArg(1));
     SpirvInstruction *originalVal = spvBuilder.createAtomicOp(
         translateAtomicHlslOpcodeToSpirvOpcode(opcode),
         astContext.UnsignedIntTy, ptr, spv::Scope::Device,
-        spv::MemorySemanticsMask::MaskNone, value, srcLoc);
+        spv::MemorySemanticsMask::MaskNone, value,
+        expr->getCallee()->getExprLoc());
     if (expr->getNumArgs() > 2) {
       originalVal = castToType(originalVal, astContext.UnsignedIntTy,
                                expr->getArg(2)->getType(),
                                expr->getArg(2)->getLocStart());
-      spvBuilder.createStore(doExpr(expr->getArg(2)), originalVal);
+      spvBuilder.createStore(doExpr(expr->getArg(2)), originalVal,
+                             expr->getArg(2)->getLocStart());
     }
   }
 
@@ -2786,7 +2888,8 @@ SpirvEmitter::processGetSamplePosition(const CXXMemberCallExpr *expr) {
                 "standard sample settings with 1, 2, 4, 8, or 16 samples and "
                 "will return float2(0, 0) for other cases",
                 expr->getCallee()->getExprLoc());
-  return emitGetSamplePosition(sampleCount, doExpr(expr->getArg(0)));
+  return emitGetSamplePosition(sampleCount, doExpr(expr->getArg(0)),
+                               expr->getCallee()->getExprLoc());
 }
 
 SpirvInstruction *
@@ -2800,7 +2903,7 @@ SpirvEmitter::processSubpassLoad(const CXXMemberCallExpr *expr) {
 
   return processBufferTextureLoad(object, location, /*constOffset*/ 0,
                                   /*varOffset*/ 0, /*lod*/ sample,
-                                  /*residencyCode*/ 0);
+                                  /*residencyCode*/ 0, expr->getExprLoc());
 }
 
 SpirvInstruction *
@@ -2858,7 +2961,7 @@ SpirvEmitter::processBufferTextureGetDimensions(const CXXMemberCallExpr *expr) {
   const auto storeToOutputArg = [this](const Expr *outputArg,
                                        SpirvInstruction *id, QualType type) {
     id = castToType(id, type, outputArg->getType(), outputArg->getExprLoc());
-    spvBuilder.createStore(doExpr(outputArg), id);
+    spvBuilder.createStore(doExpr(outputArg), id, outputArg->getLocStart());
   };
 
   if ((typeName == "Texture1D" && numArgs > 1) ||
@@ -2905,21 +3008,22 @@ SpirvEmitter::processBufferTextureGetDimensions(const CXXMemberCallExpr *expr) {
   SpirvInstruction *query =
       lod ? cast<SpirvInstruction>(spvBuilder.createImageQuery(
                 spv::Op::OpImageQuerySizeLod, resultQualType,
-                expr->getExprLoc(), objectInstr, lod))
+                expr->getCallee()->getExprLoc(), objectInstr, lod))
           : cast<SpirvInstruction>(spvBuilder.createImageQuery(
-                spv::Op::OpImageQuerySize, resultQualType, expr->getExprLoc(),
-                objectInstr));
+                spv::Op::OpImageQuerySize, resultQualType,
+                expr->getCallee()->getExprLoc(), objectInstr));
 
   if (querySize == 1) {
     const uint32_t argIndex = mipLevel ? 1 : 0;
     storeToOutputArg(expr->getArg(argIndex), query, resultQualType);
   } else {
     for (uint32_t i = 0; i < querySize; ++i) {
+      const uint32_t argIndex = mipLevel ? i + 1 : i;
       auto *component = spvBuilder.createCompositeExtract(
-          astContext.UnsignedIntTy, query, {i});
+          astContext.UnsignedIntTy, query, {i},
+          expr->getCallee()->getExprLoc());
       // If the first arg is the mipmap level, we must write the results
       // starting from Arg(i+1), not Arg(i).
-      const uint32_t argIndex = mipLevel ? i + 1 : i;
       storeToOutputArg(expr->getArg(argIndex), component,
                        astContext.UnsignedIntTy);
     }
@@ -2930,7 +3034,8 @@ SpirvEmitter::processBufferTextureGetDimensions(const CXXMemberCallExpr *expr) {
     const spv::Op opcode =
         numLevels ? spv::Op::OpImageQueryLevels : spv::Op::OpImageQuerySamples;
     auto *numLevelsSamplesQuery = spvBuilder.createImageQuery(
-        opcode, astContext.UnsignedIntTy, expr->getExprLoc(), objectInstr);
+        opcode, astContext.UnsignedIntTy, expr->getCallee()->getExprLoc(),
+        objectInstr);
     storeToOutputArg(numLevelsSamplesArg, numLevelsSamplesQuery,
                      astContext.UnsignedIntTy);
   }
@@ -2966,7 +3071,8 @@ SpirvEmitter::processTextureLevelOfDetail(const CXXMemberCallExpr *expr,
   // The first component of the float2 contains the mipmap array layer.
   // The second component of the float2 represents the unclamped lod.
   return spvBuilder.createCompositeExtract(astContext.FloatTy, query,
-                                           unclamped ? 1 : 0);
+                                           unclamped ? 1 : 0,
+                                           expr->getCallee()->getExprLoc());
 }
 
 SpirvInstruction *SpirvEmitter::processTextureGatherRGBACmpRGBA(
@@ -2997,7 +3103,7 @@ SpirvInstruction *SpirvEmitter::processTextureGatherRGBACmpRGBA(
   const FunctionDecl *callee = expr->getDirectCallee();
   const auto numArgs = expr->getNumArgs();
   const auto *imageExpr = expr->getImplicitObjectArgument();
-  const auto loc = expr->getExprLoc();
+  const auto loc = expr->getCallee()->getExprLoc();
   const QualType imageType = imageExpr->getType();
   const QualType retType = callee->getReturnType();
 
@@ -3058,10 +3164,11 @@ SpirvInstruction *SpirvEmitter::processTextureGatherRGBACmpRGBA(
           compareVal,
           /*constOffset*/ nullptr, varOffset, /*constOffsets*/ nullptr,
           /*sampleNumber*/ nullptr, status, loc);
-      texels[i] = spvBuilder.createCompositeExtract(elemType, gatherRet, {i});
+      texels[i] =
+          spvBuilder.createCompositeExtract(elemType, gatherRet, {i}, loc);
     }
     return spvBuilder.createCompositeConstruct(
-        retType, {texels[0], texels[1], texels[2], texels[3]});
+        retType, {texels[0], texels[1], texels[2], texels[3]}, loc);
   }
 
   return spvBuilder.createImageGather(
@@ -3126,7 +3233,8 @@ SpirvEmitter::processTextureGatherCmp(const CXXMemberCallExpr *expr) {
 SpirvInstruction *SpirvEmitter::processBufferTextureLoad(
     const Expr *object, SpirvInstruction *location,
     SpirvInstruction *constOffset, SpirvInstruction *varOffset,
-    SpirvInstruction *lod, SpirvInstruction *residencyCode) {
+    SpirvInstruction *lod, SpirvInstruction *residencyCode,
+    SourceLocation loc) {
   // Loading for Buffer and RWBuffer translates to an OpImageFetch.
   // The result type of an OpImageFetch must be a vec4 of float or int.
   const auto type = object->getType();
@@ -3171,14 +3279,14 @@ SpirvInstruction *SpirvEmitter::processBufferTextureLoad(
   const QualType texelType = astContext.getExtVectorType(elemType, 4u);
   auto *texel = spvBuilder.createImageFetchOrRead(
       doFetch, texelType, type, objectInfo, location, lod, constOffset,
-      varOffset, /*constOffsets*/ nullptr, sampleNumber, residencyCode);
+      varOffset, /*constOffsets*/ nullptr, sampleNumber, residencyCode, loc);
 
   // If the result type is a vec1, vec2, or vec3, some extra processing
   // (extraction) is required.
-  auto *retVal = extractVecFromVec4(texel, elemCount, elemType);
+  auto *retVal = extractVecFromVec4(texel, elemCount, elemType, loc);
   if (isTemplateOverStruct) {
     // Convert to the struct so that we are consistent with types in the AST.
-    retVal = convertVectorToStruct(sampledType, elemType, retVal);
+    retVal = convertVectorToStruct(sampledType, elemType, retVal, loc);
   }
   retVal->setRValue();
   return retVal;
@@ -3206,14 +3314,38 @@ SpirvInstruction *SpirvEmitter::processByteAddressBufferLoadStore(
   const Expr *addressExpr = expr->getArg(0);
   auto *byteAddress = doExpr(addressExpr);
   const QualType addressType = addressExpr->getType();
+  // The front-end prevents usage of templated Load2, Load3, Load4, Store2,
+  // Store3, Store4 intrinsic functions.
+  const bool isTemplatedLoadOrStore =
+      (numWords == 1) &&
+      (doStore ? !expr->getArg(1)->getType()->isSpecificBuiltinType(
+                     BuiltinType::UInt)
+               : !expr->getType()->isSpecificBuiltinType(BuiltinType::UInt));
 
   // Do a OpShiftRightLogical by 2 (divide by 4 to get aligned memory
   // access). The AST always casts the address to unsinged integer, so shift
   // by unsinged integer 2.
   auto *constUint2 =
       spvBuilder.getConstantInt(astContext.UnsignedIntTy, llvm::APInt(32, 2));
-  auto *address = spvBuilder.createBinaryOp(
-      spv::Op::OpShiftRightLogical, addressType, byteAddress, constUint2);
+  SpirvInstruction *address =
+      spvBuilder.createBinaryOp(spv::Op::OpShiftRightLogical, addressType,
+                                byteAddress, constUint2, expr->getExprLoc());
+
+  if (isTemplatedLoadOrStore) {
+    // Templated load. Need to (potentially) perform more
+    // loads/casts/composite-constructs.
+    uint32_t bitOffset = 0;
+    if (doStore) {
+      auto *values = doExpr(expr->getArg(1));
+      RawBufferHandler(*this).processTemplatedStoreToBuffer(
+          values, objectInfo, address, expr->getArg(1)->getType(), bitOffset);
+      return nullptr;
+    } else {
+      RawBufferHandler rawBufferHandler(*this);
+      return rawBufferHandler.processTemplatedLoadFromBuffer(
+          objectInfo, address, expr->getType(), bitOffset);
+    }
+  }
 
   // Perform access chain into the RWByteAddressBuffer.
   // First index must be zero (member 0 of the struct is a
@@ -3221,35 +3353,39 @@ SpirvInstruction *SpirvEmitter::processByteAddressBufferLoadStore(
   // the address.
   auto *constUint0 =
       spvBuilder.getConstantInt(astContext.UnsignedIntTy, llvm::APInt(32, 0));
-  const auto *ptrType = spvContext.getPointerType(
-      astContext.UnsignedIntTy, objectInfo->getStorageClass());
   if (doStore) {
     auto *values = doExpr(expr->getArg(1));
     auto *curStoreAddress = address;
     for (uint32_t wordCounter = 0; wordCounter < numWords; ++wordCounter) {
       // Extract a 32-bit word from the input.
-      auto *curValue =
-          numWords == 1 ? values
-                        : spvBuilder.createCompositeExtract(
-                              astContext.UnsignedIntTy, values, {wordCounter});
+      auto *curValue = numWords == 1
+                           ? values
+                           : spvBuilder.createCompositeExtract(
+                                 astContext.UnsignedIntTy, values,
+                                 {wordCounter}, expr->getArg(1)->getExprLoc());
 
       // Update the output address if necessary.
       if (wordCounter > 0) {
         auto *offset = spvBuilder.getConstantInt(astContext.UnsignedIntTy,
                                                  llvm::APInt(32, wordCounter));
-        curStoreAddress = spvBuilder.createBinaryOp(
-            spv::Op::OpIAdd, addressType, address, offset);
+        curStoreAddress =
+            spvBuilder.createBinaryOp(spv::Op::OpIAdd, addressType, address,
+                                      offset, expr->getCallee()->getExprLoc());
       }
 
       // Store the word to the right address at the output.
       auto *storePtr = spvBuilder.createAccessChain(
-          ptrType, objectInfo, {constUint0, curStoreAddress});
-      spvBuilder.createStore(storePtr, curValue);
+          astContext.UnsignedIntTy, objectInfo, {constUint0, curStoreAddress},
+          object->getLocStart());
+      spvBuilder.createStore(storePtr, curValue,
+                             expr->getCallee()->getExprLoc());
     }
   } else {
-    auto *loadPtr = spvBuilder.createAccessChain(ptrType, objectInfo,
-                                                 {constUint0, address});
-    result = spvBuilder.createLoad(astContext.UnsignedIntTy, loadPtr);
+    auto *loadPtr = spvBuilder.createAccessChain(
+        astContext.UnsignedIntTy, objectInfo, {constUint0, address},
+        object->getLocStart());
+    result = spvBuilder.createLoad(astContext.UnsignedIntTy, loadPtr,
+                                   expr->getCallee()->getExprLoc());
     if (numWords > 1) {
       // Load word 2, 3, and 4 where necessary. Use OpCompositeConstruct to
       // return a vector result.
@@ -3258,16 +3394,20 @@ SpirvInstruction *SpirvEmitter::processByteAddressBufferLoadStore(
       for (uint32_t wordCounter = 2; wordCounter <= numWords; ++wordCounter) {
         auto *offset = spvBuilder.getConstantInt(
             astContext.UnsignedIntTy, llvm::APInt(32, wordCounter - 1));
-        auto *newAddress = spvBuilder.createBinaryOp(
-            spv::Op::OpIAdd, addressType, address, offset);
-        loadPtr = spvBuilder.createAccessChain(ptrType, objectInfo,
-                                               {constUint0, newAddress});
+        auto *newAddress =
+            spvBuilder.createBinaryOp(spv::Op::OpIAdd, addressType, address,
+                                      offset, expr->getCallee()->getExprLoc());
+        loadPtr = spvBuilder.createAccessChain(
+            astContext.UnsignedIntTy, objectInfo, {constUint0, newAddress},
+            object->getLocStart());
         values.push_back(
-            spvBuilder.createLoad(astContext.UnsignedIntTy, loadPtr));
+            spvBuilder.createLoad(astContext.UnsignedIntTy, loadPtr,
+                                  expr->getCallee()->getExprLoc()));
       }
       const QualType resultType =
           astContext.getExtVectorType(addressType, numWords);
-      result = spvBuilder.createCompositeConstruct(resultType, values);
+      result = spvBuilder.createCompositeConstruct(resultType, values,
+                                                   expr->getLocStart());
       result->setRValue();
     }
   }
@@ -3293,7 +3433,8 @@ SpirvEmitter::processStructuredBufferLoad(const CXXMemberCallExpr *expr) {
   auto *zero = spvBuilder.getConstantInt(astContext.IntTy, llvm::APInt(32, 0));
   auto *index = doExpr(expr->getArg(0));
 
-  return turnIntoElementPtr(buffer->getType(), info, structType, {zero, index});
+  return turnIntoElementPtr(buffer->getType(), info, structType, {zero, index},
+                            buffer->getExprLoc());
 }
 
 SpirvInstruction *
@@ -3304,7 +3445,7 @@ SpirvEmitter::incDecRWACSBufferCounter(const CXXMemberCallExpr *expr,
   auto *sOne =
       spvBuilder.getConstantInt(astContext.IntTy, llvm::APInt(32, 1, true));
 
-  const auto srcLoc = expr->getExprLoc();
+  const auto srcLoc = expr->getCallee()->getExprLoc();
   const auto *object =
       expr->getImplicitObjectArgument()->IgnoreParenNoopCasts(astContext);
 
@@ -3323,10 +3464,9 @@ SpirvEmitter::incDecRWACSBufferCounter(const CXXMemberCallExpr *expr,
     return nullptr;
   }
 
-  const auto *counterPtrType =
-      spvContext.getPointerType(astContext.IntTy, spv::StorageClass::Uniform);
   auto *counterPtr = spvBuilder.createAccessChain(
-      counterPtrType, counterPair->get(spvBuilder, spvContext), {zero});
+      astContext.IntTy, counterPair->get(spvBuilder, spvContext), {zero},
+      srcLoc);
 
   SpirvInstruction *index = nullptr;
   if (isInc) {
@@ -3340,7 +3480,7 @@ SpirvEmitter::incDecRWACSBufferCounter(const CXXMemberCallExpr *expr,
         spv::Op::OpAtomicISub, astContext.IntTy, counterPtr, spv::Scope::Device,
         spv::MemorySemanticsMask::MaskNone, sOne, srcLoc);
     index = spvBuilder.createBinaryOp(spv::Op::OpISub, astContext.IntTy, prev,
-                                      sOne);
+                                      sOne, srcLoc);
   }
 
   return index;
@@ -3510,7 +3650,7 @@ SpirvEmitter::processACSBufferAppendConsume(const CXXMemberCallExpr *expr) {
   }
 
   bufferInfo = turnIntoElementPtr(object->getType(), bufferInfo, bufferElemTy,
-                                  {zero, index});
+                                  {zero, index}, object->getExprLoc());
 
   if (isAppend) {
     // Write out the value
@@ -3519,14 +3659,15 @@ SpirvEmitter::processACSBufferAppendConsume(const CXXMemberCallExpr *expr) {
       return nullptr;
 
     if (!arg0->isRValue()) {
-      arg0 = spvBuilder.createLoad(bufferElemTy, arg0);
+      arg0 = spvBuilder.createLoad(bufferElemTy, arg0,
+                                   expr->getArg(0)->getExprLoc());
     }
     if (needCast &&
         !isSameType(astContext, bufferElemTy, arg0->getAstResultType())) {
       arg0 = castToType(arg0, arg0->getAstResultType(), bufferElemTy,
                         expr->getArg(0)->getExprLoc());
     }
-    storeValue(bufferInfo, arg0, bufferElemTy);
+    storeValue(bufferInfo, arg0, bufferElemTy, expr->getCallee()->getExprLoc());
     return 0;
   } else {
     // Note that we are returning a pointer (lvalue) here inorder to further
@@ -3559,7 +3700,8 @@ SpirvEmitter::processStreamOutputRestart(const CXXMemberCallExpr *expr) {
 
 SpirvInstruction *
 SpirvEmitter::emitGetSamplePosition(SpirvInstruction *sampleCount,
-                                    SpirvInstruction *sampleIndex) {
+                                    SpirvInstruction *sampleIndex,
+                                    SourceLocation loc) {
   struct Float2 {
     float x;
     float y;
@@ -3616,11 +3758,10 @@ SpirvEmitter::emitGetSamplePosition(SpirvInstruction *sampleCount,
   //   }
 
   const auto v2f32Type = astContext.getExtVectorType(astContext.FloatTy, 2);
-  const auto *ptrType =
-      spvContext.getPointerType(v2f32Type, spv::StorageClass::Function);
 
   // Creates a SPIR-V function scope variable of type float2[len].
-  const auto createArray = [this, v2f32Type](const Float2 *ptr, uint32_t len) {
+  const auto createArray = [this, v2f32Type, loc](const Float2 *ptr,
+                                                  uint32_t len) {
     llvm::SmallVector<SpirvConstant *, 16> components;
     for (uint32_t i = 0; i < len; ++i) {
       auto *x = spvBuilder.getConstantFloat(astContext.FloatTy,
@@ -3636,8 +3777,8 @@ SpirvEmitter::emitGetSamplePosition(SpirvInstruction *sampleCount,
 
     const std::string varName =
         "var.GetSamplePosition.data." + std::to_string(len);
-    auto *var = spvBuilder.addFnVar(arrType, /*SourceLocation*/ {}, varName);
-    spvBuilder.createStore(var, val);
+    auto *var = spvBuilder.addFnVar(arrType, loc, varName);
+    spvBuilder.createStore(var, val, loc);
     return var;
   };
 
@@ -3646,8 +3787,8 @@ SpirvEmitter::emitGetSamplePosition(SpirvInstruction *sampleCount,
   auto *pos8Arr = createArray(pos8, 8);
   auto *pos16Arr = createArray(pos16, 16);
 
-  auto *resultVar = spvBuilder.addFnVar(v2f32Type, /*SourceLocation*/ {},
-                                        "var.GetSamplePosition.result");
+  auto *resultVar =
+      spvBuilder.addFnVar(v2f32Type, loc, "var.GetSamplePosition.result");
 
   auto *then2BB = spvBuilder.createBasicBlock("if.GetSamplePosition.then2");
   auto *then4BB = spvBuilder.createBasicBlock("if.GetSamplePosition.then4");
@@ -3667,8 +3808,9 @@ SpirvEmitter::emitGetSamplePosition(SpirvInstruction *sampleCount,
   //   if (count == 2) {
   const auto check2 = spvBuilder.createBinaryOp(
       spv::Op::OpIEqual, astContext.BoolTy, sampleCount,
-      spvBuilder.getConstantInt(astContext.UnsignedIntTy, llvm::APInt(32, 2)));
-  spvBuilder.createConditionalBranch(check2, then2BB, else2BB, merge2BB);
+      spvBuilder.getConstantInt(astContext.UnsignedIntTy, llvm::APInt(32, 2)),
+      loc);
+  spvBuilder.createConditionalBranch(check2, then2BB, else2BB, loc, merge2BB);
   spvBuilder.addSuccessor(then2BB);
   spvBuilder.addSuccessor(else2BB);
   spvBuilder.setMergeTarget(merge2BB);
@@ -3676,17 +3818,20 @@ SpirvEmitter::emitGetSamplePosition(SpirvInstruction *sampleCount,
   //     position = pos2[index];
   //   }
   spvBuilder.setInsertPoint(then2BB);
-  auto *ac = spvBuilder.createAccessChain(ptrType, pos2Arr, {sampleIndex});
-  spvBuilder.createStore(resultVar, spvBuilder.createLoad(v2f32Type, ac));
-  spvBuilder.createBranch(merge2BB);
+  auto *ac =
+      spvBuilder.createAccessChain(v2f32Type, pos2Arr, {sampleIndex}, loc);
+  spvBuilder.createStore(resultVar, spvBuilder.createLoad(v2f32Type, ac, loc),
+                         loc);
+  spvBuilder.createBranch(merge2BB, loc);
   spvBuilder.addSuccessor(merge2BB);
 
   //   else if (count == 4) {
   spvBuilder.setInsertPoint(else2BB);
   const auto check4 = spvBuilder.createBinaryOp(
       spv::Op::OpIEqual, astContext.BoolTy, sampleCount,
-      spvBuilder.getConstantInt(astContext.UnsignedIntTy, llvm::APInt(32, 4)));
-  spvBuilder.createConditionalBranch(check4, then4BB, else4BB, merge4BB);
+      spvBuilder.getConstantInt(astContext.UnsignedIntTy, llvm::APInt(32, 4)),
+      loc);
+  spvBuilder.createConditionalBranch(check4, then4BB, else4BB, loc, merge4BB);
   spvBuilder.addSuccessor(then4BB);
   spvBuilder.addSuccessor(else4BB);
   spvBuilder.setMergeTarget(merge4BB);
@@ -3694,17 +3839,19 @@ SpirvEmitter::emitGetSamplePosition(SpirvInstruction *sampleCount,
   //     position = pos4[index];
   //   }
   spvBuilder.setInsertPoint(then4BB);
-  ac = spvBuilder.createAccessChain(ptrType, pos4Arr, {sampleIndex});
-  spvBuilder.createStore(resultVar, spvBuilder.createLoad(v2f32Type, ac));
-  spvBuilder.createBranch(merge4BB);
+  ac = spvBuilder.createAccessChain(v2f32Type, pos4Arr, {sampleIndex}, loc);
+  spvBuilder.createStore(resultVar, spvBuilder.createLoad(v2f32Type, ac, loc),
+                         loc);
+  spvBuilder.createBranch(merge4BB, loc);
   spvBuilder.addSuccessor(merge4BB);
 
   //   else if (count == 8) {
   spvBuilder.setInsertPoint(else4BB);
   const auto check8 = spvBuilder.createBinaryOp(
       spv::Op::OpIEqual, astContext.BoolTy, sampleCount,
-      spvBuilder.getConstantInt(astContext.UnsignedIntTy, llvm::APInt(32, 8)));
-  spvBuilder.createConditionalBranch(check8, then8BB, else8BB, merge8BB);
+      spvBuilder.getConstantInt(astContext.UnsignedIntTy, llvm::APInt(32, 8)),
+      loc);
+  spvBuilder.createConditionalBranch(check8, then8BB, else8BB, loc, merge8BB);
   spvBuilder.addSuccessor(then8BB);
   spvBuilder.addSuccessor(else8BB);
   spvBuilder.setMergeTarget(merge8BB);
@@ -3712,17 +3859,20 @@ SpirvEmitter::emitGetSamplePosition(SpirvInstruction *sampleCount,
   //     position = pos8[index];
   //   }
   spvBuilder.setInsertPoint(then8BB);
-  ac = spvBuilder.createAccessChain(ptrType, pos8Arr, {sampleIndex});
-  spvBuilder.createStore(resultVar, spvBuilder.createLoad(v2f32Type, ac));
-  spvBuilder.createBranch(merge8BB);
+  ac = spvBuilder.createAccessChain(v2f32Type, pos8Arr, {sampleIndex}, loc);
+  spvBuilder.createStore(resultVar, spvBuilder.createLoad(v2f32Type, ac, loc),
+                         loc);
+  spvBuilder.createBranch(merge8BB, loc);
   spvBuilder.addSuccessor(merge8BB);
 
   //   else if (count == 16) {
   spvBuilder.setInsertPoint(else8BB);
   const auto check16 = spvBuilder.createBinaryOp(
       spv::Op::OpIEqual, astContext.BoolTy, sampleCount,
-      spvBuilder.getConstantInt(astContext.UnsignedIntTy, llvm::APInt(32, 16)));
-  spvBuilder.createConditionalBranch(check16, then16BB, else16BB, merge16BB);
+      spvBuilder.getConstantInt(astContext.UnsignedIntTy, llvm::APInt(32, 16)),
+      loc);
+  spvBuilder.createConditionalBranch(check16, then16BB, else16BB, loc,
+                                     merge16BB);
   spvBuilder.addSuccessor(then16BB);
   spvBuilder.addSuccessor(else16BB);
   spvBuilder.setMergeTarget(merge16BB);
@@ -3730,9 +3880,10 @@ SpirvEmitter::emitGetSamplePosition(SpirvInstruction *sampleCount,
   //     position = pos16[index];
   //   }
   spvBuilder.setInsertPoint(then16BB);
-  ac = spvBuilder.createAccessChain(ptrType, pos16Arr, {sampleIndex});
-  spvBuilder.createStore(resultVar, spvBuilder.createLoad(v2f32Type, ac));
-  spvBuilder.createBranch(merge16BB);
+  ac = spvBuilder.createAccessChain(v2f32Type, pos16Arr, {sampleIndex}, loc);
+  spvBuilder.createStore(resultVar, spvBuilder.createLoad(v2f32Type, ac, loc),
+                         loc);
+  spvBuilder.createBranch(merge16BB, loc);
   spvBuilder.addSuccessor(merge16BB);
 
   //   else {
@@ -3742,24 +3893,24 @@ SpirvEmitter::emitGetSamplePosition(SpirvInstruction *sampleCount,
   auto *zero =
       spvBuilder.getConstantFloat(astContext.FloatTy, llvm::APFloat(0.0f));
   auto *v2f32Zero = spvBuilder.getConstantComposite(v2f32Type, {zero, zero});
-  spvBuilder.createStore(resultVar, v2f32Zero);
-  spvBuilder.createBranch(merge16BB);
+  spvBuilder.createStore(resultVar, v2f32Zero, loc);
+  spvBuilder.createBranch(merge16BB, loc);
   spvBuilder.addSuccessor(merge16BB);
 
   spvBuilder.setInsertPoint(merge16BB);
-  spvBuilder.createBranch(merge8BB);
+  spvBuilder.createBranch(merge8BB, loc);
   spvBuilder.addSuccessor(merge8BB);
 
   spvBuilder.setInsertPoint(merge8BB);
-  spvBuilder.createBranch(merge4BB);
+  spvBuilder.createBranch(merge4BB, loc);
   spvBuilder.addSuccessor(merge4BB);
 
   spvBuilder.setInsertPoint(merge4BB);
-  spvBuilder.createBranch(merge2BB);
+  spvBuilder.createBranch(merge2BB, loc);
   spvBuilder.addSuccessor(merge2BB);
 
   spvBuilder.setInsertPoint(merge2BB);
-  return spvBuilder.createLoad(v2f32Type, resultVar);
+  return spvBuilder.createLoad(v2f32Type, resultVar, loc);
 }
 
 SpirvInstruction *
@@ -3863,14 +4014,16 @@ SpirvEmitter::processIntrinsicMemberCall(const CXXMemberCallExpr *expr,
     retVal = processTextureLevelOfDetail(expr, /* unclamped */ true);
     break;
   case IntrinsicOp::MOP_IncrementCounter:
-    retVal = spvBuilder.createUnaryOp(
-        spv::Op::OpBitcast, astContext.UnsignedIntTy,
-        incDecRWACSBufferCounter(expr, /*isInc*/ true));
+    retVal =
+        spvBuilder.createUnaryOp(spv::Op::OpBitcast, astContext.UnsignedIntTy,
+                                 incDecRWACSBufferCounter(expr, /*isInc*/ true),
+                                 expr->getCallee()->getExprLoc());
     break;
   case IntrinsicOp::MOP_DecrementCounter:
     retVal = spvBuilder.createUnaryOp(
         spv::Op::OpBitcast, astContext.UnsignedIntTy,
-        incDecRWACSBufferCounter(expr, /*isInc*/ false));
+        incDecRWACSBufferCounter(expr, /*isInc*/ false),
+        expr->getCallee()->getExprLoc());
     break;
   case IntrinsicOp::MOP_Append:
     if (hlsl::IsHLSLStreamOutputType(
@@ -3928,7 +4081,8 @@ SpirvInstruction *SpirvEmitter::createImageSample(
     std::pair<SpirvInstruction *, SpirvInstruction *> grad,
     SpirvInstruction *constOffset, SpirvInstruction *varOffset,
     SpirvInstruction *constOffsets, SpirvInstruction *sample,
-    SpirvInstruction *minLod, SpirvInstruction *residencyCodeId) {
+    SpirvInstruction *minLod, SpirvInstruction *residencyCodeId,
+    SourceLocation loc) {
 
   // SampleDref* instructions in SPIR-V always return a scalar.
   // They also have the correct type in HLSL.
@@ -3936,7 +4090,7 @@ SpirvInstruction *SpirvEmitter::createImageSample(
     return spvBuilder.createImageSample(retType, imageType, image, sampler,
                                         coordinate, compareVal, bias, lod, grad,
                                         constOffset, varOffset, constOffsets,
-                                        sample, minLod, residencyCodeId);
+                                        sample, minLod, residencyCodeId, loc);
   }
 
   // Non-Dref Sample instructions in SPIR-V must always return a vec4.
@@ -3962,11 +4116,11 @@ SpirvInstruction *SpirvEmitter::createImageSample(
   auto *retVal = spvBuilder.createImageSample(
       texelType, imageType, image, sampler, coordinate, compareVal, bias, lod,
       grad, constOffset, varOffset, constOffsets, sample, minLod,
-      residencyCodeId);
+      residencyCodeId, loc);
 
   // Extract smaller vector from the vec4 result if necessary.
   if (texelType != retType) {
-    retVal = extractVecFromVec4(retVal, retVecSize, elemType);
+    retVal = extractVecFromVec4(retVal, retVecSize, elemType, loc);
   }
 
   return retVal;
@@ -4037,7 +4191,8 @@ SpirvEmitter::processTextureSampleGather(const CXXMemberCallExpr *expr,
                              /*lod*/ nullptr, std::make_pair(nullptr, nullptr),
                              constOffset, varOffset,
                              /*constOffsets*/ nullptr, /*sampleNumber*/ nullptr,
-                             /*minLod*/ clamp, status);
+                             /*minLod*/ clamp, status,
+                             expr->getCallee()->getLocStart());
   } else {
     return spvBuilder.createImageGather(
         retType, imageType, image, sampler, coordinate,
@@ -4118,12 +4273,12 @@ SpirvEmitter::processTextureSampleBiasLevel(const CXXMemberCallExpr *expr,
 
   const auto retType = expr->getDirectCallee()->getReturnType();
 
-  return createImageSample(retType, imageType, image, sampler, coordinate,
-                           /*compareVal*/ nullptr, bias, lod,
-                           std::make_pair(nullptr, nullptr), constOffset,
-                           varOffset,
-                           /*constOffsets*/ nullptr, /*sampleNumber*/ nullptr,
-                           /*minLod*/ clamp, status);
+  return createImageSample(
+      retType, imageType, image, sampler, coordinate,
+      /*compareVal*/ nullptr, bias, lod, std::make_pair(nullptr, nullptr),
+      constOffset, varOffset,
+      /*constOffsets*/ nullptr, /*sampleNumber*/ nullptr,
+      /*minLod*/ clamp, status, expr->getCallee()->getLocStart());
 }
 
 SpirvInstruction *
@@ -4175,12 +4330,12 @@ SpirvEmitter::processTextureSampleGrad(const CXXMemberCallExpr *expr) {
     handleOffsetInMethodCall(expr, 4, &constOffset, &varOffset);
 
   const auto retType = expr->getDirectCallee()->getReturnType();
-  return createImageSample(retType, imageType, image, sampler, coordinate,
-                           /*compareVal*/ nullptr, /*bias*/ nullptr,
-                           /*lod*/ nullptr, std::make_pair(ddx, ddy),
-                           constOffset, varOffset,
-                           /*constOffsets*/ nullptr, /*sampleNumber*/ nullptr,
-                           /*minLod*/ clamp, status);
+  return createImageSample(
+      retType, imageType, image, sampler, coordinate,
+      /*compareVal*/ nullptr, /*bias*/ nullptr,
+      /*lod*/ nullptr, std::make_pair(ddx, ddy), constOffset, varOffset,
+      /*constOffsets*/ nullptr, /*sampleNumber*/ nullptr,
+      /*minLod*/ clamp, status, expr->getCallee()->getLocStart());
 }
 
 SpirvInstruction *
@@ -4270,7 +4425,7 @@ SpirvEmitter::processTextureSampleCmpCmpLevelZero(const CXXMemberCallExpr *expr,
       /*bias*/ nullptr, lod, std::make_pair(nullptr, nullptr), constOffset,
       varOffset,
       /*constOffsets*/ nullptr, /*sampleNumber*/ nullptr, /*minLod*/ clamp,
-      status);
+      status, expr->getCallee()->getLocStart());
 }
 
 SpirvInstruction *
@@ -4323,11 +4478,12 @@ SpirvEmitter::processBufferTextureLoad(const CXXMemberCallExpr *expr) {
       expr->getArg(numArgs - 1)->getType()->isUnsignedIntegerType();
   auto *status = hasStatusArg ? doExpr(expr->getArg(numArgs - 1)) : nullptr;
 
+  auto loc = expr->getExprLoc();
   if (isBuffer(objectType) || isRWBuffer(objectType) || isRWTexture(objectType))
     return processBufferTextureLoad(object, doExpr(locationArg),
                                     /*constOffset*/ nullptr,
                                     /*varOffset*/ nullptr, /*lod*/ nullptr,
-                                    /*residencyCode*/ status);
+                                    /*residencyCode*/ status, loc);
 
   // Subtract 1 for status (if it exists), and 1 for sampleIndex (if it exists),
   // and 1 for location.
@@ -4351,7 +4507,8 @@ SpirvEmitter::processBufferTextureLoad(const CXXMemberCallExpr *expr) {
       // that consists of both the coordinate and the mipmap level (via the
       // last vector element). We need to split it here since the
       // OpImageFetch SPIR-V instruction encodes them as separate arguments.
-      splitVecLastElement(locationArg->getType(), location, &coordinate, &lod);
+      splitVecLastElement(locationArg->getType(), location, &coordinate, &lod,
+                          locationArg->getExprLoc());
       // For textures other than Texture2DMS(Array), offset should be the
       // second parameter (index 1).
       if (hasOffsetArg)
@@ -4359,7 +4516,7 @@ SpirvEmitter::processBufferTextureLoad(const CXXMemberCallExpr *expr) {
     }
 
     return processBufferTextureLoad(object, coordinate, constOffset, varOffset,
-                                    lod, status);
+                                    lod, status, loc);
   }
   emitError("Load() of the given object type unimplemented",
             object->getExprLoc());
@@ -4401,7 +4558,8 @@ SpirvEmitter::doCXXOperatorCallExpr(const CXXOperatorCallExpr *expr) {
       return processBufferTextureLoad(baseExpr, doExpr(indexExpr),
                                       /*constOffset*/ nullptr,
                                       /*varOffset*/ nullptr, lod,
-                                      /*residencyCode*/ nullptr);
+                                      /*residencyCode*/ nullptr,
+                                      expr->getExprLoc());
     }
     // .mips[][] or .sample[][] must use the correct slice.
     if (isTextureMipsSampleIndexing(expr, &baseExpr, &indexExpr, &lodExpr)) {
@@ -4409,7 +4567,8 @@ SpirvEmitter::doCXXOperatorCallExpr(const CXXOperatorCallExpr *expr) {
       return processBufferTextureLoad(baseExpr, doExpr(indexExpr),
                                       /*constOffset*/ nullptr,
                                       /*varOffset*/ nullptr, lod,
-                                      /*residencyCode*/ nullptr);
+                                      /*residencyCode*/ nullptr,
+                                      expr->getExprLoc());
     }
   }
 
@@ -4428,11 +4587,12 @@ SpirvEmitter::doCXXOperatorCallExpr(const CXXOperatorCallExpr *expr) {
   // TODO: We can optimize the codegen by emitting OpCompositeExtract if
   // all indices are contant integers.
   if (base->isRValue()) {
-    base = createTemporaryVar(baseExpr->getType(), "vector", base);
+    base = createTemporaryVar(baseExpr->getType(), "vector", base,
+                              baseExpr->getExprLoc());
   }
 
-  return turnIntoElementPtr(baseExpr->getType(), base, expr->getType(),
-                            indices);
+  return turnIntoElementPtr(baseExpr->getType(), base, expr->getType(), indices,
+                            baseExpr->getExprLoc());
 }
 
 SpirvInstruction *
@@ -4465,7 +4625,7 @@ SpirvEmitter::doExtMatrixElementExpr(const ExtMatrixElementExpr *expr) {
     if (colCount > 1)
       indices.push_back(col);
 
-    if (baseExpr->isGLValue()) {
+    if (!baseInfo->isRValue()) {
       llvm::SmallVector<SpirvInstruction *, 2> indexInstructions(indices.size(),
                                                                  nullptr);
       for (uint32_t i = 0; i < indices.size(); ++i)
@@ -4476,16 +4636,16 @@ SpirvEmitter::doExtMatrixElementExpr(const ExtMatrixElementExpr *expr) {
         assert(!baseInfo->isRValue());
         // Load the element via access chain
         elem = spvBuilder.createAccessChain(
-            spvContext.getPointerType(elemType, baseInfo->getStorageClass()),
-            baseInfo, indexInstructions);
+            elemType, baseInfo, indexInstructions, baseExpr->getLocStart());
       } else {
         // The matrix is of size 1x1. No need to use access chain, base should
         // be the source pointer.
         elem = baseInfo;
       }
-      elem = spvBuilder.createLoad(elemType, elem);
+      elem = spvBuilder.createLoad(elemType, elem, baseExpr->getLocStart());
     } else { // e.g., (mat1 + mat2)._m11
-      elem = spvBuilder.createCompositeExtract(elemType, baseInfo, indices);
+      elem = spvBuilder.createCompositeExtract(elemType, baseInfo, indices,
+                                               baseExpr->getLocStart());
     }
     elements.push_back(elem);
   }
@@ -4494,7 +4654,8 @@ SpirvEmitter::doExtMatrixElementExpr(const ExtMatrixElementExpr *expr) {
   auto *value = elements.front();
   if (size > 1) {
     value = spvBuilder.createCompositeConstruct(
-        astContext.getExtVectorType(elemType, size), elements);
+        astContext.getExtVectorType(elemType, size), elements,
+        expr->getLocStart());
   }
 
   // Note: Special-case: Booleans have no physical layout, and therefore when
@@ -4507,7 +4668,7 @@ SpirvEmitter::doExtMatrixElementExpr(const ExtMatrixElementExpr *expr) {
     const auto toType =
         size == 1 ? astContext.BoolTy
                   : astContext.getExtVectorType(astContext.BoolTy, size);
-    value = castToBool(value, fromType, toType);
+    value = castToBool(value, fromType, toType, expr->getLocStart());
   }
   value->setRValue();
   return value;
@@ -4553,21 +4714,20 @@ SpirvEmitter::doHLSLVectorElementExpr(const HLSLVectorElementExpr *expr) {
       auto *index = spvBuilder.getConstantInt(
           astContext.IntTy, llvm::APInt(32, accessor.Swz0, true));
       // We need a lvalue here. Do not try to load.
-      return spvBuilder.createAccessChain(
-          spvContext.getPointerType(type, baseInfo->getStorageClass()),
-          baseInfo, {index});
+      return spvBuilder.createAccessChain(type, baseInfo, {index},
+                                          baseExpr->getLocStart());
     } else { // E.g., (v + w).x;
       // The original base vector may not be a rvalue. Need to load it if
       // it is lvalue since ImplicitCastExpr (LValueToRValue) will be missing
       // for that case.
-      SpirvInstruction *result =
-          spvBuilder.createCompositeExtract(type, baseInfo, {accessor.Swz0});
+      SpirvInstruction *result = spvBuilder.createCompositeExtract(
+          type, baseInfo, {accessor.Swz0}, baseExpr->getLocStart());
       // Special-case: Booleans in SPIR-V do not have a physical layout. Uint is
       // used to represent them when layout is required.
       if (expr->getType()->isBooleanType() &&
           baseInfo->getLayoutRule() != SpirvLayoutRule::Void)
-        result =
-            castToBool(result, astContext.UnsignedIntTy, astContext.BoolTy);
+        result = castToBool(result, astContext.UnsignedIntTy, astContext.BoolTy,
+                            expr->getLocStart());
       return result;
     }
   }
@@ -4578,7 +4738,8 @@ SpirvEmitter::doHLSLVectorElementExpr(const HLSLVectorElementExpr *expr) {
     auto *info = loadIfGLValue(baseExpr);
     const auto type = expr->getType();
     llvm::SmallVector<SpirvInstruction *, 4> components(accessorSize, info);
-    info = spvBuilder.createCompositeConstruct(type, components);
+    info = spvBuilder.createCompositeConstruct(type, components,
+                                               expr->getLocStart());
     info->setRValue();
     return info;
   }
@@ -4600,7 +4761,8 @@ SpirvEmitter::doHLSLVectorElementExpr(const HLSLVectorElementExpr *expr) {
   auto *info = loadIfGLValue(baseExpr);
   // Use base for both vectors. But we are only selecting values from the
   // first one.
-  return spvBuilder.createVectorShuffle(expr->getType(), info, info, selectors);
+  return spvBuilder.createVectorShuffle(expr->getType(), info, info, selectors,
+                                        expr->getLocStart());
 }
 
 SpirvInstruction *SpirvEmitter::doInitListExpr(const InitListExpr *expr) {
@@ -4621,8 +4783,8 @@ SpirvInstruction *SpirvEmitter::doMemberExpr(const MemberExpr *expr) {
   auto *instr = loadIfAliasVarRef(base);
 
   if (instr && !indices.empty()) {
-    instr =
-        turnIntoElementPtr(base->getType(), instr, expr->getType(), indices);
+    instr = turnIntoElementPtr(base->getType(), instr, expr->getType(), indices,
+                               base->getExprLoc());
   }
 
   return instr;
@@ -4630,12 +4792,13 @@ SpirvInstruction *SpirvEmitter::doMemberExpr(const MemberExpr *expr) {
 
 SpirvVariable *SpirvEmitter::createTemporaryVar(QualType type,
                                                 llvm::StringRef name,
-                                                SpirvInstruction *init) {
+                                                SpirvInstruction *init,
+                                                SourceLocation loc) {
   // We are creating a temporary variable in the Function storage class here,
   // which means it has void layout rule.
   const std::string varName = "temp.var." + name.str();
-  auto *var = spvBuilder.addFnVar(type, /*SourceLocation*/ {}, varName);
-  storeValue(var, init, type);
+  auto *var = spvBuilder.addFnVar(type, loc, varName);
+  storeValue(var, init, type, loc);
   return var;
 }
 
@@ -4655,24 +4818,28 @@ SpirvInstruction *SpirvEmitter::doUnaryOperator(const UnaryOperator *expr) {
 
     const spv::Op spvOp = translateOp(isInc ? BO_Add : BO_Sub, subType);
     SpirvInstruction *originValue =
-        subValue->isRValue() ? subValue
-                             : spvBuilder.createLoad(subType, subValue);
+        subValue->isRValue()
+            ? subValue
+            : spvBuilder.createLoad(subType, subValue, subExpr->getLocStart());
     auto *one = hlsl::IsHLSLMatType(subType) ? getMatElemValueOne(subType)
                                              : getValueOne(subType);
 
     SpirvInstruction *incValue = nullptr;
     if (isMxNMatrix(subType)) {
       // For matrices, we can only increment/decrement each vector of it.
-      const auto actOnEachVec = [this, spvOp, one](uint32_t /*index*/,
-                                                   QualType vecType,
-                                                   SpirvInstruction *lhsVec) {
-        auto *val = spvBuilder.createBinaryOp(spvOp, vecType, lhsVec, one);
+      const auto actOnEachVec = [this, spvOp, one,
+                                 expr](uint32_t /*index*/, QualType vecType,
+                                       SpirvInstruction *lhsVec) {
+        auto *val = spvBuilder.createBinaryOp(spvOp, vecType, lhsVec, one,
+                                              expr->getOperatorLoc());
         val->setRValue();
         return val;
       };
-      incValue = processEachVectorInMatrix(subExpr, originValue, actOnEachVec);
+      incValue = processEachVectorInMatrix(subExpr, originValue, actOnEachVec,
+                                           expr->getLocStart());
     } else {
-      incValue = spvBuilder.createBinaryOp(spvOp, subType, originValue, one);
+      incValue = spvBuilder.createBinaryOp(spvOp, subType, originValue, one,
+                                           expr->getOperatorLoc());
     }
 
     // If this is a RWBuffer/RWTexture assignment, OpImageWrite will be used.
@@ -4681,7 +4848,7 @@ SpirvInstruction *SpirvEmitter::doUnaryOperator(const UnaryOperator *expr) {
       incValue->setRValue();
       subValue = incValue;
     } else {
-      spvBuilder.createStore(subValue, incValue);
+      spvBuilder.createStore(subValue, incValue, subExpr->getLocStart());
     }
 
     // Prefix increment/decrement operator returns a lvalue, while postfix
@@ -4694,15 +4861,16 @@ SpirvInstruction *SpirvEmitter::doUnaryOperator(const UnaryOperator *expr) {
     }
   }
   case UO_Not: {
-    subValue = spvBuilder.createUnaryOp(spv::Op::OpNot, subType, subValue);
+    subValue = spvBuilder.createUnaryOp(spv::Op::OpNot, subType, subValue,
+                                        expr->getOperatorLoc());
     subValue->setRValue();
     return subValue;
   }
   case UO_LNot: {
     // Parsing will do the necessary casting to make sure we are applying the
     // ! operator on boolean values.
-    subValue =
-        spvBuilder.createUnaryOp(spv::Op::OpLogicalNot, subType, subValue);
+    subValue = spvBuilder.createUnaryOp(spv::Op::OpLogicalNot, subType,
+                                        subValue, expr->getOperatorLoc());
     subValue->setRValue();
     return subValue;
   }
@@ -4713,7 +4881,8 @@ SpirvInstruction *SpirvEmitter::doUnaryOperator(const UnaryOperator *expr) {
     // SPIR-V have two opcodes for negating values: OpSNegate and OpFNegate.
     const spv::Op spvOp = isFloatOrVecOfFloatType(subType) ? spv::Op::OpFNegate
                                                            : spv::Op::OpSNegate;
-    subValue = spvBuilder.createUnaryOp(spvOp, subType, subValue);
+    subValue = spvBuilder.createUnaryOp(spvOp, subType, subValue,
+                                        expr->getOperatorLoc());
     subValue->setRValue();
     return subValue;
   }
@@ -4863,12 +5032,17 @@ SpirvEmitter::processAssignment(const Expr *lhs, SpirvInstruction *rhs,
   if (SpirvInstruction *result = tryToAssignToRWBufferRWTexture(lhs, rhs))
     return result;
 
+  // Assigning to a out attribute or indices object in mesh shader should be
+  // handled differently.
+  if (SpirvInstruction *result = tryToAssignToMSOutAttrsOrIndices(lhs, rhs))
+    return result;
+
   // Normal assignment procedure
 
   if (!lhsPtr)
     lhsPtr = doExpr(lhs);
 
-  storeValue(lhsPtr, rhs, lhs->getType());
+  storeValue(lhsPtr, rhs, lhs->getType(), lhs->getLocStart());
 
   // Plain assignment returns a rvalue, while compound assignment returns
   // lvalue.
@@ -4876,7 +5050,8 @@ SpirvEmitter::processAssignment(const Expr *lhs, SpirvInstruction *rhs,
 }
 
 void SpirvEmitter::storeValue(SpirvInstruction *lhsPtr,
-                              SpirvInstruction *rhsVal, QualType lhsValType) {
+                              SpirvInstruction *rhsVal, QualType lhsValType,
+                              SourceLocation loc) {
   // Defend against nullptr source or destination so errors can bubble up to the
   // user.
   if (!lhsPtr || !rhsVal)
@@ -4908,7 +5083,7 @@ void SpirvEmitter::storeValue(SpirvInstruction *lhsPtr,
       rhsVal = castToInt(rhsVal, fromType, toType, {});
     }
 
-    spvBuilder.createStore(lhsPtr, rhsVal);
+    spvBuilder.createStore(lhsPtr, rhsVal, loc);
   } else if (isOpaqueType(lhsValType)) {
     // Resource types are represented using RecordType in the AST.
     // Handle them before the general RecordType.
@@ -4919,7 +5094,7 @@ void SpirvEmitter::storeValue(SpirvInstruction *lhsPtr,
     // let SPIRV-Tools opt to do the legalization work.
     //
     // Note: legalization specific code
-    spvBuilder.createStore(lhsPtr, rhsVal);
+    spvBuilder.createStore(lhsPtr, rhsVal, loc);
     needsLegalization = true;
   } else if (isAKindOfStructuredOrByteBuffer(lhsValType)) {
     // The rhs should be a pointer and the lhs should be a pointer-to-pointer.
@@ -4927,7 +5102,7 @@ void SpirvEmitter::storeValue(SpirvInstruction *lhsPtr,
     // up.
     //
     // Note: legalization specific code
-    spvBuilder.createStore(lhsPtr, rhsVal);
+    spvBuilder.createStore(lhsPtr, rhsVal, loc);
     needsLegalization = true;
 
     // For ConstantBuffers/TextureBuffers, we decompose and assign each field
@@ -4957,28 +5132,32 @@ void SpirvEmitter::storeValue(SpirvInstruction *lhsPtr,
     // Do separate load of each element via access chain
     llvm::SmallVector<SpirvInstruction *, 8> elements;
     for (uint32_t i = 0; i < arraySize; ++i) {
-      const auto *subRhsPtrType =
-          spvContext.getPointerType(elemType, rhsVal->getStorageClass());
       auto *subRhsPtr = spvBuilder.createAccessChain(
-          subRhsPtrType, rhsVal,
+          elemType, rhsVal,
           {spvBuilder.getConstantInt(astContext.IntTy,
-                                     llvm::APInt(32, i, true))});
-      elements.push_back(spvBuilder.createLoad(elemType, subRhsPtr));
+                                     llvm::APInt(32, i, true))},
+          loc);
+      elements.push_back(spvBuilder.createLoad(elemType, subRhsPtr, loc));
     }
 
     // Create a new composite and write out once
     spvBuilder.createStore(
-        lhsPtr, spvBuilder.createCompositeConstruct(lhsValType, elements));
+        lhsPtr,
+        spvBuilder.createCompositeConstruct(lhsValType, elements,
+                                            rhsVal->getSourceLocation()),
+        loc);
   } else if (lhsPtr->getLayoutRule() == rhsVal->getLayoutRule()) {
     // If lhs and rhs has the same memory layout, we should be safe to load
     // from rhs and directly store into lhs and avoid decomposing rhs.
     // Note: this check should happen after those setting needsLegalization.
     // TODO: is this optimization always correct?
-    spvBuilder.createStore(lhsPtr, rhsVal);
+    spvBuilder.createStore(lhsPtr, rhsVal, loc);
   } else if (lhsValType->isRecordType() || lhsValType->isConstantArrayType() ||
              lhsIsNonFpMat) {
     spvBuilder.createStore(
-        lhsPtr, reconstructValue(rhsVal, lhsValType, lhsPtr->getLayoutRule()));
+        lhsPtr,
+        reconstructValue(rhsVal, lhsValType, lhsPtr->getLayoutRule(), loc),
+        loc);
   } else {
     emitError("storing value of type %0 unimplemented", {}) << lhsValType;
   }
@@ -4986,11 +5165,13 @@ void SpirvEmitter::storeValue(SpirvInstruction *lhsPtr,
 
 SpirvInstruction *SpirvEmitter::reconstructValue(SpirvInstruction *srcVal,
                                                  const QualType valType,
-                                                 SpirvLayoutRule dstLR) {
+                                                 SpirvLayoutRule dstLR,
+                                                 SourceLocation loc) {
   // Lambda for casting scalar or vector of bool<-->uint in cases where one side
   // of the reconstruction (lhs or rhs) has a layout rule.
-  const auto handleBooleanLayout = [this, &srcVal, dstLR](SpirvInstruction *val,
-                                                          QualType valType) {
+  const auto handleBooleanLayout = [this, &srcVal, dstLR,
+                                    loc](SpirvInstruction *val,
+                                         QualType valType) {
     // We only need to cast if we have a scalar or vector of booleans.
     if (!isBoolOrVecOfBoolType(valType))
       return val;
@@ -5019,25 +5200,27 @@ SpirvInstruction *SpirvEmitter::reconstructValue(SpirvInstruction *srcVal,
             : astContext.getExtVectorType(astContext.UnsignedIntTy, vecSize);
 
     if (shouldCastToBool)
-      return castToBool(val, uintType, boolType);
+      return castToBool(val, uintType, boolType, loc);
     if (shouldCastToUint)
-      return castToInt(val, boolType, uintType, {});
+      return castToInt(val, boolType, uintType, loc);
 
     return val;
   };
 
   // Lambda for cases where we want to reconstruct an array
-  const auto reconstructArray = [this, &srcVal, valType,
-                                 dstLR](uint32_t arraySize,
-                                        QualType arrayElemType) {
+  const auto reconstructArray = [this, &srcVal, valType, dstLR,
+                                 loc](uint32_t arraySize,
+                                      QualType arrayElemType) {
     llvm::SmallVector<SpirvInstruction *, 4> elements;
     for (uint32_t i = 0; i < arraySize; ++i) {
       SpirvInstruction *subSrcVal =
-          spvBuilder.createCompositeExtract(arrayElemType, srcVal, {i});
+          spvBuilder.createCompositeExtract(arrayElemType, srcVal, {i}, loc);
       subSrcVal->setLayoutRule(srcVal->getLayoutRule());
-      elements.push_back(reconstructValue(subSrcVal, arrayElemType, dstLR));
+      elements.push_back(
+          reconstructValue(subSrcVal, arrayElemType, dstLR, loc));
     }
-    auto *result = spvBuilder.createCompositeConstruct(valType, elements);
+    auto *result = spvBuilder.createCompositeConstruct(
+        valType, elements, srcVal->getSourceLocation());
     result->setLayoutRule(dstLR);
     return result;
   };
@@ -5075,13 +5258,15 @@ SpirvInstruction *SpirvEmitter::reconstructValue(SpirvInstruction *srcVal,
     uint32_t index = 0;
     llvm::SmallVector<SpirvInstruction *, 4> elements;
     for (const auto *field : recordType->getDecl()->fields()) {
-      SpirvInstruction *subSrcVal =
-          spvBuilder.createCompositeExtract(field->getType(), srcVal, {index});
+      SpirvInstruction *subSrcVal = spvBuilder.createCompositeExtract(
+          field->getType(), srcVal, {index}, loc);
       subSrcVal->setLayoutRule(srcVal->getLayoutRule());
-      elements.push_back(reconstructValue(subSrcVal, field->getType(), dstLR));
+      elements.push_back(
+          reconstructValue(subSrcVal, field->getType(), dstLR, loc));
       ++index;
     }
-    auto *result = spvBuilder.createCompositeConstruct(valType, elements);
+    auto *result = spvBuilder.createCompositeConstruct(
+        valType, elements, srcVal->getSourceLocation());
     result->setLayoutRule(dstLR);
     return result;
   }
@@ -5092,7 +5277,7 @@ SpirvInstruction *SpirvEmitter::reconstructValue(SpirvInstruction *srcVal,
 SpirvInstruction *SpirvEmitter::processBinaryOp(
     const Expr *lhs, const Expr *rhs, const BinaryOperatorKind opcode,
     const QualType computationType, const QualType resultType,
-    SourceRange sourceRange, SpirvInstruction **lhsInfo,
+    SourceRange sourceRange, SourceLocation loc, SpirvInstruction **lhsInfo,
     const spv::Op mandateGenOpcode) {
   const QualType lhsType = lhs->getType();
   const QualType rhsType = rhs->getType();
@@ -5101,7 +5286,7 @@ SpirvInstruction *SpirvEmitter::processBinaryOp(
   // onto each element vector iff the operands are not degenerated matrices
   // and we don't have a matrix specific SPIR-V instruction for the operation.
   if (!isSpirvMatrixOp(mandateGenOpcode) && isMxNMatrix(lhsType)) {
-    return processMatrixBinaryOp(lhs, rhs, opcode, sourceRange);
+    return processMatrixBinaryOp(lhs, rhs, opcode, sourceRange, loc);
   }
 
   // Comma operator works differently from other binary operations as there is
@@ -5149,9 +5334,9 @@ SpirvInstruction *SpirvEmitter::processBinaryOp(
   case BO_ShrAssign:
     // We need to cull the RHS to make sure that we are not shifting by an
     // amount that is larger than the bitwidth of the LHS.
-    rhsVal =
-        spvBuilder.createBinaryOp(spv::Op::OpBitwiseAnd, computationType,
-                                  rhsVal, getMaskForBitwidthValue(rhsType));
+    rhsVal = spvBuilder.createBinaryOp(spv::Op::OpBitwiseAnd, computationType,
+                                       rhsVal, getMaskForBitwidthValue(rhsType),
+                                       loc);
     // Fall through
   case BO_Add:
   case BO_Sub:
@@ -5185,8 +5370,8 @@ SpirvInstruction *SpirvEmitter::processBinaryOp(
         if (isAcceptedSpecConstantBinaryOp(spvOp)) {
           if (lhsValConstant->isSpecConstant() ||
               rhsValConstant->isSpecConstant()) {
-            auto *val = spvBuilder.createSpecConstantBinaryOp(spvOp, resultType,
-                                                              lhsVal, rhsVal);
+            auto *val = spvBuilder.createSpecConstantBinaryOp(
+                spvOp, resultType, lhsVal, rhsVal, loc);
             val->setRValue();
             return val;
           }
@@ -5197,14 +5382,15 @@ SpirvInstruction *SpirvEmitter::processBinaryOp(
     // Normal binary operation
     SpirvInstruction *val = nullptr;
     if (BinaryOperator::isCompoundAssignmentOp(opcode)) {
-      val = spvBuilder.createBinaryOp(spvOp, computationType, lhsVal, rhsVal);
+      val = spvBuilder.createBinaryOp(spvOp, computationType, lhsVal, rhsVal,
+                                      loc);
       // For a compound assignments, the AST does not have the proper implicit
       // cast if lhs and rhs have different types. So we need to manually cast
       // the result back to lhs' type.
       if (computationType != lhsType)
         val = castToType(val, computationType, lhsType, lhs->getExprLoc());
     } else {
-      val = spvBuilder.createBinaryOp(spvOp, resultType, lhsVal, rhsVal);
+      val = spvBuilder.createBinaryOp(spvOp, resultType, lhsVal, rhsVal, loc);
     }
 
     val->setRValue();
@@ -5239,19 +5425,21 @@ void SpirvEmitter::initOnce(QualType varType, std::string varName,
 
   varName = "init.done." + varName;
 
+  auto loc = varInit ? varInit->getLocStart() : SourceLocation();
+
   // Create a file/module visible variable to hold the initialization state.
   SpirvVariable *initDoneVar = spvBuilder.addModuleVar(
       astContext.BoolTy, spv::StorageClass::Private, /*isPrecise*/ false,
       varName, spvBuilder.getConstantBool(false));
 
-  auto *condition = spvBuilder.createLoad(astContext.BoolTy, initDoneVar);
+  auto *condition = spvBuilder.createLoad(astContext.BoolTy, initDoneVar, loc);
 
   auto *todoBB = spvBuilder.createBasicBlock("if.init.todo");
   auto *doneBB = spvBuilder.createBasicBlock("if.init.done");
 
   // If initDoneVar contains true, we jump to the "done" basic block; otherwise,
   // jump to the "todo" basic block.
-  spvBuilder.createConditionalBranch(condition, doneBB, todoBB, doneBB);
+  spvBuilder.createConditionalBranch(condition, doneBB, todoBB, loc, doneBB);
   spvBuilder.addSuccessor(todoBB);
   spvBuilder.addSuccessor(doneBB);
   spvBuilder.setMergeTarget(doneBB);
@@ -5262,12 +5450,12 @@ void SpirvEmitter::initOnce(QualType varType, std::string varName,
     var->setStorageClass(spv::StorageClass::Private);
     storeValue(
         // Static function variable are of private storage class
-        var, doExpr(varInit), varInit->getType());
+        var, loadIfGLValue(varInit), varInit->getType(), varInit->getLocEnd());
   } else {
-    spvBuilder.createStore(var, spvBuilder.getConstantNull(varType));
+    spvBuilder.createStore(var, spvBuilder.getConstantNull(varType), loc);
   }
-  spvBuilder.createStore(initDoneVar, spvBuilder.getConstantBool(true));
-  spvBuilder.createBranch(doneBB);
+  spvBuilder.createStore(initDoneVar, spvBuilder.getConstantBool(true), loc);
+  spvBuilder.createBranch(doneBB, loc);
   spvBuilder.addSuccessor(doneBB);
 
   spvBuilder.setInsertPoint(doneBB);
@@ -5424,7 +5612,7 @@ SpirvInstruction *SpirvEmitter::createVectorSplat(const Expr *scalarExpr,
   if ((scalarVal = tryToEvaluateAsConst(scalarExpr))) {
     scalarVal->setRValue();
   } else {
-    scalarVal = doExpr(scalarExpr);
+    scalarVal = loadIfGLValue(scalarExpr);
   }
 
   if (!scalarVal || size == 1) {
@@ -5445,7 +5633,8 @@ SpirvInstruction *SpirvEmitter::createVectorSplat(const Expr *scalarExpr,
     return value;
   } else {
     llvm::SmallVector<SpirvInstruction *, 4> elements(size_t(size), scalarVal);
-    auto *value = spvBuilder.createCompositeConstruct(vecType, elements);
+    auto *value = spvBuilder.createCompositeConstruct(
+        vecType, elements, scalarExpr->getLocStart());
     value->setRValue();
     return value;
   }
@@ -5453,7 +5642,8 @@ SpirvInstruction *SpirvEmitter::createVectorSplat(const Expr *scalarExpr,
 
 void SpirvEmitter::splitVecLastElement(QualType vecType, SpirvInstruction *vec,
                                        SpirvInstruction **residual,
-                                       SpirvInstruction **lastElement) {
+                                       SpirvInstruction **lastElement,
+                                       SourceLocation loc) {
   assert(hlsl::IsHLSLVecType(vecType));
 
   const uint32_t count = hlsl::GetHLSLVecSize(vecType);
@@ -5461,22 +5651,24 @@ void SpirvEmitter::splitVecLastElement(QualType vecType, SpirvInstruction *vec,
   const QualType elemType = hlsl::GetHLSLVecElementType(vecType);
 
   if (count == 2) {
-    *residual = spvBuilder.createCompositeExtract(elemType, vec, 0);
+    *residual = spvBuilder.createCompositeExtract(elemType, vec, 0, loc);
   } else {
     llvm::SmallVector<uint32_t, 4> indices;
     for (uint32_t i = 0; i < count - 1; ++i)
       indices.push_back(i);
 
     const QualType type = astContext.getExtVectorType(elemType, count - 1);
-    *residual = spvBuilder.createVectorShuffle(type, vec, vec, indices);
+    *residual = spvBuilder.createVectorShuffle(type, vec, vec, indices, loc);
   }
 
-  *lastElement = spvBuilder.createCompositeExtract(elemType, vec, {count - 1});
+  *lastElement =
+      spvBuilder.createCompositeExtract(elemType, vec, {count - 1}, loc);
 }
 
-SpirvInstruction *
-SpirvEmitter::convertVectorToStruct(QualType structType, QualType elemType,
-                                    SpirvInstruction *vector) {
+SpirvInstruction *SpirvEmitter::convertVectorToStruct(QualType structType,
+                                                      QualType elemType,
+                                                      SpirvInstruction *vector,
+                                                      SourceLocation loc) {
   assert(structType->isStructureType());
 
   const auto *structDecl = structType->getAsStructureType()->getDecl();
@@ -5486,8 +5678,8 @@ SpirvEmitter::convertVectorToStruct(QualType structType, QualType elemType,
 
   for (const auto *field : structDecl->fields()) {
     if (isScalarType(field->getType())) {
-      members.push_back(
-          spvBuilder.createCompositeExtract(elemType, vector, {vectorIndex++}));
+      members.push_back(spvBuilder.createCompositeExtract(
+          elemType, vector, {vectorIndex++}, loc));
     } else if (isVectorType(field->getType(), nullptr, &elemCount)) {
       llvm::SmallVector<uint32_t, 4> indices;
       for (uint32_t i = 0; i < elemCount; ++i)
@@ -5495,13 +5687,14 @@ SpirvEmitter::convertVectorToStruct(QualType structType, QualType elemType,
 
       members.push_back(spvBuilder.createVectorShuffle(
           astContext.getExtVectorType(elemType, elemCount), vector, vector,
-          indices));
+          indices, loc));
     } else {
       assert(false && "unhandled type");
     }
   }
 
-  return spvBuilder.createCompositeConstruct(structType, members);
+  return spvBuilder.createCompositeConstruct(structType, members,
+                                             vector->getSourceLocation());
 }
 
 SpirvInstruction *
@@ -5530,13 +5723,15 @@ SpirvEmitter::tryToGenFloatVectorScale(const BinaryOperator *expr) {
         const QualType vecType = expr->getType();
         if (isa<CompoundAssignOperator>(expr)) {
           SpirvInstruction *lhsPtr = nullptr;
-          auto *result = processBinaryOp(
-              lhs, cast->getSubExpr(), expr->getOpcode(), vecType, vecType,
-              range, &lhsPtr, spv::Op::OpVectorTimesScalar);
+          auto *result =
+              processBinaryOp(lhs, cast->getSubExpr(), expr->getOpcode(),
+                              vecType, vecType, range, expr->getOperatorLoc(),
+                              &lhsPtr, spv::Op::OpVectorTimesScalar);
           return processAssignment(lhs, result, true, lhsPtr);
         } else {
           return processBinaryOp(lhs, cast->getSubExpr(), expr->getOpcode(),
-                                 vecType, vecType, range, nullptr,
+                                 vecType, vecType, range,
+                                 expr->getOperatorLoc(), nullptr,
                                  spv::Op::OpVectorTimesScalar);
         }
       }
@@ -5552,8 +5747,8 @@ SpirvEmitter::tryToGenFloatVectorScale(const BinaryOperator *expr) {
         // OpVectorTimesScalar requires the first operand to be a vector and
         // the second to be a scalar.
         return processBinaryOp(rhs, cast->getSubExpr(), expr->getOpcode(),
-                               vecType, vecType, range, nullptr,
-                               spv::Op::OpVectorTimesScalar);
+                               vecType, vecType, range, expr->getOperatorLoc(),
+                               nullptr, spv::Op::OpVectorTimesScalar);
       }
     }
   }
@@ -5596,13 +5791,14 @@ SpirvEmitter::tryToGenFloatMatrixScale(const BinaryOperator *expr) {
         const spv::Op opcode = selectOpcode(lhsType);
         if (isa<CompoundAssignOperator>(expr)) {
           SpirvInstruction *lhsPtr = nullptr;
-          auto *result =
-              processBinaryOp(lhs, cast->getSubExpr(), expr->getOpcode(),
-                              matType, matType, range, &lhsPtr, opcode);
+          auto *result = processBinaryOp(
+              lhs, cast->getSubExpr(), expr->getOpcode(), matType, matType,
+              range, expr->getOperatorLoc(), &lhsPtr, opcode);
           return processAssignment(lhs, result, true, lhsPtr);
         } else {
           return processBinaryOp(lhs, cast->getSubExpr(), expr->getOpcode(),
-                                 matType, matType, range, nullptr, opcode);
+                                 matType, matType, range,
+                                 expr->getOperatorLoc(), nullptr, opcode);
         }
       }
     }
@@ -5618,7 +5814,8 @@ SpirvEmitter::tryToGenFloatMatrixScale(const BinaryOperator *expr) {
         // OpMatrixTimesScalar requires the first operand to be a matrix and
         // the second to be a scalar.
         return processBinaryOp(rhs, cast->getSubExpr(), expr->getOpcode(),
-                               matType, matType, range, nullptr, opcode);
+                               matType, matType, range, expr->getOperatorLoc(),
+                               nullptr, opcode);
       }
     }
   }
@@ -5677,13 +5874,18 @@ SpirvEmitter::tryToAssignToVectorElements(const Expr *lhs,
       // We need to use OpImageWrite here.
       // Compose the new vector value first
       auto *oldVec = doExpr(base);
-      auto *newVec = spvBuilder.createCompositeInsert(baseType, oldVec,
-                                                      {accessor.Swz0}, rhs);
+      auto *newVec = spvBuilder.createCompositeInsert(
+          baseType, oldVec, {accessor.Swz0}, rhs, lhs->getLocStart());
       auto *result = tryToAssignToRWBufferRWTexture(base, newVec);
       assert(result); // Definitely RWBuffer/RWTexture assignment
       (void)result;
       return rhs; // TODO: incorrect for compound assignments
     } else {
+      // Assigning to one component of mesh out attribute/indices vector object.
+      SpirvInstruction *vecComponent = spvBuilder.getConstantInt(
+          astContext.UnsignedIntTy, llvm::APInt(32, accessor.Swz0));
+      if (tryToAssignToMSOutAttrsOrIndices(base, rhs, vecComponent))
+        return rhs;
       // Assigning to one normal vector component. Nothing special, just fall
       // back to the normal CodeGen path.
       return nullptr;
@@ -5705,6 +5907,26 @@ SpirvEmitter::tryToAssignToVectorElements(const Expr *lhs,
     return processAssignment(base, rhs, false);
   }
 
+  if (tryToAssignToMSOutAttrsOrIndices(base, rhs, /*vecComponent=*/nullptr,
+                                       /*noWriteBack=*/true)) {
+    // Assigning to 'n' components of mesh out attribute/indices vector object.
+    const QualType elemType =
+        hlsl::GetHLSLVecElementType(rhs->getAstResultType());
+    uint32_t i = 0;
+    for (; i < accessor.Count; ++i) {
+      auto *rhsElem = spvBuilder.createCompositeExtract(elemType, rhs, {i},
+                                                        lhs->getLocStart());
+      uint32_t position;
+      accessor.GetPosition(i, &position);
+      SpirvInstruction *vecComponent = spvBuilder.getConstantInt(
+          astContext.UnsignedIntTy, llvm::APInt(32, position));
+      if (!tryToAssignToMSOutAttrsOrIndices(base, rhsElem, vecComponent))
+        break;
+    }
+    assert(i == accessor.Count);
+    return rhs;
+  }
+
   llvm::SmallVector<uint32_t, 4> selectors;
   selectors.resize(baseSize);
   // Assume we are selecting all original elements first.
@@ -5722,13 +5944,14 @@ SpirvEmitter::tryToAssignToVectorElements(const Expr *lhs,
   }
 
   auto *vec1 = doExpr(base);
-  auto *vec1Val =
-      vec1->isRValue() ? vec1 : spvBuilder.createLoad(baseType, vec1);
-  auto *shuffle =
-      spvBuilder.createVectorShuffle(baseType, vec1Val, rhs, selectors);
+  auto *vec1Val = vec1->isRValue() ? vec1
+                                   : spvBuilder.createLoad(baseType, vec1,
+                                                           base->getLocStart());
+  auto *shuffle = spvBuilder.createVectorShuffle(baseType, vec1Val, rhs,
+                                                 selectors, lhs->getLocStart());
 
   if (!tryToAssignToRWBufferRWTexture(base, shuffle))
-    spvBuilder.createStore(vec1, shuffle);
+    spvBuilder.createStore(vec1, shuffle, lhs->getLocStart());
 
   // TODO: OK, this return value is incorrect for compound assignments, for
   // which cases we should return lvalues. Should at least emit errors if
@@ -5746,8 +5969,9 @@ SpirvEmitter::tryToAssignToRWBufferRWTexture(const Expr *lhs,
     auto *loc = doExpr(indexExpr);
     const QualType imageType = baseExpr->getType();
     auto *baseInfo = doExpr(baseExpr);
-    auto *image = spvBuilder.createLoad(imageType, baseInfo);
-    spvBuilder.createImageWrite(imageType, image, loc, rhs);
+    auto *image =
+        spvBuilder.createLoad(imageType, baseInfo, baseExpr->getExprLoc());
+    spvBuilder.createImageWrite(imageType, image, loc, rhs, lhs->getExprLoc());
     return rhs;
   }
   return nullptr;
@@ -5794,8 +6018,10 @@ SpirvEmitter::tryToAssignToMatrixElements(const Expr *lhs,
     // If we are writing to only one element, the rhs should already be a
     // scalar value.
     auto *rhsElem = rhs;
-    if (accessor.Count > 1)
-      rhsElem = spvBuilder.createCompositeExtract(elemType, rhs, {i});
+    if (accessor.Count > 1) {
+      rhsElem = spvBuilder.createCompositeExtract(elemType, rhs, {i},
+                                                  rhs->getSourceLocation());
+    }
 
     // If the lhs is actually a matrix of size 1x1, we don't need the access
     // chain. base is already the dest pointer.
@@ -5804,11 +6030,10 @@ SpirvEmitter::tryToAssignToMatrixElements(const Expr *lhs,
       assert(!base->isRValue());
       // Load the element via access chain
       lhsElemPtr = spvBuilder.createAccessChain(
-          spvContext.getPointerType(elemType, lhsElemPtr->getStorageClass()),
-          lhsElemPtr, indexInstructions);
+          elemType, lhsElemPtr, indexInstructions, lhs->getLocStart());
     }
 
-    spvBuilder.createStore(lhsElemPtr, rhsElem);
+    spvBuilder.createStore(lhsElemPtr, rhsElem, lhs->getLocStart());
   }
 
   // TODO: OK, this return value is incorrect for compound assignments, for
@@ -5817,11 +6042,200 @@ SpirvEmitter::tryToAssignToMatrixElements(const Expr *lhs,
   return rhs;
 }
 
+SpirvInstruction *SpirvEmitter::tryToAssignToMSOutAttrsOrIndices(
+    const Expr *lhs, SpirvInstruction *rhs, SpirvInstruction *vecComponent,
+    bool noWriteBack) {
+  // Early exit for non-mesh shaders.
+  if (!spvContext.isMS())
+    return nullptr;
+
+  llvm::SmallVector<SpirvInstruction *, 4> indices;
+  bool isMSOutAttribute = false;
+  bool isMSOutAttributeBlock = false;
+  bool isMSOutIndices = false;
+
+  const Expr *base = collectArrayStructIndices(lhs, /*rawIndex*/ false,
+                                               /*rawIndices*/ nullptr, &indices,
+                                               &isMSOutAttribute);
+  // Expecting at least one array index - early exit.
+  if (!base || indices.empty())
+    return nullptr;
+
+  const DeclaratorDecl *varDecl = nullptr;
+  if (isMSOutAttribute) {
+    const MemberExpr *memberExpr = dyn_cast<MemberExpr>(base);
+    assert(memberExpr);
+    varDecl = cast<DeclaratorDecl>(memberExpr->getMemberDecl());
+  } else {
+    if (const auto *arg = dyn_cast<DeclRefExpr>(base)) {
+      if (varDecl = dyn_cast<DeclaratorDecl>(arg->getDecl())) {
+        if (varDecl->hasAttr<HLSLIndicesAttr>()) {
+          isMSOutIndices = true;
+        } else if (varDecl->hasAttr<HLSLVerticesAttr>() ||
+                   varDecl->hasAttr<HLSLPrimitivesAttr>()) {
+          isMSOutAttributeBlock = true;
+        }
+      }
+    }
+  }
+
+  // Return if no out attribute or indices object found.
+  if (!(isMSOutAttribute || isMSOutAttributeBlock || isMSOutIndices)) {
+    return nullptr;
+  }
+
+  // For noWriteBack, return without generating write instructions.
+  if (noWriteBack) {
+    return rhs;
+  }
+
+  // Add vecComponent to indices.
+  if (vecComponent) {
+    indices.push_back(vecComponent);
+  }
+
+  if (isMSOutAttribute) {
+    assignToMSOutAttribute(varDecl, rhs, indices);
+  } else if (isMSOutIndices) {
+    assignToMSOutIndices(varDecl, rhs, indices);
+  } else {
+    assert(isMSOutAttributeBlock);
+    QualType type = varDecl->getType();
+    assert(isa<ConstantArrayType>(type));
+    type = astContext.getAsConstantArrayType(type)->getElementType();
+    assert(type->isStructureType());
+
+    // Extract subvalue and assign to its corresponding member attribute.
+    const auto *structDecl = type->getAs<RecordType>()->getDecl();
+    for (const auto *field : structDecl->fields()) {
+      const auto fieldType = field->getType();
+      SpirvInstruction *subValue = spvBuilder.createCompositeExtract(
+          fieldType, rhs, {getNumBaseClasses(type) + field->getFieldIndex()},
+          lhs->getLocStart());
+      assignToMSOutAttribute(field, subValue, indices);
+    }
+  }
+
+  // TODO: OK, this return value is incorrect for compound assignments, for
+  // which cases we should return lvalues. Should at least emit errors if
+  // this return value is used (can be checked via ASTContext.getParents).
+  return rhs;
+}
+
+void SpirvEmitter::assignToMSOutAttribute(
+    const DeclaratorDecl *decl, SpirvInstruction *value,
+    const llvm::SmallVector<SpirvInstruction *, 4> &indices) {
+  assert(spvContext.isMS() && !indices.empty());
+
+  // Extract attribute index and vecComponent (if any).
+  SpirvInstruction *attrIndex = indices.front();
+  SpirvInstruction *vecComponent = nullptr;
+  if (indices.size() > 1) {
+    vecComponent = indices.back();
+  }
+
+  auto semanticInfo = declIdMapper.getStageVarSemantic(decl);
+  assert(semanticInfo.isValid());
+  const auto loc = decl->getLocation();
+  // Special handle writes to clip/cull distance attributes.
+  if (!declIdMapper.glPerVertex.tryToAccess(
+          hlsl::DXIL::SigPointKind::MSOut, semanticInfo.semantic->GetKind(),
+          semanticInfo.index, attrIndex, &value, /*noWriteBack=*/false,
+          vecComponent, loc)) {
+    // All other attribute writes are handled below.
+    auto *varInstr = declIdMapper.getStageVarInstruction(decl);
+    QualType valueType = value->getAstResultType();
+    varInstr = spvBuilder.createAccessChain(valueType, varInstr, indices, loc);
+    spvBuilder.createStore(varInstr, value, loc);
+  }
+}
+
+void SpirvEmitter::assignToMSOutIndices(
+    const DeclaratorDecl *decl, SpirvInstruction *value,
+    const llvm::SmallVector<SpirvInstruction *, 4> &indices) {
+  assert(spvContext.isMS() && !indices.empty());
+
+  // Extract vertex index and vecComponent (if any).
+  SpirvInstruction *vertIndex = indices.front();
+  SpirvInstruction *vecComponent = nullptr;
+  if (indices.size() > 1) {
+    vecComponent = indices.back();
+  }
+  auto *var = declIdMapper.getStageVarInstruction(decl);
+  const auto *varTypeDecl = astContext.getAsConstantArrayType(decl->getType());
+  QualType varType = varTypeDecl->getElementType();
+  uint32_t numVertices = 1;
+  if (!isVectorType(varType, nullptr, &numVertices)) {
+    assert(isScalarType(varType));
+  }
+  QualType valueType = value->getAstResultType();
+  uint32_t numValues = 1;
+  if (!isVectorType(valueType, nullptr, &numValues)) {
+    assert(isScalarType(valueType));
+  }
+
+  const auto loc = decl->getLocation();
+  if (numVertices == 1) {
+    // for "point" output topology.
+    assert(numValues == 1);
+    // create accesschain for PrimitiveIndicesNV[vertIndex].
+    auto *ptr = spvBuilder.createAccessChain(astContext.UnsignedIntTy, var,
+                                             {vertIndex}, loc);
+    // finally create store for PrimitiveIndicesNV[vertIndex] = value.
+    spvBuilder.createStore(ptr, value, loc);
+  } else {
+    // for "line" or "triangle" output topology.
+    assert(numVertices == 2 || numVertices == 3);
+    // set baseOffset = vertIndex * numVertices.
+    auto *baseOffset = spvBuilder.createBinaryOp(
+        spv::Op::OpIMul, astContext.UnsignedIntTy, vertIndex,
+        spvBuilder.getConstantInt(astContext.UnsignedIntTy,
+                                  llvm::APInt(32, numVertices)),
+        loc);
+    if (vecComponent) {
+      // write an individual vector component of uint2 or uint3.
+      assert(numValues == 1);
+      // set baseOffset = baseOffset + vecComponent.
+      baseOffset =
+          spvBuilder.createBinaryOp(spv::Op::OpIAdd, astContext.UnsignedIntTy,
+                                    baseOffset, vecComponent, loc);
+      // create accesschain for PrimitiveIndicesNV[baseOffset].
+      auto *ptr = spvBuilder.createAccessChain(astContext.UnsignedIntTy, var,
+                                               {baseOffset}, loc);
+      // finally create store for PrimitiveIndicesNV[baseOffset] = value.
+      spvBuilder.createStore(ptr, value, loc);
+    } else {
+      // write all vector components of uint2 or uint3.
+      assert(numValues == numVertices);
+      auto *curOffset = baseOffset;
+      for (uint32_t i = 0; i < numValues; ++i) {
+        if (i != 0) {
+          // set curOffset = baseOffset + i.
+          curOffset = spvBuilder.createBinaryOp(
+              spv::Op::OpIAdd, astContext.UnsignedIntTy, baseOffset,
+              spvBuilder.getConstantInt(astContext.UnsignedIntTy,
+                                        llvm::APInt(32, i)),
+              loc);
+        }
+        // create accesschain for PrimitiveIndicesNV[curOffset].
+        auto *ptr = spvBuilder.createAccessChain(astContext.UnsignedIntTy, var,
+                                                 {curOffset}, loc);
+        // finally create store for PrimitiveIndicesNV[curOffset] = value[i].
+        spvBuilder.createStore(ptr,
+                               spvBuilder.createCompositeExtract(
+                                   astContext.UnsignedIntTy, value, {i}, loc),
+                               loc);
+      }
+    }
+  }
+}
+
 SpirvInstruction *SpirvEmitter::processEachVectorInMatrix(
     const Expr *matrix, SpirvInstruction *matrixVal,
     llvm::function_ref<SpirvInstruction *(uint32_t, QualType,
                                           SpirvInstruction *)>
-        actOnEachVector) {
+        actOnEachVector,
+    SourceLocation loc) {
   const auto matType = matrix->getType();
   assert(isMxNMatrix(matType));
   const QualType vecType = getComponentVectorType(astContext, matType);
@@ -5832,12 +6246,13 @@ SpirvInstruction *SpirvEmitter::processEachVectorInMatrix(
   llvm::SmallVector<SpirvInstruction *, 4> vectors;
   // Extract each component vector and do operation on it
   for (uint32_t i = 0; i < rowCount; ++i) {
-    auto *lhsVec = spvBuilder.createCompositeExtract(vecType, matrixVal, {i});
+    auto *lhsVec = spvBuilder.createCompositeExtract(vecType, matrixVal, {i},
+                                                     matrix->getLocStart());
     vectors.push_back(actOnEachVector(i, vecType, lhsVec));
   }
 
   // Construct the result matrix
-  auto *val = spvBuilder.createCompositeConstruct(matType, vectors);
+  auto *val = spvBuilder.createCompositeConstruct(matType, vectors, loc);
   val->setRValue();
   return val;
 }
@@ -5905,13 +6320,14 @@ void SpirvEmitter::createSpecConstant(const VarDecl *varDecl) {
       specConstant, varDecl->getAttr<VKConstantIdAttr>()->getSpecConstId(),
       varDecl->getLocation());
 
+  specConstant->setDebugName(varDecl->getName());
   declIdMapper.registerSpecConstant(varDecl, specConstant);
 }
 
 SpirvInstruction *
 SpirvEmitter::processMatrixBinaryOp(const Expr *lhs, const Expr *rhs,
                                     const BinaryOperatorKind opcode,
-                                    SourceRange range) {
+                                    SourceRange range, SourceLocation loc) {
   // TODO: some code are duplicated from processBinaryOp. Try to unify them.
   const auto lhsType = lhs->getType();
   assert(isMxNMatrix(lhsType));
@@ -5922,7 +6338,7 @@ SpirvEmitter::processMatrixBinaryOp(const Expr *lhs, const Expr *rhs,
     // Evalute rhs before lhs
     rhsVal = doExpr(rhs);
     lhsPtr = doExpr(lhs);
-    lhsVal = spvBuilder.createLoad(lhsType, lhsPtr);
+    lhsVal = spvBuilder.createLoad(lhsType, lhsPtr, lhs->getLocStart());
   } else {
     // Evalute lhs before rhs
     lhsVal = lhsPtr = doExpr(lhs);
@@ -5940,18 +6356,20 @@ SpirvEmitter::processMatrixBinaryOp(const Expr *lhs, const Expr *rhs,
   case BO_MulAssign:
   case BO_DivAssign:
   case BO_RemAssign: {
-    const auto actOnEachVec = [this, spvOp, rhsVal](uint32_t index,
-                                                    QualType vecType,
-                                                    SpirvInstruction *lhsVec) {
+    const auto actOnEachVec = [this, spvOp, rhsVal, rhs,
+                               loc](uint32_t index, QualType vecType,
+                                    SpirvInstruction *lhsVec) {
       // For each vector of lhs, we need to load the corresponding vector of
       // rhs and do the operation on them.
-      auto *rhsVec =
-          spvBuilder.createCompositeExtract(vecType, rhsVal, {index});
-      auto *val = spvBuilder.createBinaryOp(spvOp, vecType, lhsVec, rhsVec);
+      auto *rhsVec = spvBuilder.createCompositeExtract(vecType, rhsVal, {index},
+                                                       rhs->getLocStart());
+      auto *val =
+          spvBuilder.createBinaryOp(spvOp, vecType, lhsVec, rhsVec, loc);
       val->setRValue();
       return val;
     };
-    return processEachVectorInMatrix(lhs, lhsVal, actOnEachVec);
+    return processEachVectorInMatrix(lhs, lhsVal, actOnEachVec,
+                                     lhs->getLocStart());
   }
   case BO_Assign:
     llvm_unreachable("assignment should not be handled here");
@@ -5968,7 +6386,8 @@ SpirvEmitter::processMatrixBinaryOp(const Expr *lhs, const Expr *rhs,
 const Expr *SpirvEmitter::collectArrayStructIndices(
     const Expr *expr, bool rawIndex,
     llvm::SmallVectorImpl<uint32_t> *rawIndices,
-    llvm::SmallVectorImpl<SpirvInstruction *> *indices) {
+    llvm::SmallVectorImpl<SpirvInstruction *> *indices,
+    bool *isMSOutAttribute) {
   assert((rawIndex && rawIndices) || (!rawIndex && indices));
 
   if (const auto *indexing = dyn_cast<MemberExpr>(expr)) {
@@ -5983,7 +6402,20 @@ const Expr *SpirvEmitter::collectArrayStructIndices(
 
     const Expr *base = collectArrayStructIndices(
         indexing->getBase()->IgnoreParenNoopCasts(astContext), rawIndex,
-        rawIndices, indices);
+        rawIndices, indices, isMSOutAttribute);
+
+    if (isMSOutAttribute && base) {
+      if (const auto *arg = dyn_cast<DeclRefExpr>(base)) {
+        if (const auto *varDecl = dyn_cast<VarDecl>(arg->getDecl())) {
+          if (varDecl->hasAttr<HLSLVerticesAttr>() ||
+              varDecl->hasAttr<HLSLPrimitivesAttr>()) {
+            assert(spvContext.isMS());
+            *isMSOutAttribute = true;
+            return expr;
+          }
+        }
+      }
+    }
 
     // Append the index of the current level
     const auto *fieldDecl = cast<FieldDecl>(indexing->getMemberDecl());
@@ -6010,9 +6442,18 @@ const Expr *SpirvEmitter::collectArrayStructIndices(
     // The base of an ArraySubscriptExpr has a wrapping LValueToRValue implicit
     // cast. We need to ingore it to avoid creating OpLoad.
     const Expr *thisBase = indexing->getBase()->IgnoreParenLValueCasts();
-    const Expr *base =
-        collectArrayStructIndices(thisBase, rawIndex, rawIndices, indices);
-    indices->push_back(doExpr(indexing->getIdx()));
+    const Expr *base = collectArrayStructIndices(thisBase, rawIndex, rawIndices,
+                                                 indices, isMSOutAttribute);
+    // The index into an array must be an integer number.
+    const auto *idxExpr = indexing->getIdx();
+    const auto idxExprType = idxExpr->getType();
+    SpirvInstruction *thisIndex = doExpr(idxExpr);
+    if (!idxExprType->isIntegerType() || idxExprType->isBooleanType()) {
+      thisIndex = castToInt(thisIndex, idxExprType, astContext.UnsignedIntTy,
+                            idxExpr->getExprLoc());
+    }
+
+    indices->push_back(thisIndex);
     return base;
   }
 
@@ -6031,8 +6472,8 @@ const Expr *SpirvEmitter::collectArrayStructIndices(
           indexing->getArg(0)->IgnoreParenNoopCasts(astContext);
 
       const auto thisBaseType = thisBase->getType();
-      const Expr *base =
-          collectArrayStructIndices(thisBase, rawIndex, rawIndices, indices);
+      const Expr *base = collectArrayStructIndices(
+          thisBase, rawIndex, rawIndices, indices, isMSOutAttribute);
 
       if (thisBaseType != base->getType() &&
           isAKindOfStructuredOrByteBuffer(thisBaseType)) {
@@ -6085,7 +6526,8 @@ const Expr *SpirvEmitter::collectArrayStructIndices(
 
 SpirvInstruction *SpirvEmitter::turnIntoElementPtr(
     QualType baseType, SpirvInstruction *base, QualType elemType,
-    const llvm::SmallVector<SpirvInstruction *, 4> &indices) {
+    const llvm::SmallVector<SpirvInstruction *, 4> &indices,
+    SourceLocation loc) {
   // If this is a rvalue, we need a temporary object to hold it
   // so that we can get access chain from it.
   const bool needTempVar = base->isRValue();
@@ -6093,16 +6535,14 @@ SpirvInstruction *SpirvEmitter::turnIntoElementPtr(
 
   if (needTempVar) {
     auto varName = getAstTypeName(baseType);
-    const auto var = createTemporaryVar(baseType, varName, base);
+    const auto var = createTemporaryVar(baseType, varName, base, loc);
     var->setLayoutRule(SpirvLayoutRule::Void);
     var->setStorageClass(spv::StorageClass::Function);
     var->setContainsAliasComponent(base->containsAliasComponent());
     accessChainBase = var;
   }
 
-  base = spvBuilder.createAccessChain(
-      spvContext.getPointerType(elemType, accessChainBase->getStorageClass()),
-      accessChainBase, indices);
+  base = spvBuilder.createAccessChain(elemType, accessChainBase, indices, loc);
 
   // Okay, this part seems weird, but it is intended:
   // If the base is originally a rvalue, the whole AST involving the base
@@ -6114,7 +6554,7 @@ SpirvInstruction *SpirvEmitter::turnIntoElementPtr(
   // we must do the load here. Otherwise, it's up to the consumer of this
   // access chain to do the load, and that can be everywhere.
   if (needTempVar) {
-    base = spvBuilder.createLoad(elemType, base);
+    base = spvBuilder.createLoad(elemType, base, loc);
   }
 
   return base;
@@ -6122,7 +6562,8 @@ SpirvInstruction *SpirvEmitter::turnIntoElementPtr(
 
 SpirvInstruction *SpirvEmitter::castToBool(SpirvInstruction *fromVal,
                                            QualType fromType,
-                                           QualType toBoolType) {
+                                           QualType toBoolType,
+                                           SourceLocation loc) {
   if (isSameType(astContext, fromType, toBoolType))
     return fromVal;
 
@@ -6136,23 +6577,27 @@ SpirvInstruction *SpirvEmitter::castToBool(SpirvInstruction *fromVal,
           astContext.getExtVectorType(astContext.BoolTy, colCount);
       llvm::SmallVector<SpirvInstruction *, 4> rows;
       for (uint32_t i = 0; i < rowCount; ++i) {
-        auto *row =
-            spvBuilder.createCompositeExtract(fromRowQualType, fromVal, {i});
-        rows.push_back(castToBool(row, fromRowQualType, toBoolRowQualType));
+        auto *row = spvBuilder.createCompositeExtract(fromRowQualType, fromVal,
+                                                      {i}, loc);
+        rows.push_back(
+            castToBool(row, fromRowQualType, toBoolRowQualType, loc));
       }
-      return spvBuilder.createCompositeConstruct(toBoolType, rows);
+      return spvBuilder.createCompositeConstruct(toBoolType, rows, loc);
     }
   }
 
   // Converting to bool means comparing with value zero.
   const spv::Op spvOp = translateOp(BO_NE, fromType);
   auto *zeroVal = getValueZero(fromType);
-  return spvBuilder.createBinaryOp(spvOp, toBoolType, fromVal, zeroVal);
+  return spvBuilder.createBinaryOp(spvOp, toBoolType, fromVal, zeroVal, loc);
 }
 
 SpirvInstruction *SpirvEmitter::castToInt(SpirvInstruction *fromVal,
                                           QualType fromType, QualType toIntType,
                                           SourceLocation srcLoc) {
+  if (isEnumType(fromType))
+    fromType = astContext.IntTy;
+
   if (isSameType(astContext, fromType, toIntType))
     return fromVal;
 
@@ -6165,22 +6610,24 @@ SpirvInstruction *SpirvEmitter::castToInt(SpirvInstruction *fromVal,
   if (isSintOrVecOfSintType(fromType) || isUintOrVecOfUintType(fromType)) {
     // First convert the source to the bitwidth of the destination if necessary.
     QualType convertedType = {};
-    fromVal = convertBitwidth(fromVal, fromType, toIntType, &convertedType);
+    fromVal =
+        convertBitwidth(fromVal, srcLoc, fromType, toIntType, &convertedType);
     // If bitwidth conversion was the only thing we needed to do, we're done.
     if (isSameScalarOrVecType(convertedType, toIntType))
       return fromVal;
-    return spvBuilder.createUnaryOp(spv::Op::OpBitcast, toIntType, fromVal);
+    return spvBuilder.createUnaryOp(spv::Op::OpBitcast, toIntType, fromVal,
+                                    srcLoc);
   }
 
   if (isFloatOrVecOfFloatType(fromType)) {
     // First convert the source to the bitwidth of the destination if necessary.
-    fromVal = convertBitwidth(fromVal, fromType, toIntType);
+    fromVal = convertBitwidth(fromVal, srcLoc, fromType, toIntType);
     if (isSintOrVecOfSintType(toIntType)) {
       return spvBuilder.createUnaryOp(spv::Op::OpConvertFToS, toIntType,
-                                      fromVal);
+                                      fromVal, srcLoc);
     } else if (isUintOrVecOfUintType(toIntType)) {
       return spvBuilder.createUnaryOp(spv::Op::OpConvertFToU, toIntType,
-                                      fromVal);
+                                      fromVal, srcLoc);
     } else {
       emitError("casting from floating point to integer unimplemented", srcLoc);
     }
@@ -6210,11 +6657,11 @@ SpirvInstruction *SpirvEmitter::castToInt(SpirvInstruction *fromVal,
           astContext.getExtVectorType(toElemType, numCols);
       for (uint32_t row = 0; row < numRows; ++row) {
         auto *rowId =
-            spvBuilder.createCompositeExtract(vecType, fromVal, {row});
+            spvBuilder.createCompositeExtract(vecType, fromVal, {row}, srcLoc);
         castedRows.push_back(
             castToInt(rowId, fromVecQualType, toIntVecQualType, srcLoc));
       }
-      return spvBuilder.createCompositeConstruct(toIntType, castedRows);
+      return spvBuilder.createCompositeConstruct(toIntType, castedRows, srcLoc);
     }
   }
 
@@ -6222,6 +6669,7 @@ SpirvInstruction *SpirvEmitter::castToInt(SpirvInstruction *fromVal,
 }
 
 SpirvInstruction *SpirvEmitter::convertBitwidth(SpirvInstruction *fromVal,
+                                                SourceLocation loc,
                                                 QualType fromType,
                                                 QualType toType,
                                                 QualType *resultType) {
@@ -6248,11 +6696,14 @@ SpirvInstruction *SpirvEmitter::convertBitwidth(SpirvInstruction *fromVal,
     *resultType = targetType;
 
   if (isFloatOrVecOfFloatType(fromType))
-    return spvBuilder.createUnaryOp(spv::Op::OpFConvert, targetType, fromVal);
+    return spvBuilder.createUnaryOp(spv::Op::OpFConvert, targetType, fromVal,
+                                    loc);
   if (isSintOrVecOfSintType(fromType))
-    return spvBuilder.createUnaryOp(spv::Op::OpSConvert, targetType, fromVal);
+    return spvBuilder.createUnaryOp(spv::Op::OpSConvert, targetType, fromVal,
+                                    loc);
   if (isUintOrVecOfUintType(fromType))
-    return spvBuilder.createUnaryOp(spv::Op::OpUConvert, targetType, fromVal);
+    return spvBuilder.createUnaryOp(spv::Op::OpUConvert, targetType, fromVal,
+                                    loc);
   llvm_unreachable("invalid type passed to convertBitwidth");
 }
 
@@ -6271,21 +6722,21 @@ SpirvInstruction *SpirvEmitter::castToFloat(SpirvInstruction *fromVal,
 
   if (isSintOrVecOfSintType(fromType)) {
     // First convert the source to the bitwidth of the destination if necessary.
-    fromVal = convertBitwidth(fromVal, fromType, toFloatType);
+    fromVal = convertBitwidth(fromVal, srcLoc, fromType, toFloatType);
     return spvBuilder.createUnaryOp(spv::Op::OpConvertSToF, toFloatType,
-                                    fromVal);
+                                    fromVal, srcLoc);
   }
 
   if (isUintOrVecOfUintType(fromType)) {
     // First convert the source to the bitwidth of the destination if necessary.
-    fromVal = convertBitwidth(fromVal, fromType, toFloatType);
+    fromVal = convertBitwidth(fromVal, srcLoc, fromType, toFloatType);
     return spvBuilder.createUnaryOp(spv::Op::OpConvertUToF, toFloatType,
-                                    fromVal);
+                                    fromVal, srcLoc);
   }
 
   if (isFloatOrVecOfFloatType(fromType)) {
     // This is the case of float to float conversion with different bitwidths.
-    return convertBitwidth(fromVal, fromType, toFloatType);
+    return convertBitwidth(fromVal, srcLoc, fromType, toFloatType);
   }
 
   // Casting matrix types
@@ -6313,11 +6764,12 @@ SpirvInstruction *SpirvEmitter::castToFloat(SpirvInstruction *fromVal,
           astContext.getExtVectorType(toElemType, numCols);
       for (uint32_t row = 0; row < numRows; ++row) {
         auto *rowId =
-            spvBuilder.createCompositeExtract(vecType, fromVal, {row});
+            spvBuilder.createCompositeExtract(vecType, fromVal, {row}, srcLoc);
         castedRows.push_back(
             castToFloat(rowId, fromVecQualType, toIntVecQualType, srcLoc));
       }
-      return spvBuilder.createCompositeConstruct(toFloatType, castedRows);
+      return spvBuilder.createCompositeConstruct(toFloatType, castedRows,
+                                                 srcLoc);
     }
   }
 
@@ -6423,8 +6875,7 @@ SpirvEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
   case hlsl::IntrinsicOp::IOP_texCUBEgrad:
   case hlsl::IntrinsicOp::IOP_texCUBElod:
   case hlsl::IntrinsicOp::IOP_texCUBEproj: {
-    emitError("deprecated %0 intrinsic function will not be supported",
-              callExpr->getExprLoc())
+    emitError("deprecated %0 intrinsic function will not be supported", srcLoc)
         << callee->getName();
     return nullptr;
   }
@@ -6504,6 +6955,7 @@ SpirvEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
     retVal = processIntrinsicLit(callExpr);
     break;
   case hlsl::IntrinsicOp::IOP_mad:
+  case hlsl::IntrinsicOp::IOP_umad:
     retVal = processIntrinsicMad(callExpr);
     break;
   case hlsl::IntrinsicOp::IOP_modf:
@@ -6546,21 +6998,20 @@ SpirvEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
     break;
   case hlsl::IntrinsicOp::IOP_WaveGetLaneCount: {
     featureManager.requestTargetEnv(SPV_ENV_VULKAN_1_1, "WaveGetLaneCount",
-                                    callExpr->getExprLoc());
+                                    srcLoc);
     const QualType retType = callExpr->getCallReturnType(astContext);
-    auto *var = declIdMapper.getBuiltinVar(spv::BuiltIn::SubgroupSize, retType,
-                                           callExpr->getExprLoc());
+    auto *var =
+        declIdMapper.getBuiltinVar(spv::BuiltIn::SubgroupSize, retType, srcLoc);
 
-    retVal = spvBuilder.createLoad(retType, var);
+    retVal = spvBuilder.createLoad(retType, var, srcLoc);
   } break;
   case hlsl::IntrinsicOp::IOP_WaveGetLaneIndex: {
     featureManager.requestTargetEnv(SPV_ENV_VULKAN_1_1, "WaveGetLaneIndex",
-                                    callExpr->getExprLoc());
+                                    srcLoc);
     const QualType retType = callExpr->getCallReturnType(astContext);
-    auto *var =
-        declIdMapper.getBuiltinVar(spv::BuiltIn::SubgroupLocalInvocationId,
-                                   retType, callExpr->getExprLoc());
-    retVal = spvBuilder.createLoad(retType, var);
+    auto *var = declIdMapper.getBuiltinVar(
+        spv::BuiltIn::SubgroupLocalInvocationId, retType, srcLoc);
+    retVal = spvBuilder.createLoad(retType, var, srcLoc);
   } break;
   case hlsl::IntrinsicOp::IOP_WaveIsFirstLane:
     retVal = processWaveQuery(callExpr, spv::Op::OpGroupNonUniformElect);
@@ -6593,7 +7044,7 @@ SpirvEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
   case hlsl::IntrinsicOp::IOP_WaveActiveBitXor: {
     const auto retType = callExpr->getCallReturnType(astContext);
     retVal = processWaveReductionOrPrefix(
-        callExpr, translateWaveOp(hlslOpcode, retType, callExpr->getExprLoc()),
+        callExpr, translateWaveOp(hlslOpcode, retType, srcLoc),
         spv::GroupOperation::Reduce);
   } break;
   case hlsl::IntrinsicOp::IOP_WavePrefixUSum:
@@ -6602,7 +7053,7 @@ SpirvEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
   case hlsl::IntrinsicOp::IOP_WavePrefixProduct: {
     const auto retType = callExpr->getCallReturnType(astContext);
     retVal = processWaveReductionOrPrefix(
-        callExpr, translateWaveOp(hlslOpcode, retType, callExpr->getExprLoc()),
+        callExpr, translateWaveOp(hlslOpcode, retType, srcLoc),
         spv::GroupOperation::ExclusiveScan);
   } break;
   case hlsl::IntrinsicOp::IOP_WavePrefixCountBits:
@@ -6621,8 +7072,7 @@ SpirvEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
   case hlsl::IntrinsicOp::IOP_abort:
   case hlsl::IntrinsicOp::IOP_GetRenderTargetSampleCount:
   case hlsl::IntrinsicOp::IOP_GetRenderTargetSamplePosition: {
-    emitError("no equivalent for %0 intrinsic function in Vulkan",
-              callExpr->getExprLoc())
+    emitError("no equivalent for %0 intrinsic function in Vulkan", srcLoc)
         << callee->getName();
     return 0;
   }
@@ -6633,7 +7083,7 @@ SpirvEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
       retVal =
           processIntrinsicUsingSpirvInst(callExpr, spv::Op::OpTranspose, false);
     else
-      retVal = processNonFpMatrixTranspose(matType, doExpr(mat));
+      retVal = processNonFpMatrixTranspose(matType, doExpr(mat), srcLoc);
 
     break;
   }
@@ -6658,14 +7108,30 @@ SpirvEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
     retVal = processRayBuiltins(callExpr, hlslOpcode);
     break;
   }
-  case hlsl::IntrinsicOp::IOP_AcceptHitAndEndSearch: {
-    spvBuilder.createRayTracingOpsNV(spv::Op::OpTerminateRayNV, QualType(), {},
-                                     callExpr->getExprLoc());
-    break;
-  }
+  case hlsl::IntrinsicOp::IOP_AcceptHitAndEndSearch:
   case hlsl::IntrinsicOp::IOP_IgnoreHit: {
-    spvBuilder.createRayTracingOpsNV(spv::Op::OpIgnoreIntersectionNV,
-                                     QualType(), {}, callExpr->getExprLoc());
+
+    // Any modifications made to the ray payload in an any hit shader are
+    // preserved before calling AcceptHit/IgnoreHit. Write out the results to
+    // the payload which is visible only in entry functions
+    const auto iter = functionInfoMap.find(curFunction);
+    if (iter != functionInfoMap.end()) {
+      const auto &entryInfo = iter->second;
+      if (entryInfo->isEntryFunction) {
+        const auto payloadArg = curFunction->getParamDecl(0);
+        const auto payloadArgInst =
+            declIdMapper.getDeclEvalInfo(payloadArg, payloadArg->getLocStart());
+        auto tempLoad = spvBuilder.createLoad(
+            payloadArg->getType(), payloadArgInst, payloadArg->getLocStart());
+        spvBuilder.createStore(currentRayPayload, tempLoad,
+                               callExpr->getExprLoc());
+      }
+    }
+    spvBuilder.createRayTracingOpsNV(
+        hlslOpcode == hlsl::IntrinsicOp ::IOP_AcceptHitAndEndSearch
+            ? spv::Op::OpTerminateRayNV
+            : spv::Op::OpIgnoreIntersectionNV,
+        QualType(), {}, srcLoc);
     break;
   }
   case hlsl::IntrinsicOp::IOP_ReportHit: {
@@ -6678,6 +7144,14 @@ SpirvEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
   }
   case hlsl::IntrinsicOp::IOP_CallShader: {
     processCallShader(callExpr);
+    break;
+  }
+  case hlsl::IntrinsicOp::IOP_DispatchMesh: {
+    processDispatchMesh(callExpr);
+    break;
+  }
+  case hlsl::IntrinsicOp::IOP_SetMeshOutputCounts: {
+    processMeshOutputCounts(callExpr);
     break;
   }
     INTRINSIC_SPIRV_OP_CASE(ddx, DPdx, true);
@@ -6738,7 +7212,7 @@ SpirvEmitter::processIntrinsicCallExpr(const CallExpr *callExpr) {
     INTRINSIC_OP_CASE(sqrt, Sqrt, true);
     INTRINSIC_OP_CASE(trunc, Trunc, true);
   default:
-    emitError("%0 intrinsic function unimplemented", callExpr->getExprLoc())
+    emitError("%0 intrinsic function unimplemented", srcLoc)
         << callee->getName();
     return 0;
   }
@@ -6813,24 +7287,58 @@ SpirvEmitter::processIntrinsicInterlockedMethod(const CallExpr *expr,
     const auto outputArg = callExpr->getArg(outputArgIndex);
     const auto outputArgType = outputArg->getType();
     if (baseType != outputArgType)
-      toWrite = castToInt(toWrite, baseType, outputArgType, dest->getExprLoc());
-    spvBuilder.createStore(doExpr(outputArg), toWrite);
+      toWrite =
+          castToInt(toWrite, baseType, outputArgType, dest->getLocStart());
+    spvBuilder.createStore(doExpr(outputArg), toWrite, callExpr->getExprLoc());
   };
+
+  // If a vector swizzling of a texture is done as an argument of an
+  // interlocked method, we need to handle the access to the texture
+  // buffer element correctly. For example:
+  //
+  //  InterlockedAdd(myRWTexture[index].r, 1);
+  //
+  // `-CallExpr
+  //  |-ImplicitCastExpr
+  //  | `-DeclRefExpr Function 'InterlockedAdd'
+  //  |                        'void (unsigned int &, unsigned int)'
+  //  |-HLSLVectorElementExpr 'unsigned int' lvalue vectorcomponent r
+  //  | `-ImplicitCastExpr 'vector<uint, 1>':'vector<unsigned int, 1>'
+  //  |                                       <HLSLVectorSplat>
+  //  |   `-CXXOperatorCallExpr 'unsigned int' lvalue
+  const auto *cxxOpCall = dyn_cast<CXXOperatorCallExpr>(dest);
+  if (const auto *vector = dyn_cast<HLSLVectorElementExpr>(dest)) {
+    const Expr *base = vector->getBase();
+    cxxOpCall = dyn_cast<CXXOperatorCallExpr>(base);
+    if (const auto *cast = dyn_cast<CastExpr>(base)) {
+      cxxOpCall = dyn_cast<CXXOperatorCallExpr>(cast->getSubExpr());
+    }
+  }
 
   // If the argument is indexing into a texture/buffer, we need to create an
   // OpImageTexelPointer instruction.
   SpirvInstruction *ptr = nullptr;
-  if (const auto *callExpr = dyn_cast<CXXOperatorCallExpr>(dest)) {
+  if (cxxOpCall) {
     const Expr *base = nullptr;
     const Expr *index = nullptr;
-    if (isBufferTextureIndexing(callExpr, &base, &index)) {
+    if (isBufferTextureIndexing(cxxOpCall, &base, &index)) {
+      if (hlsl::IsHLSLResourceType(base->getType())) {
+        const auto resultTy = hlsl::GetHLSLResourceResultType(base->getType());
+        if (!isScalarType(resultTy, nullptr)) {
+          emitError("Interlocked operation for texture buffer whose result "
+                    "type is non-scalar type is not allowed",
+                    dest->getExprLoc());
+          return nullptr;
+        }
+      }
       auto *baseInstr = doExpr(base);
       if (baseInstr->isRValue()) {
         // OpImageTexelPointer's Image argument must have a type of
         // OpTypePointer with Type OpTypeImage. Need to create a temporary
         // variable if the baseId is an rvalue.
-        baseInstr = createTemporaryVar(
-            base->getType(), getAstTypeName(base->getType()), baseInstr);
+        baseInstr =
+            createTemporaryVar(base->getType(), getAstTypeName(base->getType()),
+                               baseInstr, base->getExprLoc());
       }
       auto *coordInstr = doExpr(index);
       ptr = spvBuilder.createImageTexelPointer(baseType, baseInstr, coordInstr,
@@ -6907,10 +7415,11 @@ SpirvEmitter::processIntrinsicNonUniformResourceIndex(const CallExpr *expr) {
 
 SpirvInstruction *
 SpirvEmitter::processIntrinsicMsad4(const CallExpr *callExpr) {
+  const auto loc = callExpr->getExprLoc();
   if (!spirvOptions.noWarnEmulatedFeatures)
     emitWarning("msad4 intrinsic function is emulated using many SPIR-V "
                 "instructions due to lack of direct SPIR-V equivalent",
-                callExpr->getExprLoc());
+                loc);
 
   // Compares a 4-byte reference value and an 8-byte source value and
   // accumulates a vector of 4 sums. Each sum corresponds to the masked sum
@@ -6943,7 +7452,6 @@ SpirvEmitter::processIntrinsicMsad4(const CallExpr *callExpr) {
   auto *reference = doExpr(callExpr->getArg(0));
   auto *source = doExpr(callExpr->getArg(1));
   auto *accum = doExpr(callExpr->getArg(2));
-  const auto loc = callExpr->getExprLoc();
   const auto uint0 =
       spvBuilder.getConstantInt(astContext.UnsignedIntTy, llvm::APInt(32, 0));
   const auto uint8 =
@@ -6954,20 +7462,20 @@ SpirvEmitter::processIntrinsicMsad4(const CallExpr *callExpr) {
       spvBuilder.getConstantInt(astContext.UnsignedIntTy, llvm::APInt(32, 24));
 
   // Step 1.
-  auto *v1x = spvBuilder.createCompositeExtract(uintType, source, {0});
+  auto *v1x = spvBuilder.createCompositeExtract(uintType, source, {0}, loc);
   // r0.x = v1xS8 = v1.x shifted by 8 bits
   auto *v1xS8 = spvBuilder.createBinaryOp(spv::Op::OpShiftLeftLogical, uintType,
-                                          v1x, uint8);
+                                          v1x, uint8, loc);
   // r0.y = v1xS16 = v1.x shifted by 16 bits
   auto *v1xS16 = spvBuilder.createBinaryOp(spv::Op::OpShiftLeftLogical,
-                                           uintType, v1x, uint16);
+                                           uintType, v1x, uint16, loc);
   // r0.z = v1xS24 = v1.x shifted by 24 bits
   auto *v1xS24 = spvBuilder.createBinaryOp(spv::Op::OpShiftLeftLogical,
-                                           uintType, v1x, uint24);
+                                           uintType, v1x, uint24, loc);
 
   // Step 2.
   // Do bfi 3 times. DXIL bfi is equivalent to SPIR-V OpBitFieldInsert.
-  auto *v1y = spvBuilder.createCompositeExtract(uintType, source, {1});
+  auto *v1y = spvBuilder.createCompositeExtract(uintType, source, {1}, loc);
   // Note that t0.x = v1.x, nothing we need to do for that.
   auto *t0y =
       spvBuilder.createBitFieldInsert(uintType, /*base*/ v1xS8, /*insert*/ v1y,
@@ -7025,10 +7533,10 @@ SpirvEmitter::processIntrinsicMsad4(const CallExpr *callExpr) {
   //     return accum;
   // }
 
-  auto *accum0 = spvBuilder.createCompositeExtract(uintType, accum, {0});
-  auto *accum1 = spvBuilder.createCompositeExtract(uintType, accum, {1});
-  auto *accum2 = spvBuilder.createCompositeExtract(uintType, accum, {2});
-  auto *accum3 = spvBuilder.createCompositeExtract(uintType, accum, {3});
+  auto *accum0 = spvBuilder.createCompositeExtract(uintType, accum, {0}, loc);
+  auto *accum1 = spvBuilder.createCompositeExtract(uintType, accum, {1}, loc);
+  auto *accum2 = spvBuilder.createCompositeExtract(uintType, accum, {2}, loc);
+  auto *accum3 = spvBuilder.createCompositeExtract(uintType, accum, {3}, loc);
   const llvm::SmallVector<SpirvInstruction *, 4> sources = {v1x, t0y, t0z, t0w};
   llvm::SmallVector<SpirvInstruction *, 4> accums = {accum0, accum1, accum2,
                                                      accum3};
@@ -7041,10 +7549,10 @@ SpirvEmitter::processIntrinsicMsad4(const CallExpr *callExpr) {
         spvBuilder.getConstantInt(astContext.UnsignedIntTy,
                                   llvm::APInt(32, i * 8)),
         /*count*/ uint8, /*isSigned*/ false, loc));
-    signedRefBytes.push_back(
-        spvBuilder.createUnaryOp(spv::Op::OpBitcast, intType, refBytes.back()));
+    signedRefBytes.push_back(spvBuilder.createUnaryOp(
+        spv::Op::OpBitcast, intType, refBytes.back(), loc));
     isRefByteZero.push_back(spvBuilder.createBinaryOp(
-        spv::Op::OpIEqual, boolType, refBytes.back(), uint0));
+        spv::Op::OpIEqual, boolType, refBytes.back(), uint0, loc));
   }
 
   for (uint32_t msadNum = 0; msadNum < 4; ++msadNum) {
@@ -7057,23 +7565,25 @@ SpirvEmitter::processIntrinsicMsad4(const CallExpr *callExpr) {
                                     llvm::APInt(32, 8 * byteCount)),
           /*count*/ uint8, /*isSigned*/ false, loc);
       auto *signedSrcByte =
-          spvBuilder.createUnaryOp(spv::Op::OpBitcast, intType, srcByte);
-      auto *sub = spvBuilder.createBinaryOp(
-          spv::Op::OpISub, intType, signedRefBytes[byteCount], signedSrcByte);
+          spvBuilder.createUnaryOp(spv::Op::OpBitcast, intType, srcByte, loc);
+      auto *sub = spvBuilder.createBinaryOp(spv::Op::OpISub, intType,
+                                            signedRefBytes[byteCount],
+                                            signedSrcByte, loc);
       auto *absSub = spvBuilder.createExtInst(
           intType, glsl, GLSLstd450::GLSLstd450SAbs, {sub}, loc);
       auto *diff = spvBuilder.createSelect(
           uintType, isRefByteZero[byteCount], uint0,
-          spvBuilder.createUnaryOp(spv::Op::OpBitcast, uintType, absSub), loc);
+          spvBuilder.createUnaryOp(spv::Op::OpBitcast, uintType, absSub, loc),
+          loc);
 
       // As pointed out by the DXIL reference above, it is *not* required to
       // saturate the output to UINT_MAX in case of overflow. Wrapping around is
       // also allowed. For simplicity, we will wrap around at this point.
       accums[msadNum] = spvBuilder.createBinaryOp(spv::Op::OpIAdd, uintType,
-                                                  accums[msadNum], diff);
+                                                  accums[msadNum], diff, loc);
     }
   }
-  return spvBuilder.createCompositeConstruct(uint4Type, accums);
+  return spvBuilder.createCompositeConstruct(uint4Type, accums, loc);
 }
 
 SpirvInstruction *SpirvEmitter::processWaveQuery(const CallExpr *callExpr,
@@ -7310,7 +7820,7 @@ SpirvInstruction *SpirvEmitter::processIntrinsicModf(const CallExpr *callExpr) {
   auto *glslInstSet = spvBuilder.getGLSLExtInstSet();
   const Expr *arg = callExpr->getArg(0);
   const Expr *ipArg = callExpr->getArg(1);
-  const auto loc = callExpr->getExprLoc();
+  const auto loc = callExpr->getLocStart();
   const auto argType = arg->getType();
   const auto ipType = ipArg->getType();
   const auto returnType = callExpr->getType();
@@ -7328,12 +7838,12 @@ SpirvInstruction *SpirvEmitter::processIntrinsicModf(const CallExpr *callExpr) {
                                             GLSLstd450::GLSLstd450ModfStruct,
                                             {argInstr}, loc);
       SpirvInstruction *ip =
-          spvBuilder.createCompositeExtract(argType, modf, {1});
+          spvBuilder.createCompositeExtract(argType, modf, {1}, loc);
       // This will do nothing if the input number (x) and the ip are both of the
       // same type. Otherwise, it will convert the ip into int as necessary.
-      ip = castToInt(ip, argType, ipType, arg->getExprLoc());
+      ip = castToInt(ip, argType, ipType, ipArg->getLocStart());
       processAssignment(ipArg, ip, false, nullptr);
-      return spvBuilder.createCompositeExtract(argType, modf, {0});
+      return spvBuilder.createCompositeExtract(argType, modf, {0}, loc);
     }
   }
 
@@ -7351,22 +7861,25 @@ SpirvInstruction *SpirvEmitter::processIntrinsicModf(const CallExpr *callExpr) {
       llvm::SmallVector<SpirvInstruction *, 4> ips;
       for (uint32_t i = 0; i < rowCount; ++i) {
         auto *curRow =
-            spvBuilder.createCompositeExtract(colType, argInstr, {i});
+            spvBuilder.createCompositeExtract(colType, argInstr, {i}, loc);
         auto *modf = spvBuilder.createExtInst(modfStructType, glslInstSet,
                                               GLSLstd450::GLSLstd450ModfStruct,
                                               {curRow}, loc);
-        ips.push_back(spvBuilder.createCompositeExtract(colType, modf, {1}));
-        fracs.push_back(spvBuilder.createCompositeExtract(colType, modf, {0}));
+        ips.push_back(
+            spvBuilder.createCompositeExtract(colType, modf, {1}, loc));
+        fracs.push_back(
+            spvBuilder.createCompositeExtract(colType, modf, {0}, loc));
       }
 
-      SpirvInstruction *ip = spvBuilder.createCompositeConstruct(argType, ips);
+      SpirvInstruction *ip =
+          spvBuilder.createCompositeConstruct(argType, ips, loc);
       // If the 'ip' is not a float type, the AST will not contain a CastExpr
       // because this is internal to the intrinsic function. So, in such a
       // case we need to cast manually.
       if (!hlsl::GetHLSLMatElementType(ipType)->isFloatingType())
-        ip = castToInt(ip, argType, ipType, ipArg->getExprLoc());
+        ip = castToInt(ip, argType, ipType, ipArg->getLocStart());
       processAssignment(ipArg, ip, false, nullptr);
-      return spvBuilder.createCompositeConstruct(returnType, fracs);
+      return spvBuilder.createCompositeConstruct(returnType, fracs, loc);
     }
   }
 
@@ -7389,7 +7902,7 @@ SpirvInstruction *SpirvEmitter::processIntrinsicMad(const CallExpr *callExpr) {
 
   // TODO: We currently don't propagate the NoContraction decoration.
 
-  const auto loc = callExpr->getExprLoc();
+  const auto loc = callExpr->getLocStart();
   const Expr *arg0 = callExpr->getArg(0);
   const Expr *arg1 = callExpr->getArg(1);
   const Expr *arg2 = callExpr->getArg(2);
@@ -7398,6 +7911,9 @@ SpirvInstruction *SpirvEmitter::processIntrinsicMad(const CallExpr *callExpr) {
   auto *arg0Instr = doExpr(arg0);
   auto *arg1Instr = doExpr(arg1);
   auto *arg2Instr = doExpr(arg2);
+  auto arg0Loc = arg0->getLocStart();
+  auto arg1Loc = arg1->getLocStart();
+  auto arg2Loc = arg2->getLocStart();
 
   // For floating point arguments, we can use the extended instruction set's Fma
   // instruction. Sadly we can't simply call processIntrinsicUsingGLSLInst
@@ -7407,20 +7923,21 @@ SpirvInstruction *SpirvEmitter::processIntrinsicMad(const CallExpr *callExpr) {
     auto *glslInstSet = spvBuilder.getGLSLExtInstSet();
     // For matrix cases, operate on each row of the matrix.
     if (isMxNMatrix(arg0->getType())) {
-      const auto actOnEachVec = [this, loc, glslInstSet, arg1Instr,
-                                 arg2Instr](uint32_t index, QualType vecType,
-                                            SpirvInstruction *arg0Row) {
-        auto *arg1Row =
-            spvBuilder.createCompositeExtract(vecType, arg1Instr, {index});
-        auto *arg2Row =
-            spvBuilder.createCompositeExtract(vecType, arg2Instr, {index});
+      const auto actOnEachVec = [this, loc, glslInstSet, arg1Instr, arg2Instr,
+                                 arg1Loc,
+                                 arg2Loc](uint32_t index, QualType vecType,
+                                          SpirvInstruction *arg0Row) {
+        auto *arg1Row = spvBuilder.createCompositeExtract(vecType, arg1Instr,
+                                                          {index}, arg1Loc);
+        auto *arg2Row = spvBuilder.createCompositeExtract(vecType, arg2Instr,
+                                                          {index}, arg2Loc);
         auto *fma =
             spvBuilder.createExtInst(vecType, glslInstSet, GLSLstd450Fma,
                                      {arg0Row, arg1Row, arg2Row}, loc);
         spvBuilder.decorateNoContraction(fma, loc);
         return fma;
       };
-      return processEachVectorInMatrix(arg0, arg0Instr, actOnEachVec);
+      return processEachVectorInMatrix(arg0, arg0Instr, actOnEachVec, loc);
     }
     // Non-matrix cases
     auto *fma =
@@ -7434,9 +7951,9 @@ SpirvInstruction *SpirvEmitter::processIntrinsicMad(const CallExpr *callExpr) {
   {
     if (isScalarType(argType) || isVectorType(argType)) {
       auto *mul = spvBuilder.createBinaryOp(spv::Op::OpIMul, argType, arg0Instr,
-                                            arg1Instr);
-      auto *add =
-          spvBuilder.createBinaryOp(spv::Op::OpIAdd, argType, mul, arg2Instr);
+                                            arg1Instr, loc);
+      auto *add = spvBuilder.createBinaryOp(spv::Op::OpIAdd, argType, mul,
+                                            arg2Instr, loc);
       spvBuilder.decorateNoContraction(mul, loc);
       spvBuilder.decorateNoContraction(add, loc);
       return add;
@@ -7452,20 +7969,20 @@ SpirvInstruction *SpirvEmitter::processIntrinsicMad(const CallExpr *callExpr) {
       llvm::SmallVector<SpirvInstruction *, 4> resultRows;
       for (uint32_t i = 0; i < rowCount; ++i) {
         auto *rowArg0 =
-            spvBuilder.createCompositeExtract(colType, arg0Instr, {i});
+            spvBuilder.createCompositeExtract(colType, arg0Instr, {i}, arg0Loc);
         auto *rowArg1 =
-            spvBuilder.createCompositeExtract(colType, arg1Instr, {i});
+            spvBuilder.createCompositeExtract(colType, arg1Instr, {i}, arg1Loc);
         auto *rowArg2 =
-            spvBuilder.createCompositeExtract(colType, arg2Instr, {i});
+            spvBuilder.createCompositeExtract(colType, arg2Instr, {i}, arg2Loc);
         auto *mul = spvBuilder.createBinaryOp(spv::Op::OpIMul, colType, rowArg0,
-                                              rowArg1);
-        auto *add =
-            spvBuilder.createBinaryOp(spv::Op::OpIAdd, colType, mul, rowArg2);
+                                              rowArg1, loc);
+        auto *add = spvBuilder.createBinaryOp(spv::Op::OpIAdd, colType, mul,
+                                              rowArg2, loc);
         spvBuilder.decorateNoContraction(mul, loc);
         spvBuilder.decorateNoContraction(add, loc);
         resultRows.push_back(add);
       }
-      return spvBuilder.createCompositeConstruct(argType, resultRows);
+      return spvBuilder.createCompositeConstruct(argType, resultRows, loc);
     }
   }
 
@@ -7500,12 +8017,13 @@ SpirvInstruction *SpirvEmitter::processIntrinsicLit(const CallExpr *callExpr) {
   auto *min = spvBuilder.createExtInst(
       floatType, glslInstSet, GLSLstd450::GLSLstd450FMin, {nDotL, nDotH}, loc);
   auto *isNeg = spvBuilder.createBinaryOp(spv::Op::OpFOrdLessThan, boolType,
-                                          min, floatZero);
-  auto *mul = spvBuilder.createBinaryOp(spv::Op::OpFMul, floatType, nDotH, m);
+                                          min, floatZero, loc);
+  auto *mul =
+      spvBuilder.createBinaryOp(spv::Op::OpFMul, floatType, nDotH, m, loc);
   auto *specular =
       spvBuilder.createSelect(floatType, isNeg, floatZero, mul, loc);
   return spvBuilder.createCompositeConstruct(
-      retType, {floatOne, diffuse, specular, floatOne});
+      retType, {floatOne, diffuse, specular, floatOne}, callExpr->getLocEnd());
 }
 
 SpirvInstruction *
@@ -7549,15 +8067,15 @@ SpirvEmitter::processIntrinsicFrexp(const CallExpr *callExpr) {
                                              GLSLstd450::GLSLstd450FrexpStruct,
                                              {argInstr}, loc);
       auto *exponentInt =
-          spvBuilder.createCompositeExtract(expType, frexp, {1});
+          spvBuilder.createCompositeExtract(expType, frexp, {1}, loc);
 
       // Since the SPIR-V instruction returns an int, and the intrinsic HLSL
       // expects a float, an conversion must take place before writing the
       // results.
-      auto *exponentFloat = spvBuilder.createUnaryOp(spv::Op::OpConvertSToF,
-                                                     returnType, exponentInt);
-      spvBuilder.createStore(expInstr, exponentFloat);
-      return spvBuilder.createCompositeExtract(argType, frexp, {0});
+      auto *exponentFloat = spvBuilder.createUnaryOp(
+          spv::Op::OpConvertSToF, returnType, exponentInt, loc);
+      spvBuilder.createStore(expInstr, exponentFloat, loc);
+      return spvBuilder.createCompositeExtract(argType, frexp, {0}, loc);
     }
   }
 
@@ -7576,27 +8094,28 @@ SpirvEmitter::processIntrinsicFrexp(const CallExpr *callExpr) {
       llvm::SmallVector<SpirvInstruction *, 4> exponents;
       llvm::SmallVector<SpirvInstruction *, 4> mantissas;
       for (uint32_t i = 0; i < rowCount; ++i) {
-        auto *curRow =
-            spvBuilder.createCompositeExtract(colType, argInstr, {i});
+        auto *curRow = spvBuilder.createCompositeExtract(colType, argInstr, {i},
+                                                         arg->getLocStart());
         auto *frexp = spvBuilder.createExtInst(
             frexpStructType, glslInstSet, GLSLstd450::GLSLstd450FrexpStruct,
             {curRow}, loc);
         auto *exponentInt =
-            spvBuilder.createCompositeExtract(expType, frexp, {1});
+            spvBuilder.createCompositeExtract(expType, frexp, {1}, loc);
 
         // Since the SPIR-V instruction returns an int, and the intrinsic HLSL
         // expects a float, an conversion must take place before writing the
         // results.
-        auto *exponentFloat = spvBuilder.createUnaryOp(spv::Op::OpConvertSToF,
-                                                       colType, exponentInt);
+        auto *exponentFloat = spvBuilder.createUnaryOp(
+            spv::Op::OpConvertSToF, colType, exponentInt, loc);
         exponents.push_back(exponentFloat);
         mantissas.push_back(
-            spvBuilder.createCompositeExtract(colType, frexp, {0}));
+            spvBuilder.createCompositeExtract(colType, frexp, {0}, loc));
       }
       auto *exponentsResult =
-          spvBuilder.createCompositeConstruct(returnType, exponents);
-      spvBuilder.createStore(expInstr, exponentsResult);
-      return spvBuilder.createCompositeConstruct(returnType, mantissas);
+          spvBuilder.createCompositeConstruct(returnType, exponents, loc);
+      spvBuilder.createStore(expInstr, exponentsResult, loc);
+      return spvBuilder.createCompositeConstruct(returnType, mantissas,
+                                                 callExpr->getLocEnd());
     }
   }
 
@@ -7617,31 +8136,32 @@ SpirvEmitter::processIntrinsicLdexp(const CallExpr *callExpr) {
   const auto paramType = x->getType();
   auto *xInstr = doExpr(x);
   auto *expInstr = doExpr(callExpr->getArg(1));
-  const auto loc = callExpr->getExprLoc();
+  const auto loc = callExpr->getLocStart();
+  const auto arg1Loc = callExpr->getArg(1)->getLocStart();
 
   // For scalar and vector argument types.
   if (isScalarType(paramType) || isVectorType(paramType)) {
     const auto twoExp = spvBuilder.createExtInst(
         paramType, glsl, GLSLstd450::GLSLstd450Exp2, {expInstr}, loc);
-    return spvBuilder.createBinaryOp(spv::Op::OpFMul, paramType, xInstr,
-                                     twoExp);
+    return spvBuilder.createBinaryOp(spv::Op::OpFMul, paramType, xInstr, twoExp,
+                                     loc);
   }
 
   // For matrix argument types.
   {
     uint32_t rowCount = 0, colCount = 0;
     if (isMxNMatrix(paramType, nullptr, &rowCount, &colCount)) {
-      const auto actOnEachVec = [this, loc, glsl,
-                                 expInstr](uint32_t index, QualType vecType,
-                                           SpirvInstruction *xRowInstr) {
-        auto *expRowInstr =
-            spvBuilder.createCompositeExtract(vecType, expInstr, {index});
+      const auto actOnEachVec = [this, loc, glsl, expInstr,
+                                 arg1Loc](uint32_t index, QualType vecType,
+                                          SpirvInstruction *xRowInstr) {
+        auto *expRowInstr = spvBuilder.createCompositeExtract(vecType, expInstr,
+                                                              {index}, arg1Loc);
         auto *twoExp = spvBuilder.createExtInst(
             vecType, glsl, GLSLstd450::GLSLstd450Exp2, {expRowInstr}, loc);
         return spvBuilder.createBinaryOp(spv::Op::OpFMul, vecType, xRowInstr,
-                                         twoExp);
+                                         twoExp, loc);
       };
-      return processEachVectorInMatrix(x, xInstr, actOnEachVec);
+      return processEachVectorInMatrix(x, xInstr, actOnEachVec, loc);
     }
   }
 
@@ -7659,16 +8179,20 @@ SpirvInstruction *SpirvEmitter::processIntrinsicDst(const CallExpr *callExpr) {
   const QualType f32 = astContext.FloatTy;
   auto *arg0Id = doExpr(callExpr->getArg(0));
   auto *arg1Id = doExpr(callExpr->getArg(1));
-  auto *arg0y = spvBuilder.createCompositeExtract(f32, arg0Id, {1});
-  auto *arg1y = spvBuilder.createCompositeExtract(f32, arg1Id, {1});
-  auto *arg0z = spvBuilder.createCompositeExtract(f32, arg0Id, {2});
-  auto *arg1w = spvBuilder.createCompositeExtract(f32, arg1Id, {3});
+  auto arg0Loc = callExpr->getArg(0)->getLocStart();
+  auto arg1Loc = callExpr->getArg(1)->getLocStart();
+  auto *arg0y = spvBuilder.createCompositeExtract(f32, arg0Id, {1}, arg0Loc);
+  auto *arg1y = spvBuilder.createCompositeExtract(f32, arg1Id, {1}, arg1Loc);
+  auto *arg0z = spvBuilder.createCompositeExtract(f32, arg0Id, {2}, arg0Loc);
+  auto *arg1w = spvBuilder.createCompositeExtract(f32, arg1Id, {3}, arg1Loc);
+  auto loc = callExpr->getLocEnd();
   auto *arg0yMularg1y =
-      spvBuilder.createBinaryOp(spv::Op::OpFMul, f32, arg0y, arg1y);
+      spvBuilder.createBinaryOp(spv::Op::OpFMul, f32, arg0y, arg1y, loc);
   return spvBuilder.createCompositeConstruct(
       callExpr->getType(),
       {spvBuilder.getConstantFloat(astContext.FloatTy, llvm::APFloat(1.0f)),
-       arg0yMularg1y, arg0z, arg1w});
+       arg0yMularg1y, arg0z, arg1w},
+      loc);
 }
 
 SpirvInstruction *SpirvEmitter::processIntrinsicClip(const CallExpr *callExpr) {
@@ -7694,14 +8218,14 @@ SpirvInstruction *SpirvEmitter::processIntrinsicClip(const CallExpr *callExpr) {
   if (isScalarType(argType)) {
     auto *zero = getValueZero(argType);
     condition = spvBuilder.createBinaryOp(spv::Op::OpFOrdLessThan, boolType,
-                                          argInstr, zero);
+                                          argInstr, zero, loc);
   } else if (isVectorType(argType, nullptr, &elemCount)) {
     auto *zero = getValueZero(argType);
     const QualType boolVecType =
         astContext.getExtVectorType(boolType, elemCount);
     auto *cmp = spvBuilder.createBinaryOp(spv::Op::OpFOrdLessThan, boolVecType,
-                                          argInstr, zero);
-    condition = spvBuilder.createUnaryOp(spv::Op::OpAny, boolType, cmp);
+                                          argInstr, zero, loc);
+    condition = spvBuilder.createUnaryOp(spv::Op::OpAny, boolType, cmp, loc);
   } else if (isMxNMatrix(argType, &elemType, &rowCount, &colCount)) {
     const auto floatVecType = astContext.getExtVectorType(elemType, colCount);
     auto *elemZero = getValueZero(elemType);
@@ -7710,17 +8234,18 @@ SpirvInstruction *SpirvEmitter::processIntrinsicClip(const CallExpr *callExpr) {
     llvm::SmallVector<SpirvInstruction *, 4> cmpResults;
     for (uint32_t i = 0; i < rowCount; ++i) {
       auto *lhsVec =
-          spvBuilder.createCompositeExtract(floatVecType, argInstr, {i});
+          spvBuilder.createCompositeExtract(floatVecType, argInstr, {i}, loc);
       const auto boolColType = astContext.getExtVectorType(boolType, colCount);
       auto *cmp = spvBuilder.createBinaryOp(spv::Op::OpFOrdLessThan,
-                                            boolColType, lhsVec, zero);
-      auto *any = spvBuilder.createUnaryOp(spv::Op::OpAny, boolType, cmp);
+                                            boolColType, lhsVec, zero, loc);
+      auto *any = spvBuilder.createUnaryOp(spv::Op::OpAny, boolType, cmp, loc);
       cmpResults.push_back(any);
     }
     const auto boolRowType = astContext.getExtVectorType(boolType, rowCount);
     auto *results =
-        spvBuilder.createCompositeConstruct(boolRowType, cmpResults);
-    condition = spvBuilder.createUnaryOp(spv::Op::OpAny, boolType, results);
+        spvBuilder.createCompositeConstruct(boolRowType, cmpResults, loc);
+    condition =
+        spvBuilder.createUnaryOp(spv::Op::OpAny, boolType, results, loc);
   } else {
     emitError("invalid argument type passed to clip intrinsic function", loc);
     return nullptr;
@@ -7730,7 +8255,7 @@ SpirvInstruction *SpirvEmitter::processIntrinsicClip(const CallExpr *callExpr) {
   auto *thenBB = spvBuilder.createBasicBlock("if.true");
   auto *mergeBB = spvBuilder.createBasicBlock("if.merge");
   // Create the branch instruction. This will end the current basic block.
-  spvBuilder.createConditionalBranch(condition, thenBB, mergeBB, mergeBB);
+  spvBuilder.createConditionalBranch(condition, thenBB, mergeBB, loc, mergeBB);
   spvBuilder.addSuccessor(thenBB);
   spvBuilder.addSuccessor(mergeBB);
   spvBuilder.setMergeTarget(mergeBB);
@@ -7764,21 +8289,24 @@ SpirvEmitter::processIntrinsicClamp(const CallExpr *callExpr) {
   auto *argXInstr = doExpr(argX);
   auto *argMinInstr = doExpr(argMin);
   auto *argMaxInstr = doExpr(argMax);
+  const auto argMinLoc = argMin->getLocStart();
+  const auto argMaxLoc = argMax->getLocStart();
 
   // FClamp, UClamp, and SClamp do not operate on matrices, so we should perform
   // the operation on each vector of the matrix.
   if (isMxNMatrix(argX->getType())) {
     const auto actOnEachVec = [this, loc, glslInstSet, glslOpcode, argMinInstr,
-                               argMaxInstr](uint32_t index, QualType vecType,
-                                            SpirvInstruction *curRow) {
-      auto *minRowInstr =
-          spvBuilder.createCompositeExtract(vecType, argMinInstr, {index});
-      auto *maxRowInstr =
-          spvBuilder.createCompositeExtract(vecType, argMaxInstr, {index});
+                               argMaxInstr, argMinLoc,
+                               argMaxLoc](uint32_t index, QualType vecType,
+                                          SpirvInstruction *curRow) {
+      auto *minRowInstr = spvBuilder.createCompositeExtract(
+          vecType, argMinInstr, {index}, argMinLoc);
+      auto *maxRowInstr = spvBuilder.createCompositeExtract(
+          vecType, argMaxInstr, {index}, argMaxLoc);
       return spvBuilder.createExtInst(vecType, glslInstSet, glslOpcode,
                                       {curRow, minRowInstr, maxRowInstr}, loc);
     };
-    return processEachVectorInMatrix(argX, argXInstr, actOnEachVec);
+    return processEachVectorInMatrix(argX, argXInstr, actOnEachVec, loc);
   }
 
   return spvBuilder.createExtInst(returnType, glslInstSet, glslOpcode,
@@ -7848,9 +8376,8 @@ SpirvEmitter::processIntrinsicMemoryBarrier(const CallExpr *callExpr,
   return nullptr;
 }
 
-SpirvInstruction *
-SpirvEmitter::processNonFpMatrixTranspose(QualType matType,
-                                          SpirvInstruction *matrix) {
+SpirvInstruction *SpirvEmitter::processNonFpMatrixTranspose(
+    QualType matType, SpirvInstruction *matrix, SourceLocation loc) {
   // Simplest way is to flatten the matrix construct a new matrix from the
   // flattened elements. (for a mat4x4).
   QualType elemType = {};
@@ -7867,7 +8394,7 @@ SpirvEmitter::processNonFpMatrixTranspose(QualType matType,
   for (uint32_t i = 0; i < numRows; ++i)
     for (uint32_t j = 0; j < numCols; ++j)
       elems.push_back(
-          spvBuilder.createCompositeExtract(elemType, matrix, {i, j}));
+          spvBuilder.createCompositeExtract(elemType, matrix, {i, j}, loc));
 
   llvm::SmallVector<SpirvInstruction *, 4> cols;
   for (uint32_t i = 0; i < numCols; ++i) {
@@ -7877,36 +8404,38 @@ SpirvEmitter::processNonFpMatrixTranspose(QualType matType,
     for (uint32_t j = 0; j < numRows; ++j)
       indexes.push_back(elems[i + (j * numCols)]);
 
-    cols.push_back(spvBuilder.createCompositeConstruct(colQualType, indexes));
+    cols.push_back(
+        spvBuilder.createCompositeConstruct(colQualType, indexes, loc));
   }
 
   auto transposeType = astContext.getConstantArrayType(
       colQualType, llvm::APInt(32, numCols), clang::ArrayType::Normal, 0);
-  return spvBuilder.createCompositeConstruct(transposeType, cols);
+  return spvBuilder.createCompositeConstruct(transposeType, cols, loc);
 }
 
 SpirvInstruction *SpirvEmitter::processNonFpDot(SpirvInstruction *vec1Id,
                                                 SpirvInstruction *vec2Id,
                                                 uint32_t vecSize,
-                                                QualType elemType) {
+                                                QualType elemType,
+                                                SourceLocation loc) {
   llvm::SmallVector<SpirvInstruction *, 4> muls;
   for (uint32_t i = 0; i < vecSize; ++i) {
-    auto *elem1 = spvBuilder.createCompositeExtract(elemType, vec1Id, {i});
-    auto *elem2 = spvBuilder.createCompositeExtract(elemType, vec2Id, {i});
+    auto *elem1 = spvBuilder.createCompositeExtract(elemType, vec1Id, {i}, loc);
+    auto *elem2 = spvBuilder.createCompositeExtract(elemType, vec2Id, {i}, loc);
     muls.push_back(spvBuilder.createBinaryOp(translateOp(BO_Mul, elemType),
-                                             elemType, elem1, elem2));
+                                             elemType, elem1, elem2, loc));
   }
   SpirvInstruction *sum = muls[0];
   for (uint32_t i = 1; i < vecSize; ++i) {
     sum = spvBuilder.createBinaryOp(translateOp(BO_Add, elemType), elemType,
-                                    sum, muls[i]);
+                                    sum, muls[i], loc);
   }
   return sum;
 }
 
 SpirvInstruction *SpirvEmitter::processNonFpScalarTimesMatrix(
     QualType scalarType, SpirvInstruction *scalar, QualType matrixType,
-    SpirvInstruction *matrix) {
+    SpirvInstruction *matrix, SourceLocation loc) {
   assert(isScalarType(scalarType));
   QualType elemType = {};
   uint32_t numRows = 0, numCols = 0;
@@ -7923,19 +8452,21 @@ SpirvInstruction *SpirvEmitter::processNonFpScalarTimesMatrix(
   // passed to mul().
   const auto rowType = astContext.getExtVectorType(elemType, numCols);
   llvm::SmallVector<SpirvInstruction *, 4> splat(size_t(numCols), scalar);
-  auto *scalarSplat = spvBuilder.createCompositeConstruct(rowType, splat);
+  auto *scalarSplat = spvBuilder.createCompositeConstruct(rowType, splat, loc);
   llvm::SmallVector<SpirvInstruction *, 4> mulRows;
   for (uint32_t row = 0; row < numRows; ++row) {
-    auto *rowInstr = spvBuilder.createCompositeExtract(rowType, matrix, {row});
+    auto *rowInstr =
+        spvBuilder.createCompositeExtract(rowType, matrix, {row}, loc);
     mulRows.push_back(spvBuilder.createBinaryOp(
-        translateOp(BO_Mul, scalarType), rowType, rowInstr, scalarSplat));
+        translateOp(BO_Mul, scalarType), rowType, rowInstr, scalarSplat, loc));
   }
-  return spvBuilder.createCompositeConstruct(matrixType, mulRows);
+  return spvBuilder.createCompositeConstruct(matrixType, mulRows, loc);
 }
 
 SpirvInstruction *SpirvEmitter::processNonFpVectorTimesMatrix(
     QualType vecType, SpirvInstruction *vector, QualType matType,
-    SpirvInstruction *matrix, SpirvInstruction *matrixTranspose) {
+    SpirvInstruction *matrix, SourceLocation loc,
+    SpirvInstruction *matrixTranspose) {
   // This function assumes that the vector element type and matrix elemet type
   // are the same.
   QualType vecElemType = {}, matElemType = {};
@@ -7954,22 +8485,22 @@ SpirvInstruction *SpirvEmitter::processNonFpVectorTimesMatrix(
   // handle this in SPIR-V would be to first transpose the matrix, and then use
   // OpAccessChain.
   if (!matrixTranspose)
-    matrixTranspose = processNonFpMatrixTranspose(matType, matrix);
+    matrixTranspose = processNonFpMatrixTranspose(matType, matrix, loc);
 
   llvm::SmallVector<SpirvInstruction *, 4> resultElems;
   for (uint32_t col = 0; col < numCols; ++col) {
     auto *colInstr =
-        spvBuilder.createCompositeExtract(vecType, matrixTranspose, {col});
+        spvBuilder.createCompositeExtract(vecType, matrixTranspose, {col}, loc);
     resultElems.push_back(
-        processNonFpDot(vector, colInstr, vecSize, vecElemType));
+        processNonFpDot(vector, colInstr, vecSize, vecElemType, loc));
   }
   return spvBuilder.createCompositeConstruct(
-      astContext.getExtVectorType(vecElemType, numCols), resultElems);
+      astContext.getExtVectorType(vecElemType, numCols), resultElems, loc);
 }
 
 SpirvInstruction *SpirvEmitter::processNonFpMatrixTimesVector(
     QualType matType, SpirvInstruction *matrix, QualType vecType,
-    SpirvInstruction *vector) {
+    SpirvInstruction *vector, SourceLocation loc) {
   // This function assumes that the vector element type and matrix elemet type
   // are the same.
   QualType vecElemType = {}, matElemType = {};
@@ -7988,17 +8519,18 @@ SpirvInstruction *SpirvEmitter::processNonFpMatrixTimesVector(
   // vector.
   llvm::SmallVector<SpirvInstruction *, 4> resultElems;
   for (uint32_t row = 0; row < numRows; ++row) {
-    auto *rowInstr = spvBuilder.createCompositeExtract(vecType, matrix, {row});
+    auto *rowInstr =
+        spvBuilder.createCompositeExtract(vecType, matrix, {row}, loc);
     resultElems.push_back(
-        processNonFpDot(rowInstr, vector, vecSize, vecElemType));
+        processNonFpDot(rowInstr, vector, vecSize, vecElemType, loc));
   }
   return spvBuilder.createCompositeConstruct(
-      astContext.getExtVectorType(vecElemType, numRows), resultElems);
+      astContext.getExtVectorType(vecElemType, numRows), resultElems, loc);
 }
 
 SpirvInstruction *SpirvEmitter::processNonFpMatrixTimesMatrix(
     QualType lhsType, SpirvInstruction *lhs, QualType rhsType,
-    SpirvInstruction *rhs) {
+    SpirvInstruction *rhs, SourceLocation loc) {
   // This function assumes that the vector element type and matrix elemet type
   // are the same.
   QualType lhsElemType = {}, rhsElemType = {};
@@ -8014,13 +8546,14 @@ SpirvInstruction *SpirvEmitter::processNonFpMatrixTimesMatrix(
   (void)rhsIsMat;
   (void)lhsIsMat;
 
-  auto *rhsTranspose = processNonFpMatrixTranspose(rhsType, rhs);
+  auto *rhsTranspose = processNonFpMatrixTranspose(rhsType, rhs, loc);
   const auto vecType = astContext.getExtVectorType(lhsElemType, lhsNumCols);
   llvm::SmallVector<SpirvInstruction *, 4> resultRows;
   for (uint32_t row = 0; row < lhsNumRows; ++row) {
-    auto *rowInstr = spvBuilder.createCompositeExtract(vecType, lhs, {row});
+    auto *rowInstr =
+        spvBuilder.createCompositeExtract(vecType, lhs, {row}, loc);
     resultRows.push_back(processNonFpVectorTimesMatrix(
-        vecType, rowInstr, rhsType, rhs, rhsTranspose));
+        vecType, rowInstr, rhsType, rhs, loc, rhsTranspose));
   }
 
   // The resulting matrix will have 'lhsNumRows' rows and 'rhsNumCols' columns.
@@ -8028,7 +8561,7 @@ SpirvInstruction *SpirvEmitter::processNonFpMatrixTimesMatrix(
       astContext.getExtVectorType(lhsElemType, rhsNumCols);
   const auto resultType = astContext.getConstantArrayType(
       resultColType, llvm::APInt(32, lhsNumRows), clang::ArrayType::Normal, 0);
-  return spvBuilder.createCompositeConstruct(resultType, resultRows);
+  return spvBuilder.createCompositeConstruct(resultType, resultRows, loc);
 }
 
 SpirvInstruction *SpirvEmitter::processIntrinsicMul(const CallExpr *callExpr) {
@@ -8040,6 +8573,7 @@ SpirvInstruction *SpirvEmitter::processIntrinsicMul(const CallExpr *callExpr) {
   const Expr *arg1 = callExpr->getArg(1);
   const QualType arg0Type = arg0->getType();
   const QualType arg1Type = arg1->getType();
+  auto loc = callExpr->getExprLoc();
 
   // The HLSL mul() function takes 2 arguments. Each argument may be a scalar,
   // vector, or matrix. The frontend ensures that the two arguments have the
@@ -8055,12 +8589,12 @@ SpirvInstruction *SpirvEmitter::processIntrinsicMul(const CallExpr *callExpr) {
       // We can use OpVectorTimesScalar if arguments are floats.
       if (arg0Type->isFloatingType())
         return spvBuilder.createBinaryOp(spv::Op::OpVectorTimesScalar,
-                                         returnType, arg1Id, doExpr(arg0));
+                                         returnType, arg1Id, doExpr(arg0), loc);
 
       // Use OpIMul for integers
       return spvBuilder.createBinaryOp(spv::Op::OpIMul, returnType,
                                        createVectorSplat(arg0, elemCount),
-                                       arg1Id);
+                                       arg1Id, loc);
     }
   }
 
@@ -8074,11 +8608,11 @@ SpirvInstruction *SpirvEmitter::processIntrinsicMul(const CallExpr *callExpr) {
       // We can use OpVectorTimesScalar if arguments are floats.
       if (arg1Type->isFloatingType())
         return spvBuilder.createBinaryOp(spv::Op::OpVectorTimesScalar,
-                                         returnType, arg0Id, doExpr(arg1));
+                                         returnType, arg0Id, doExpr(arg1), loc);
 
       // Use OpIMul for integers
       return spvBuilder.createBinaryOp(spv::Op::OpIMul, returnType, arg0Id,
-                                       createVectorSplat(arg1, elemCount));
+                                       createVectorSplat(arg1, elemCount), loc);
     }
   }
 
@@ -8093,7 +8627,7 @@ SpirvInstruction *SpirvEmitter::processIntrinsicMul(const CallExpr *callExpr) {
   // mul(scalar, scalar)
   if (isScalarType(arg0Type) && isScalarType(arg1Type))
     return spvBuilder.createBinaryOp(translateOp(BO_Mul, arg0Type), returnType,
-                                     arg0Id, arg1Id);
+                                     arg0Id, arg1Id, loc);
 
   // mul(scalar, matrix)
   {
@@ -8103,10 +8637,10 @@ SpirvInstruction *SpirvEmitter::processIntrinsicMul(const CallExpr *callExpr) {
       // and the scalar type are float.
       if (arg0Type->isFloatingType() && elemType->isFloatingType())
         return spvBuilder.createBinaryOp(spv::Op::OpMatrixTimesScalar,
-                                         returnType, arg1Id, arg0Id);
+                                         returnType, arg1Id, arg0Id, loc);
       else
-        return processNonFpScalarTimesMatrix(arg0Type, arg0Id, arg1Type,
-                                             arg1Id);
+        return processNonFpScalarTimesMatrix(arg0Type, arg0Id, arg1Type, arg1Id,
+                                             callExpr->getExprLoc());
     }
   }
 
@@ -8118,10 +8652,10 @@ SpirvInstruction *SpirvEmitter::processIntrinsicMul(const CallExpr *callExpr) {
       // and the scalar type are float.
       if (arg1Type->isFloatingType() && elemType->isFloatingType())
         return spvBuilder.createBinaryOp(spv::Op::OpMatrixTimesScalar,
-                                         returnType, arg0Id, arg1Id);
+                                         returnType, arg0Id, arg1Id, loc);
       else
-        return processNonFpScalarTimesMatrix(arg1Type, arg1Id, arg0Type,
-                                             arg0Id);
+        return processNonFpScalarTimesMatrix(arg1Type, arg1Id, arg0Type, arg0Id,
+                                             callExpr->getExprLoc());
     }
   }
 
@@ -8135,10 +8669,10 @@ SpirvInstruction *SpirvEmitter::processIntrinsicMul(const CallExpr *callExpr) {
 
       if (vecElemType->isFloatingType() && matElemType->isFloatingType())
         return spvBuilder.createBinaryOp(spv::Op::OpMatrixTimesVector,
-                                         returnType, arg1Id, arg0Id);
+                                         returnType, arg1Id, arg0Id, loc);
       else
-        return processNonFpVectorTimesMatrix(arg0Type, arg0Id, arg1Type,
-                                             arg1Id);
+        return processNonFpVectorTimesMatrix(arg0Type, arg0Id, arg1Type, arg1Id,
+                                             callExpr->getExprLoc());
     }
   }
 
@@ -8151,10 +8685,10 @@ SpirvInstruction *SpirvEmitter::processIntrinsicMul(const CallExpr *callExpr) {
       assert(elemCount == numCols);
       if (vecElemType->isFloatingType() && matElemType->isFloatingType())
         return spvBuilder.createBinaryOp(spv::Op::OpVectorTimesMatrix,
-                                         returnType, arg1Id, arg0Id);
+                                         returnType, arg1Id, arg0Id, loc);
       else
-        return processNonFpMatrixTimesVector(arg0Type, arg0Id, arg1Type,
-                                             arg1Id);
+        return processNonFpMatrixTimesVector(arg0Type, arg0Id, arg1Type, arg1Id,
+                                             callExpr->getExprLoc());
     }
   }
 
@@ -8168,10 +8702,10 @@ SpirvInstruction *SpirvEmitter::processIntrinsicMul(const CallExpr *callExpr) {
       assert(lhsCols == rhsRows);
       if (elemType->isFloatingType())
         return spvBuilder.createBinaryOp(spv::Op::OpMatrixTimesMatrix,
-                                         returnType, arg1Id, arg0Id);
+                                         returnType, arg1Id, arg0Id, loc);
       else
-        return processNonFpMatrixTimesMatrix(arg0Type, arg0Id, arg1Type,
-                                             arg1Id);
+        return processNonFpMatrixTimesMatrix(arg0Type, arg0Id, arg1Type, arg1Id,
+                                             callExpr->getExprLoc());
     }
   }
 
@@ -8203,6 +8737,8 @@ SpirvInstruction *SpirvEmitter::processIntrinsicDot(const CallExpr *callExpr) {
   (void)vec1ComponentType;
   (void)vec1Size;
 
+  auto loc = callExpr->getLocStart();
+
   // According to HLSL reference, the dot function only works on integers
   // and floats.
   assert(returnType->isFloatingType() || returnType->isIntegerType());
@@ -8211,13 +8747,13 @@ SpirvInstruction *SpirvEmitter::processIntrinsicDot(const CallExpr *callExpr) {
   // basically the same as regular multiplication of 2 scalars.
   if (vec0Size == 1) {
     const spv::Op spvOp = translateOp(BO_Mul, arg0Type);
-    return spvBuilder.createBinaryOp(spvOp, returnType, arg0Id, arg1Id);
+    return spvBuilder.createBinaryOp(spvOp, returnType, arg0Id, arg1Id, loc);
   }
 
   // If the vectors are of type Float, we can use OpDot.
   if (returnType->isFloatingType()) {
-    return spvBuilder.createBinaryOp(spv::Op::OpDot, returnType, arg0Id,
-                                     arg1Id);
+    return spvBuilder.createBinaryOp(spv::Op::OpDot, returnType, arg0Id, arg1Id,
+                                     loc);
   }
   // Vector component type is Integer (signed or unsigned).
   // Create all instructions necessary to perform a dot product on
@@ -8232,19 +8768,19 @@ SpirvInstruction *SpirvEmitter::processIntrinsicDot(const CallExpr *callExpr) {
 
     // Extract members from the two vectors and multiply them.
     for (unsigned int i = 0; i < vec0Size; ++i) {
-      auto *vec0member =
-          spvBuilder.createCompositeExtract(returnType, arg0Id, {i});
-      auto *vec1member =
-          spvBuilder.createCompositeExtract(returnType, arg1Id, {i});
+      auto *vec0member = spvBuilder.createCompositeExtract(
+          returnType, arg0Id, {i}, arg0->getLocStart());
+      auto *vec1member = spvBuilder.createCompositeExtract(
+          returnType, arg1Id, {i}, arg1->getLocStart());
       auto *multId = spvBuilder.createBinaryOp(multSpvOp, returnType,
-                                               vec0member, vec1member);
+                                               vec0member, vec1member, loc);
       multIds.push_back(multId);
     }
     // Add all the multiplications.
     result = multIds[0];
     for (unsigned int i = 1; i < vec0Size; ++i) {
-      auto *additionId =
-          spvBuilder.createBinaryOp(addSpvOp, returnType, result, multIds[i]);
+      auto *additionId = spvBuilder.createBinaryOp(addSpvOp, returnType, result,
+                                                   multIds[i], loc);
       result = additionId;
     }
     return result;
@@ -8259,24 +8795,25 @@ SpirvInstruction *SpirvEmitter::processIntrinsicRcp(const CallExpr *callExpr) {
   const Expr *arg = callExpr->getArg(0);
   auto *argId = doExpr(arg);
   const QualType argType = arg->getType();
+  auto loc = callExpr->getLocStart();
 
   // For cases with matrix argument.
   QualType elemType = {};
   uint32_t numRows = 0, numCols = 0;
   if (isMxNMatrix(argType, &elemType, &numRows, &numCols)) {
     auto *vecOne = getVecValueOne(elemType, numCols);
-    const auto actOnEachVec = [this, vecOne](uint32_t /*index*/,
-                                             QualType vecType,
-                                             SpirvInstruction *curRow) {
-      return spvBuilder.createBinaryOp(spv::Op::OpFDiv, vecType, vecOne,
-                                       curRow);
+    const auto actOnEachVec = [this, vecOne, loc](uint32_t /*index*/,
+                                                  QualType vecType,
+                                                  SpirvInstruction *curRow) {
+      return spvBuilder.createBinaryOp(spv::Op::OpFDiv, vecType, vecOne, curRow,
+                                       loc);
     };
-    return processEachVectorInMatrix(arg, argId, actOnEachVec);
+    return processEachVectorInMatrix(arg, argId, actOnEachVec, loc);
   }
 
   // For cases with scalar or vector arguments.
   return spvBuilder.createBinaryOp(spv::Op::OpFDiv, returnType,
-                                   getValueOne(argType), argId);
+                                   getValueOne(argType), argId, loc);
 }
 
 SpirvInstruction *
@@ -8287,6 +8824,7 @@ SpirvEmitter::processIntrinsicAllOrAny(const CallExpr *callExpr,
   const QualType returnType = callExpr->getType();
   const Expr *arg = callExpr->getArg(0);
   const QualType argType = arg->getType();
+  const auto loc = callExpr->getExprLoc();
 
   // Handle scalars, vectors of size 1, and 1x1 matrices as arguments.
   // Optimization: can directly cast them to boolean. No need for OpAny/OpAll.
@@ -8295,7 +8833,7 @@ SpirvEmitter::processIntrinsicAllOrAny(const CallExpr *callExpr,
     if (isScalarType(argType, &scalarType) &&
         (scalarType->isBooleanType() || scalarType->isFloatingType() ||
          scalarType->isIntegerType()))
-      return castToBool(doExpr(arg), argType, returnType);
+      return castToBool(doExpr(arg), argType, returnType, loc);
   }
 
   // Handle vectors larger than 1, Mx1 matrices, and 1xN matrices as arguments.
@@ -8306,8 +8844,9 @@ SpirvEmitter::processIntrinsicAllOrAny(const CallExpr *callExpr,
     if (isVectorType(argType, &elemType, &size)) {
       const QualType castToBoolType =
           astContext.getExtVectorType(returnType, size);
-      auto *castedToBool = castToBool(doExpr(arg), argType, castToBoolType);
-      return spvBuilder.createUnaryOp(spvOp, returnType, castedToBool);
+      auto *castedToBool =
+          castToBool(doExpr(arg), argType, castToBoolType, loc);
+      return spvBuilder.createUnaryOp(spvOp, returnType, castedToBool, loc);
     }
   }
 
@@ -8321,26 +8860,27 @@ SpirvEmitter::processIntrinsicAllOrAny(const CallExpr *callExpr,
       llvm::SmallVector<SpirvInstruction *, 4> rowResults;
       for (uint32_t i = 0; i < matRowCount; ++i) {
         // Extract the row which is a float vector of size matColCount.
-        auto *rowFloatVec =
-            spvBuilder.createCompositeExtract(vecType, matrix, {i});
+        auto *rowFloatVec = spvBuilder.createCompositeExtract(
+            vecType, matrix, {i}, arg->getLocStart());
         // Cast the float vector to boolean vector.
         const auto rowFloatQualType =
             astContext.getExtVectorType(elemType, matColCount);
         const auto rowBoolQualType =
             astContext.getExtVectorType(returnType, matColCount);
-        auto *rowBoolVec =
-            castToBool(rowFloatVec, rowFloatQualType, rowBoolQualType);
+        auto *rowBoolVec = castToBool(rowFloatVec, rowFloatQualType,
+                                      rowBoolQualType, arg->getLocStart());
         // Perform OpAny/OpAll on the boolean vector.
         rowResults.push_back(
-            spvBuilder.createUnaryOp(spvOp, returnType, rowBoolVec));
+            spvBuilder.createUnaryOp(spvOp, returnType, rowBoolVec, loc));
       }
       // Create a new vector that is the concatenation of results of all rows.
       const QualType vecOfBools =
           astContext.getExtVectorType(astContext.BoolTy, matRowCount);
-      auto *row = spvBuilder.createCompositeConstruct(vecOfBools, rowResults);
+      auto *row =
+          spvBuilder.createCompositeConstruct(vecOfBools, rowResults, loc);
 
       // Run OpAny/OpAll on the newly-created vector.
-      return spvBuilder.createUnaryOp(spvOp, returnType, row);
+      return spvBuilder.createUnaryOp(spvOp, returnType, row, loc);
     }
   }
 
@@ -8384,6 +8924,7 @@ SpirvEmitter::processIntrinsicAsType(const CallExpr *callExpr) {
   const uint32_t numArgs = callExpr->getNumArgs();
   const Expr *arg0 = callExpr->getArg(0);
   const QualType argType = arg0->getType();
+  const auto loc = callExpr->getExprLoc();
 
   // Method 3 return type may be the same as arg type, so it would be a no-op.
   if (isSameType(astContext, returnType, argType))
@@ -8397,7 +8938,8 @@ SpirvEmitter::processIntrinsicAsType(const CallExpr *callExpr) {
     uint32_t numRows = 0, numCols = 0;
     // For non-matrix arguments (scalar or vector), just do an OpBitCast.
     if (!isMxNMatrix(argType, &fromElemType, &numRows, &numCols)) {
-      return spvBuilder.createUnaryOp(spv::Op::OpBitcast, returnType, argInstr);
+      return spvBuilder.createUnaryOp(spv::Op::OpBitcast, returnType, argInstr,
+                                      loc);
     }
 
     // Input or output type is a matrix.
@@ -8406,12 +8948,12 @@ SpirvEmitter::processIntrinsicAsType(const CallExpr *callExpr) {
     const auto fromVecType = astContext.getExtVectorType(fromElemType, numCols);
     const auto toVecType = astContext.getExtVectorType(toElemType, numCols);
     for (uint32_t row = 0; row < numRows; ++row) {
-      auto *rowInstr =
-          spvBuilder.createCompositeExtract(fromVecType, argInstr, {row});
-      castedRows.push_back(
-          spvBuilder.createUnaryOp(spv::Op::OpBitcast, toVecType, rowInstr));
+      auto *rowInstr = spvBuilder.createCompositeExtract(
+          fromVecType, argInstr, {row}, arg0->getLocStart());
+      castedRows.push_back(spvBuilder.createUnaryOp(spv::Op::OpBitcast,
+                                                    toVecType, rowInstr, loc));
     }
-    return spvBuilder.createCompositeConstruct(returnType, castedRows);
+    return spvBuilder.createCompositeConstruct(returnType, castedRows, loc);
   }
   case 2: {
     auto *lowbits = doExpr(arg0);
@@ -8421,18 +8963,19 @@ SpirvEmitter::processIntrinsicAsType(const CallExpr *callExpr) {
     // Handling Method 4
     if (argType->isUnsignedIntegerType()) {
       const auto uintVec2Type = astContext.getExtVectorType(uintType, 2);
-      auto *operand = spvBuilder.createCompositeConstruct(uintVec2Type,
-                                                          {lowbits, highbits});
-      return spvBuilder.createUnaryOp(spv::Op::OpBitcast, doubleType, operand);
+      auto *operand = spvBuilder.createCompositeConstruct(
+          uintVec2Type, {lowbits, highbits}, loc);
+      return spvBuilder.createUnaryOp(spv::Op::OpBitcast, doubleType, operand,
+                                      loc);
     }
     // Handling Method 5
     else {
       const auto uintVec4Type = astContext.getExtVectorType(uintType, 4);
       const auto doubleVec2Type = astContext.getExtVectorType(doubleType, 2);
-      auto *operand = spvBuilder.createVectorShuffle(uintVec4Type, lowbits,
-                                                     highbits, {0, 2, 1, 3});
+      auto *operand = spvBuilder.createVectorShuffle(
+          uintVec4Type, lowbits, highbits, {0, 2, 1, 3}, loc);
       return spvBuilder.createUnaryOp(spv::Op::OpBitcast, doubleVec2Type,
-                                      operand);
+                                      operand, loc);
     }
   }
   case 3: {
@@ -8443,16 +8986,19 @@ SpirvEmitter::processIntrinsicAsType(const CallExpr *callExpr) {
     const auto uintType = astContext.UnsignedIntTy;
     const auto uintVec2Type = astContext.getExtVectorType(uintType, 2);
     auto *vecResult =
-        spvBuilder.createUnaryOp(spv::Op::OpBitcast, uintVec2Type, value);
-    spvBuilder.createStore(
-        lowbits, spvBuilder.createCompositeExtract(uintType, vecResult, {0}));
-    spvBuilder.createStore(
-        highbits, spvBuilder.createCompositeExtract(uintType, vecResult, {1}));
+        spvBuilder.createUnaryOp(spv::Op::OpBitcast, uintVec2Type, value, loc);
+    spvBuilder.createStore(lowbits,
+                           spvBuilder.createCompositeExtract(
+                               uintType, vecResult, {0}, arg0->getLocStart()),
+                           loc);
+    spvBuilder.createStore(highbits,
+                           spvBuilder.createCompositeExtract(
+                               uintType, vecResult, {1}, arg0->getLocStart()),
+                           loc);
     return nullptr;
   }
   default:
-    emitError("unrecognized signature for %0 intrinsic function",
-              callExpr->getExprLoc())
+    emitError("unrecognized signature for %0 intrinsic function", loc)
         << callExpr->getDirectCallee()->getName();
     return nullptr;
   }
@@ -8466,13 +9012,14 @@ SpirvEmitter::processD3DCOLORtoUBYTE4(const CallExpr *callExpr) {
   const auto arg = callExpr->getArg(0);
   auto *argId = doExpr(arg);
   const auto argType = arg->getType();
+  auto loc = callExpr->getLocStart();
   auto *swizzle =
-      spvBuilder.createVectorShuffle(argType, argId, argId, {2, 1, 0, 3});
+      spvBuilder.createVectorShuffle(argType, argId, argId, {2, 1, 0, 3}, loc);
   auto *scaled = spvBuilder.createBinaryOp(
       spv::Op::OpVectorTimesScalar, argType, swizzle,
-      spvBuilder.getConstantFloat(astContext.FloatTy, llvm::APFloat(255.002f)));
-  return castToInt(scaled, arg->getType(), callExpr->getType(),
-                   callExpr->getExprLoc());
+      spvBuilder.getConstantFloat(astContext.FloatTy, llvm::APFloat(255.002f)),
+      loc);
+  return castToInt(scaled, arg->getType(), callExpr->getType(), loc);
 }
 
 SpirvInstruction *
@@ -8482,14 +9029,15 @@ SpirvEmitter::processIntrinsicIsFinite(const CallExpr *callExpr) {
   // isFinite = !(isNan || isInf)
   const auto arg = doExpr(callExpr->getArg(0));
   const auto returnType = callExpr->getType();
+  const auto loc = callExpr->getExprLoc();
   const auto isNan =
-      spvBuilder.createUnaryOp(spv::Op::OpIsNan, returnType, arg);
+      spvBuilder.createUnaryOp(spv::Op::OpIsNan, returnType, arg, loc);
   const auto isInf =
-      spvBuilder.createUnaryOp(spv::Op::OpIsInf, returnType, arg);
-  const auto isNanOrInf =
-      spvBuilder.createBinaryOp(spv::Op::OpLogicalOr, returnType, isNan, isInf);
-  return spvBuilder.createUnaryOp(spv::Op::OpLogicalNot, returnType,
-                                  isNanOrInf);
+      spvBuilder.createUnaryOp(spv::Op::OpIsInf, returnType, arg, loc);
+  const auto isNanOrInf = spvBuilder.createBinaryOp(
+      spv::Op::OpLogicalOr, returnType, isNan, isInf, loc);
+  return spvBuilder.createUnaryOp(spv::Op::OpLogicalNot, returnType, isNanOrInf,
+                                  loc);
 }
 
 SpirvInstruction *
@@ -8507,13 +9055,13 @@ SpirvEmitter::processIntrinsicSinCos(const CallExpr *callExpr) {
   auto *sin =
       processIntrinsicUsingGLSLInst(sincosExpr, GLSLstd450::GLSLstd450Sin,
                                     /*actPerRowForMatrices*/ true, srcLoc);
-  spvBuilder.createStore(doExpr(callExpr->getArg(1)), sin);
+  spvBuilder.createStore(doExpr(callExpr->getArg(1)), sin, srcLoc);
 
   // Perform Cos and store results in argument 2.
   auto *cos =
       processIntrinsicUsingGLSLInst(sincosExpr, GLSLstd450::GLSLstd450Cos,
                                     /*actPerRowForMatrices*/ true, srcLoc);
-  spvBuilder.createStore(doExpr(callExpr->getArg(2)), cos);
+  spvBuilder.createStore(doExpr(callExpr->getArg(2)), cos, srcLoc);
   return nullptr;
 }
 
@@ -8526,16 +9074,16 @@ SpirvEmitter::processIntrinsicSaturate(const CallExpr *callExpr) {
   const QualType returnType = callExpr->getType();
   auto *glslInstSet = spvBuilder.getGLSLExtInstSet();
 
-  if (argType->isFloatingType()) {
-    auto *floatZero = getValueZero(argType);
-    auto *floatOne = getValueOne(argType);
+  QualType elemType = {};
+  uint32_t vecSize = 0;
+  if (isScalarType(argType, &elemType)) {
+    auto *floatZero = getValueZero(elemType);
+    auto *floatOne = getValueOne(elemType);
     return spvBuilder.createExtInst(returnType, glslInstSet,
                                     GLSLstd450::GLSLstd450FClamp,
                                     {argId, floatZero, floatOne}, loc);
   }
 
-  QualType elemType = {};
-  uint32_t vecSize = 0;
   if (isVectorType(argType, &elemType, &vecSize)) {
     auto *vecZero = getVecValueZero(elemType, vecSize);
     auto *vecOne = getVecValueOne(elemType, vecSize);
@@ -8555,7 +9103,7 @@ SpirvEmitter::processIntrinsicSaturate(const CallExpr *callExpr) {
                                       GLSLstd450::GLSLstd450FClamp,
                                       {curRow, vecZero, vecOne}, loc);
     };
-    return processEachVectorInMatrix(arg, argId, actOnEachVec);
+    return processEachVectorInMatrix(arg, argId, actOnEachVec, loc);
   }
 
   emitError("invalid argument type passed to saturate intrinsic function",
@@ -8583,13 +9131,13 @@ SpirvEmitter::processIntrinsicFloatSign(const CallExpr *callExpr) {
           return spvBuilder.createExtInst(
               vecType, glslInstSet, GLSLstd450::GLSLstd450FSign, {curRow}, loc);
         };
-    floatSign = processEachVectorInMatrix(arg, argId, actOnEachVec);
+    floatSign = processEachVectorInMatrix(arg, argId, actOnEachVec, loc);
   } else {
     floatSign = spvBuilder.createExtInst(
         argType, glslInstSet, GLSLstd450::GLSLstd450FSign, {argId}, loc);
   }
 
-  return castToInt(floatSign, arg->getType(), returnType, arg->getExprLoc());
+  return castToInt(floatSign, arg->getType(), returnType, arg->getLocStart());
 }
 
 SpirvInstruction *
@@ -8612,21 +9160,22 @@ SpirvEmitter::processIntrinsicF16ToF32(const CallExpr *callExpr) {
     llvm::SmallVector<SpirvInstruction *, 4> elements;
 
     for (uint32_t i = 0; i < elemCount; ++i) {
-      auto *srcElem = spvBuilder.createCompositeExtract(u32Type, argId, {i});
+      auto *srcElem = spvBuilder.createCompositeExtract(u32Type, argId, {i},
+                                                        arg->getLocStart());
       auto *convert = spvBuilder.createExtInst(
           v2f32Type, glsl, GLSLstd450::GLSLstd450UnpackHalf2x16, srcElem, loc);
       elements.push_back(
-          spvBuilder.createCompositeExtract(f32Type, convert, {0}));
+          spvBuilder.createCompositeExtract(f32Type, convert, {0}, loc));
     }
     return spvBuilder.createCompositeConstruct(
-        astContext.getExtVectorType(f32Type, elemCount), elements);
+        astContext.getExtVectorType(f32Type, elemCount), elements, loc);
   }
 
   auto *convert = spvBuilder.createExtInst(
       v2f32Type, glsl, GLSLstd450::GLSLstd450UnpackHalf2x16, argId, loc);
   // f16tof32() converts the float16 stored in the low-half of the uint to
   // a float. So just need to return the first component.
-  return spvBuilder.createCompositeExtract(f32Type, convert, {0});
+  return spvBuilder.createCompositeExtract(f32Type, convert, {0}, loc);
 }
 
 SpirvInstruction *
@@ -8649,20 +9198,22 @@ SpirvEmitter::processIntrinsicF32ToF16(const CallExpr *callExpr) {
     llvm::SmallVector<SpirvInstruction *, 4> elements;
 
     for (uint32_t i = 0; i < elemCount; ++i) {
-      auto *srcElem = spvBuilder.createCompositeExtract(f32Type, argId, {i});
+      auto *srcElem = spvBuilder.createCompositeExtract(f32Type, argId, {i},
+                                                        arg->getLocStart());
       auto *srcVec =
-          spvBuilder.createCompositeConstruct(v2f32Type, {srcElem, zero});
+          spvBuilder.createCompositeConstruct(v2f32Type, {srcElem, zero}, loc);
 
       elements.push_back(spvBuilder.createExtInst(
           u32Type, glsl, GLSLstd450::GLSLstd450PackHalf2x16, srcVec, loc));
     }
     return spvBuilder.createCompositeConstruct(
-        astContext.getExtVectorType(u32Type, elemCount), elements);
+        astContext.getExtVectorType(u32Type, elemCount), elements, loc);
   }
 
   // f16tof32() stores the float into the low-half of the uint. So we need
   // to supply another zero to take the other half.
-  auto *srcVec = spvBuilder.createCompositeConstruct(v2f32Type, {argId, zero});
+  auto *srcVec =
+      spvBuilder.createCompositeConstruct(v2f32Type, {argId, zero}, loc);
   return spvBuilder.createExtInst(
       u32Type, glsl, GLSLstd450::GLSLstd450PackHalf2x16, srcVec, loc);
 }
@@ -8689,6 +9240,7 @@ SpirvInstruction *SpirvEmitter::processIntrinsicUsingSpirvInst(
       break;
     }
 
+  const auto loc = callExpr->getExprLoc();
   const QualType returnType = callExpr->getType();
   if (callExpr->getNumArgs() == 1u) {
     const Expr *arg = callExpr->getArg(0);
@@ -8697,34 +9249,36 @@ SpirvInstruction *SpirvEmitter::processIntrinsicUsingSpirvInst(
     // If the instruction does not operate on matrices, we can perform the
     // instruction on each vector of the matrix.
     if (actPerRowForMatrices && isMxNMatrix(arg->getType())) {
-      const auto actOnEachVec = [this, opcode](uint32_t /*index*/,
-                                               QualType vecType,
-                                               SpirvInstruction *curRow) {
-        return spvBuilder.createUnaryOp(opcode, vecType, curRow);
+      const auto actOnEachVec = [this, opcode, loc](uint32_t /*index*/,
+                                                    QualType vecType,
+                                                    SpirvInstruction *curRow) {
+        return spvBuilder.createUnaryOp(opcode, vecType, curRow, loc);
       };
-      return processEachVectorInMatrix(arg, argId, actOnEachVec);
+      return processEachVectorInMatrix(arg, argId, actOnEachVec, loc);
     }
-    return spvBuilder.createUnaryOp(opcode, returnType, argId);
+    return spvBuilder.createUnaryOp(opcode, returnType, argId, loc);
   } else if (callExpr->getNumArgs() == 2u) {
     const Expr *arg0 = callExpr->getArg(0);
     auto *arg0Id = doExpr(arg0);
     auto *arg1Id = doExpr(callExpr->getArg(1));
+    const auto arg1Loc = callExpr->getArg(1)->getLocStart();
     // If the instruction does not operate on matrices, we can perform the
     // instruction on each vector of the matrix.
     if (actPerRowForMatrices && isMxNMatrix(arg0->getType())) {
-      const auto actOnEachVec = [this, opcode,
-                                 arg1Id](uint32_t index, QualType vecType,
-                                         SpirvInstruction *arg0Row) {
-        auto *arg1Row =
-            spvBuilder.createCompositeExtract(vecType, arg1Id, {index});
-        return spvBuilder.createBinaryOp(opcode, vecType, arg0Row, arg1Row);
+      const auto actOnEachVec = [this, opcode, arg1Id, loc,
+                                 arg1Loc](uint32_t index, QualType vecType,
+                                          SpirvInstruction *arg0Row) {
+        auto *arg1Row = spvBuilder.createCompositeExtract(vecType, arg1Id,
+                                                          {index}, arg1Loc);
+        return spvBuilder.createBinaryOp(opcode, vecType, arg0Row, arg1Row,
+                                         loc);
       };
-      return processEachVectorInMatrix(arg0, arg0Id, actOnEachVec);
+      return processEachVectorInMatrix(arg0, arg0Id, actOnEachVec, loc);
     }
-    return spvBuilder.createBinaryOp(opcode, returnType, arg0Id, arg1Id);
+    return spvBuilder.createBinaryOp(opcode, returnType, arg0Id, arg1Id, loc);
   }
 
-  emitError("unsupported %0 intrinsic function", callExpr->getExprLoc())
+  emitError("unsupported %0 intrinsic function", loc)
       << cast<DeclRefExpr>(callExpr->getCallee())->getNameInfo().getAsString();
   return nullptr;
 }
@@ -8749,7 +9303,7 @@ SpirvInstruction *SpirvEmitter::processIntrinsicUsingGLSLInst(
         return spvBuilder.createExtInst(vecType, glslInstSet, opcode,
                                         {curRowInstr}, loc);
       };
-      return processEachVectorInMatrix(arg, argInstr, actOnEachVec);
+      return processEachVectorInMatrix(arg, argInstr, actOnEachVec, loc);
     }
     return spvBuilder.createExtInst(returnType, glslInstSet, opcode, {argInstr},
                                     loc);
@@ -8757,18 +9311,19 @@ SpirvInstruction *SpirvEmitter::processIntrinsicUsingGLSLInst(
     const Expr *arg0 = callExpr->getArg(0);
     auto *arg0Instr = doExpr(arg0);
     auto *arg1Instr = doExpr(callExpr->getArg(1));
+    const auto arg1Loc = callExpr->getArg(1)->getLocStart();
     // If the instruction does not operate on matrices, we can perform the
     // instruction on each vector of the matrix.
     if (actPerRowForMatrices && isMxNMatrix(arg0->getType())) {
-      const auto actOnEachVec = [this, loc, glslInstSet, opcode,
-                                 arg1Instr](uint32_t index, QualType vecType,
-                                            SpirvInstruction *arg0RowInstr) {
-        auto *arg1RowInstr =
-            spvBuilder.createCompositeExtract(vecType, arg1Instr, {index});
+      const auto actOnEachVec = [this, loc, glslInstSet, opcode, arg1Instr,
+                                 arg1Loc](uint32_t index, QualType vecType,
+                                          SpirvInstruction *arg0RowInstr) {
+        auto *arg1RowInstr = spvBuilder.createCompositeExtract(
+            vecType, arg1Instr, {index}, arg1Loc);
         return spvBuilder.createExtInst(vecType, glslInstSet, opcode,
                                         {arg0RowInstr, arg1RowInstr}, loc);
       };
-      return processEachVectorInMatrix(arg0, arg0Instr, actOnEachVec);
+      return processEachVectorInMatrix(arg0, arg0Instr, actOnEachVec, loc);
     }
     return spvBuilder.createExtInst(returnType, glslInstSet, opcode,
                                     {arg0Instr, arg1Instr}, loc);
@@ -8777,21 +9332,24 @@ SpirvInstruction *SpirvEmitter::processIntrinsicUsingGLSLInst(
     auto *arg0Instr = doExpr(arg0);
     auto *arg1Instr = doExpr(callExpr->getArg(1));
     auto *arg2Instr = doExpr(callExpr->getArg(2));
+    auto arg1Loc = callExpr->getArg(1)->getLocStart();
+    auto arg2Loc = callExpr->getArg(2)->getLocStart();
     // If the instruction does not operate on matrices, we can perform the
     // instruction on each vector of the matrix.
     if (actPerRowForMatrices && isMxNMatrix(arg0->getType())) {
       const auto actOnEachVec = [this, loc, glslInstSet, opcode, arg1Instr,
-                                 arg2Instr](uint32_t index, QualType vecType,
-                                            SpirvInstruction *arg0RowInstr) {
-        auto *arg1RowInstr =
-            spvBuilder.createCompositeExtract(vecType, arg1Instr, {index});
-        auto *arg2RowInstr =
-            spvBuilder.createCompositeExtract(vecType, arg2Instr, {index});
+                                 arg2Instr, arg1Loc,
+                                 arg2Loc](uint32_t index, QualType vecType,
+                                          SpirvInstruction *arg0RowInstr) {
+        auto *arg1RowInstr = spvBuilder.createCompositeExtract(
+            vecType, arg1Instr, {index}, arg1Loc);
+        auto *arg2RowInstr = spvBuilder.createCompositeExtract(
+            vecType, arg2Instr, {index}, arg2Loc);
         return spvBuilder.createExtInst(
             vecType, glslInstSet, opcode,
             {arg0RowInstr, arg1RowInstr, arg2RowInstr}, loc);
       };
-      return processEachVectorInMatrix(arg0, arg0Instr, actOnEachVec);
+      return processEachVectorInMatrix(arg0, arg0Instr, actOnEachVec, loc);
     }
     return spvBuilder.createExtInst(returnType, glslInstSet, opcode,
                                     {arg0Instr, arg1Instr, arg2Instr}, loc);
@@ -8807,23 +9365,25 @@ SpirvEmitter::processIntrinsicLog10(const CallExpr *callExpr) {
   // Since there is no log10 instruction in SPIR-V, we can use:
   // log10(x) = log2(x) * ( 1 / log2(10) )
   // 1 / log2(10) = 0.30103
+  auto loc = callExpr->getExprLoc();
   auto *scale =
       spvBuilder.getConstantFloat(astContext.FloatTy, llvm::APFloat(0.30103f));
   auto *log2 = processIntrinsicUsingGLSLInst(
-      callExpr, GLSLstd450::GLSLstd450Log2, true, callExpr->getExprLoc());
+      callExpr, GLSLstd450::GLSLstd450Log2, true, loc);
   const auto returnType = callExpr->getType();
   spv::Op scaleOp = isScalarType(returnType)
                         ? spv::Op::OpFMul
                         : isVectorType(returnType)
                               ? spv::Op::OpVectorTimesScalar
                               : spv::Op::OpMatrixTimesScalar;
-  return spvBuilder.createBinaryOp(scaleOp, returnType, log2, scale);
+  return spvBuilder.createBinaryOp(scaleOp, returnType, log2, scale, loc);
 }
 
 SpirvInstruction *SpirvEmitter::processRayBuiltins(const CallExpr *callExpr,
                                                    hlsl::IntrinsicOp op) {
   spv::BuiltIn builtin = spv::BuiltIn::Max;
   bool transposeMatrix = false;
+  const auto loc = callExpr->getExprLoc();
   switch (op) {
   case hlsl::IntrinsicOp::IOP_DispatchRaysDimensions:
     builtin = spv::BuiltIn::LaunchSizeNV;
@@ -8875,7 +9435,7 @@ SpirvInstruction *SpirvEmitter::processRayBuiltins(const CallExpr *callExpr,
     builtin = spv::BuiltIn::WorldToObjectNV;
     break;
   default:
-    emitError("ray intrinsic function unimplemented", callExpr->getExprLoc());
+    emitError("ray intrinsic function unimplemented", loc);
     return nullptr;
   }
 
@@ -8895,11 +9455,11 @@ SpirvInstruction *SpirvEmitter::processRayBuiltins(const CallExpr *callExpr,
                                     templateDecl, astContext.FloatTy, 4, 3);
   }
   SpirvInstruction *retVal =
-      declIdMapper.getBuiltinVar(builtin, builtinType, callExpr->getExprLoc());
-  retVal = spvBuilder.createLoad(builtinType, retVal);
+      declIdMapper.getBuiltinVar(builtin, builtinType, loc);
+  retVal = spvBuilder.createLoad(builtinType, retVal, loc);
   if (transposeMatrix)
     retVal = spvBuilder.createUnaryOp(spv::Op::OpTranspose, callExpr->getType(),
-                                      retVal);
+                                      retVal, loc);
   return retVal;
 }
 
@@ -8940,10 +9500,12 @@ SpirvInstruction *SpirvEmitter::processReportHit(const CallExpr *callExpr) {
 
   // Copy argument to stage variable
   const auto hitAttributeArgInst =
-      declIdMapper.getDeclEvalInfo(hitAttributeArg);
+      declIdMapper.getDeclEvalInfo(hitAttributeArg, callExpr->getExprLoc());
   auto tempLoad =
-      spvBuilder.createLoad(hitAttributeArg->getType(), hitAttributeArgInst);
-  spvBuilder.createStore(hitAttributeStageVar, tempLoad);
+      spvBuilder.createLoad(hitAttributeArg->getType(), hitAttributeArgInst,
+                            hitAttributeArg->getLocStart());
+  spvBuilder.createStore(hitAttributeStageVar, tempLoad,
+                         callExpr->getExprLoc());
 
   // SPIR-V Instruction :
   // bool OpReportIntersection(<id> float Hit, <id> uint HitKind)
@@ -8954,6 +9516,7 @@ SpirvInstruction *SpirvEmitter::processReportHit(const CallExpr *callExpr) {
                                           astContext.BoolTy, reportHitArgs,
                                           callExpr->getExprLoc());
 }
+
 void SpirvEmitter::processCallShader(const CallExpr *callExpr) {
   SpirvInstruction *callDataLocInst = nullptr;
   SpirvInstruction *callDataStageVar = nullptr;
@@ -8998,10 +9561,11 @@ void SpirvEmitter::processCallShader(const CallExpr *callExpr) {
   assert(callDataStageVar && callDataArg);
 
   // Copy argument to stage variable
-  const auto callDataArgInst = declIdMapper.getDeclEvalInfo(callDataArg);
-  auto tempLoad =
-      spvBuilder.createLoad(callDataArg->getType(), callDataArgInst);
-  spvBuilder.createStore(callDataStageVar, tempLoad);
+  const auto callDataArgInst =
+      declIdMapper.getDeclEvalInfo(callDataArg, callExpr->getExprLoc());
+  auto tempLoad = spvBuilder.createLoad(callDataArg->getType(), callDataArgInst,
+                                        callDataArg->getLocStart());
+  spvBuilder.createStore(callDataStageVar, tempLoad, callExpr->getExprLoc());
 
   // SPIR-V Instruction
   // void OpExecuteCallable(<id> int SBT Index, <id> uint Callable Data Location
@@ -9014,15 +9578,17 @@ void SpirvEmitter::processCallShader(const CallExpr *callExpr) {
                                    callShaderArgs, callExpr->getExprLoc());
 
   // Copy data back to argument
-  tempLoad = spvBuilder.createLoad(callDataArg->getType(), callDataStageVar);
-  spvBuilder.createStore(callDataArgInst, tempLoad);
+  tempLoad = spvBuilder.createLoad(callDataArg->getType(), callDataStageVar,
+                                   callDataArg->getLocStart());
+  spvBuilder.createStore(callDataArgInst, tempLoad, callExpr->getExprLoc());
   return;
 }
+
 void SpirvEmitter::processTraceRay(const CallExpr *callExpr) {
-  SpirvInstruction *payloadLocInst = nullptr;
-  SpirvInstruction *payloadStageVar = nullptr;
-  const VarDecl *payloadArg = nullptr;
-  QualType payloadType;
+  SpirvInstruction *rayPayloadLocInst = nullptr;
+  SpirvInstruction *rayPayloadStageVar = nullptr;
+  const VarDecl *rayPayloadArg = nullptr;
+  QualType rayPayloadType;
 
   const auto args = callExpr->getArgs();
 
@@ -9032,7 +9598,7 @@ void SpirvEmitter::processTraceRay(const CallExpr *callExpr) {
   }
 
   // HLSL Func
-  // template<typename Payload>
+  // template<typename RayPayload>
   // void TraceRay(RaytracingAccelerationStructure rs,
   //              uint rayflags,
   //              uint InstanceInclusionMask
@@ -9040,55 +9606,59 @@ void SpirvEmitter::processTraceRay(const CallExpr *callExpr) {
   //              uint MultiplierForGeometryContributionToHitGroupIndex,
   //              uint MissShaderIndex,
   //              RayDesc ray,
-  //              inout Payload p)
+  //              inout RayPayload p)
   // where RayDesc = {float3 origin, float tMin, float3 direction, float tMax}
 
   if (const auto *implCastExpr = dyn_cast<CastExpr>(args[7])) {
     if (const auto *arg = dyn_cast<DeclRefExpr>(implCastExpr->getSubExpr())) {
       if (const auto *varDecl = dyn_cast<VarDecl>(arg->getDecl())) {
-        payloadType = varDecl->getType();
-        payloadArg = varDecl;
-        const auto payloadPair = payloadMap.find(payloadType);
-        // Check if same type of payload stage variable was already
+        rayPayloadType = varDecl->getType();
+        rayPayloadArg = varDecl;
+        const auto rayPayloadPair = rayPayloadMap.find(rayPayloadType);
+        // Check if same type of rayPayload stage variable was already
         // created, if so re-use
-        if (payloadPair == payloadMap.end()) {
-          int numPayloadVars = payloadMap.size();
-          payloadStageVar = declIdMapper.createRayTracingNVStageVar(
+        if (rayPayloadPair == rayPayloadMap.end()) {
+          int numPayloadVars = rayPayloadMap.size();
+          rayPayloadStageVar = declIdMapper.createRayTracingNVStageVar(
               spv::StorageClass::RayPayloadNV, varDecl);
           // Decorate unique location id for each created stage var
-          spvBuilder.decorateLocation(payloadStageVar, numPayloadVars);
-          payloadLocInst = spvBuilder.getConstantInt(
+          spvBuilder.decorateLocation(rayPayloadStageVar, numPayloadVars);
+          rayPayloadLocInst = spvBuilder.getConstantInt(
               astContext.UnsignedIntTy, llvm::APInt(32, numPayloadVars));
-          payloadMap[payloadType] =
-              std::make_pair(payloadStageVar, payloadLocInst);
+          rayPayloadMap[rayPayloadType] =
+              std::make_pair(rayPayloadStageVar, rayPayloadLocInst);
         } else {
-          payloadStageVar = payloadPair->second.first;
-          payloadLocInst = payloadPair->second.second;
+          rayPayloadStageVar = rayPayloadPair->second.first;
+          rayPayloadLocInst = rayPayloadPair->second.second;
         }
       }
     }
   }
 
-  assert(payloadStageVar && payloadArg);
+  assert(rayPayloadStageVar && rayPayloadArg);
 
   const auto floatType = astContext.FloatTy;
   const auto vecType = astContext.getExtVectorType(astContext.FloatTy, 3);
 
   // Extract the ray description to match SPIR-V
   SpirvInstruction *rayDescArg = doExpr(args[6]);
+  const auto loc = args[6]->getLocStart();
   const auto origin =
-      spvBuilder.createCompositeExtract(vecType, rayDescArg, {0});
+      spvBuilder.createCompositeExtract(vecType, rayDescArg, {0}, loc);
   const auto tMin =
-      spvBuilder.createCompositeExtract(floatType, rayDescArg, {1});
+      spvBuilder.createCompositeExtract(floatType, rayDescArg, {1}, loc);
   const auto direction =
-      spvBuilder.createCompositeExtract(vecType, rayDescArg, {2});
+      spvBuilder.createCompositeExtract(vecType, rayDescArg, {2}, loc);
   const auto tMax =
-      spvBuilder.createCompositeExtract(floatType, rayDescArg, {3});
+      spvBuilder.createCompositeExtract(floatType, rayDescArg, {3}, loc);
 
   // Copy argument to stage variable
-  const auto payloadArgInst = declIdMapper.getDeclEvalInfo(payloadArg);
-  auto tempLoad = spvBuilder.createLoad(payloadArg->getType(), payloadArgInst);
-  spvBuilder.createStore(payloadStageVar, tempLoad);
+  const auto rayPayloadArgInst =
+      declIdMapper.getDeclEvalInfo(rayPayloadArg, rayPayloadArg->getLocStart());
+  auto tempLoad =
+      spvBuilder.createLoad(rayPayloadArg->getType(), rayPayloadArgInst,
+                            rayPayloadArg->getLocStart());
+  spvBuilder.createStore(rayPayloadStageVar, tempLoad, callExpr->getExprLoc());
 
   // SPIR-V Instruction
   // void OpTraceNV ( <id> AccelerationStructureNV acStruct,
@@ -9101,7 +9671,7 @@ void SpirvEmitter::processTraceRay(const CallExpr *callExpr) {
   //                 <id> float Ray Tmin,
   //                 <id> vec3 Ray Direction,
   //                 <id> float Ray Tmax,
-  //                 <id> uint Payload number)
+  //                 <id> uint RayPayload number)
 
   llvm::SmallVector<SpirvInstruction *, 8> traceArgs;
   for (int ii = 0; ii < 6; ii++) {
@@ -9112,15 +9682,77 @@ void SpirvEmitter::processTraceRay(const CallExpr *callExpr) {
   traceArgs.push_back(tMin);
   traceArgs.push_back(direction);
   traceArgs.push_back(tMax);
-  traceArgs.push_back(payloadLocInst);
+  traceArgs.push_back(rayPayloadLocInst);
 
   spvBuilder.createRayTracingOpsNV(spv::Op::OpTraceNV, QualType(), traceArgs,
                                    callExpr->getExprLoc());
 
   // Copy arguments back to stage variable
-  tempLoad = spvBuilder.createLoad(payloadArg->getType(), payloadStageVar);
-  spvBuilder.createStore(payloadArgInst, tempLoad);
+  tempLoad = spvBuilder.createLoad(rayPayloadArg->getType(), rayPayloadStageVar,
+                                   rayPayloadArg->getLocStart());
+  spvBuilder.createStore(rayPayloadArgInst, tempLoad, callExpr->getExprLoc());
   return;
+}
+
+void SpirvEmitter::processDispatchMesh(const CallExpr *callExpr) {
+  // HLSL Func - void DispatchMesh(uint ThreadGroupCountX,
+  //                               uint ThreadGroupCountY,
+  //                               uint ThreadGroupCountZ,
+  //                               groupshared <structType> MeshPayload);
+  assert(callExpr->getNumArgs() == 4);
+  const auto args = callExpr->getArgs();
+  const auto loc = callExpr->getExprLoc();
+
+  // 1) create a barrier GroupMemoryBarrierWithGroupSync().
+  processIntrinsicMemoryBarrier(callExpr,
+                                /*isDevice*/ false,
+                                /*groupSync*/ true,
+                                /*isAllBarrier*/ false);
+
+  // 2) set TaskCountNV = threadX * threadY * threadZ.
+  auto *threadX = doExpr(args[0]);
+  auto *threadY = doExpr(args[1]);
+  auto *threadZ = doExpr(args[2]);
+  auto *var = declIdMapper.getBuiltinVar(spv::BuiltIn::TaskCountNV,
+                                         astContext.UnsignedIntTy, loc);
+  auto *taskCount = spvBuilder.createBinaryOp(
+      spv::Op::OpIMul, astContext.UnsignedIntTy, threadX,
+      spvBuilder.createBinaryOp(spv::Op::OpIMul, astContext.UnsignedIntTy,
+                                threadY, threadZ, loc),
+      loc);
+  spvBuilder.createStore(var, taskCount, loc);
+
+  // 3) create PerTaskNV out attribute block and store MeshPayload info.
+  const auto *sigPoint =
+      hlsl::SigPoint::GetSigPoint(hlsl::DXIL::SigPointKind::MSOut);
+  spv::StorageClass sc = spv::StorageClass::Output;
+  auto *payloadArg = doExpr(args[3]);
+  bool isValid = false;
+  if (const auto *implCastExpr = dyn_cast<CastExpr>(args[3])) {
+    if (const auto *arg = dyn_cast<DeclRefExpr>(implCastExpr->getSubExpr())) {
+      if (const auto *paramDecl = dyn_cast<VarDecl>(arg->getDecl())) {
+        if (paramDecl->hasAttr<HLSLGroupSharedAttr>()) {
+          isValid = declIdMapper.createPayloadStageVars(
+              sigPoint, sc, paramDecl, /*asInput=*/false, paramDecl->getType(),
+              "out.var", &payloadArg);
+        }
+      }
+    }
+  }
+  if (!isValid) {
+    emitError("expected groupshared object as argument to DispatchMesh()",
+              args[3]->getExprLoc());
+  }
+}
+
+void SpirvEmitter::processMeshOutputCounts(const CallExpr *callExpr) {
+  // HLSL Func - void SetMeshOutputCounts(uint numVertices, uint numPrimitives);
+  assert(callExpr->getNumArgs() == 2);
+  const auto args = callExpr->getArgs();
+  const auto loc = callExpr->getExprLoc();
+  auto *var = declIdMapper.getBuiltinVar(spv::BuiltIn::PrimitiveCountNV,
+                                         astContext.UnsignedIntTy, loc);
+  spvBuilder.createStore(var, doExpr(args[1]), loc);
 }
 
 SpirvConstant *SpirvEmitter::getValueZero(QualType type) {
@@ -9413,10 +10045,24 @@ hlsl::ShaderModel::Kind SpirvEmitter::getShaderModelKind(StringRef stageName) {
     smk = hlsl::ShaderModel::Kind::Intersection;
     break;
   case 'a':
-    smk = hlsl::ShaderModel::Kind::AnyHit;
+    switch (stageName[1]) {
+    case 'm':
+      smk = hlsl::ShaderModel::Kind::Amplification;
+      break;
+    case 'n':
+      smk = hlsl::ShaderModel::Kind::AnyHit;
+      break;
+    }
     break;
   case 'm':
-    smk = hlsl::ShaderModel::Kind::Miss;
+    switch (stageName[1]) {
+    case 'e':
+      smk = hlsl::ShaderModel::Kind::Mesh;
+      break;
+    case 'i':
+      smk = hlsl::ShaderModel::Kind::Miss;
+      break;
+    }
     break;
   default:
     smk = hlsl::ShaderModel::Kind::Invalid;
@@ -9455,6 +10101,10 @@ SpirvEmitter::getSpirvShaderStage(hlsl::ShaderModel::Kind smk) {
     return spv::ExecutionModel::MissNV;
   case hlsl::ShaderModel::Kind::Callable:
     return spv::ExecutionModel::CallableNV;
+  case hlsl::ShaderModel::Kind::Mesh:
+    return spv::ExecutionModel::MeshNV;
+  case hlsl::ShaderModel::Kind::Amplification:
+    return spv::ExecutionModel::TaskNV;
   default:
     llvm_unreachable("invalid shader model kind");
     break;
@@ -9682,9 +10332,11 @@ bool SpirvEmitter::emitEntryFunctionWrapperForRayTracing(
 
   // Initialize all global variables at the beginning of the wrapper
   for (const VarDecl *varDecl : toInitGloalVars) {
-    const auto varInfo = declIdMapper.getDeclEvalInfo(varDecl);
+    const auto varInfo =
+        declIdMapper.getDeclEvalInfo(varDecl, varDecl->getLocation());
     if (const auto *init = varDecl->getInit()) {
-      storeValue(varInfo, doExpr(init), varDecl->getType());
+      storeValue(varInfo, loadIfGLValue(init), varDecl->getType(),
+                 init->getLocStart());
 
       // Update counter variable associated with global variables
       tryToAssignCounterVar(varDecl, init);
@@ -9693,7 +10345,7 @@ bool SpirvEmitter::emitEntryFunctionWrapperForRayTracing(
     // resource objects
     else if (!hlsl::IsHLSLResourceType(varDecl->getType())) {
       auto *nullValue = spvBuilder.getConstantNull(varDecl->getType());
-      spvBuilder.createStore(varInfo, nullValue);
+      spvBuilder.createStore(varInfo, nullValue, varDecl->getLocation());
     }
   }
 
@@ -9716,8 +10368,8 @@ bool SpirvEmitter::emitEntryFunctionWrapperForRayTracing(
     paramTypes.push_back(paramType);
 
     // Order of arguments is fixed
-    // Any-Hit/Closest-Hit : Arg 0 = payload(inout), Arg1 = attribute(in)
-    // Miss : Arg 0 = payload(inout)
+    // Any-Hit/Closest-Hit : Arg 0 = rayPayload(inout), Arg1 = attribute(in)
+    // Miss : Arg 0 = rayPayload(inout)
     // Callable : Arg 0 = callable data(inout)
     // Raygeneration/Intersection : No Args allowed
     if (sKind == hlsl::ShaderModel::Kind::RayGeneration) {
@@ -9728,9 +10380,10 @@ bool SpirvEmitter::emitEntryFunctionWrapperForRayTracing(
                sKind == hlsl::ShaderModel::Kind::AnyHit) {
       // Generate rayPayloadInNV and hitAttributeNV stage variables
       if (i == 0) {
-        // First argument is always payload
+        // First argument is always rayPayload
         curStageVar = declIdMapper.createRayTracingNVStageVar(
             spv::StorageClass::IncomingRayPayloadNV, param);
+        currentRayPayload = curStageVar;
       } else {
         // Second argument is always attribute
         curStageVar = declIdMapper.createRayTracingNVStageVar(
@@ -9738,7 +10391,7 @@ bool SpirvEmitter::emitEntryFunctionWrapperForRayTracing(
       }
     } else if (sKind == hlsl::ShaderModel::Kind::Miss) {
       // Generate rayPayloadInNV stage variable
-      // First and only argument is payload
+      // First and only argument is rayPayload
       curStageVar = declIdMapper.createRayTracingNVStageVar(
           spv::StorageClass::IncomingRayPayloadNV, param);
     } else if (sKind == hlsl::ShaderModel::Kind::Callable) {
@@ -9749,14 +10402,16 @@ bool SpirvEmitter::emitEntryFunctionWrapperForRayTracing(
     if (curStageVar != nullptr) {
       stageVars.push_back(curStageVar);
       // Copy data to temporary
-      auto *tempLoadInst = spvBuilder.createLoad(paramType, curStageVar);
-      spvBuilder.createStore(tempVar, tempLoadInst);
+      auto *tempLoadInst =
+          spvBuilder.createLoad(paramType, curStageVar, param->getLocation());
+      spvBuilder.createStore(tempVar, tempLoadInst, param->getLocation());
     }
   }
 
   // Call the original entry function
   const QualType retType = decl->getReturnType();
-  spvBuilder.createFunctionCall(retType, entryFuncInstr, params);
+  spvBuilder.createFunctionCall(retType, entryFuncInstr, params,
+                                decl->getLocStart());
 
   // Write certain output variables back
   if (sKind == hlsl::ShaderModel::Kind::ClosestHit ||
@@ -9764,12 +10419,174 @@ bool SpirvEmitter::emitEntryFunctionWrapperForRayTracing(
       sKind == hlsl::ShaderModel::Kind::Miss ||
       sKind == hlsl::ShaderModel::Kind::Callable) {
     // Write back results to IncomingRayPayloadNV/IncomingCallableDataNV
-    auto *tempLoad = spvBuilder.createLoad(paramTypes[0], params[0]);
-    spvBuilder.createStore(stageVars[0], tempLoad);
+    auto *tempLoad = spvBuilder.createLoad(paramTypes[0], params[0],
+                                           decl->getBody()->getLocEnd());
+    spvBuilder.createStore(stageVars[0], tempLoad,
+                           decl->getBody()->getLocEnd());
   }
 
   spvBuilder.createReturn(decl->getBody()->getLocEnd());
   spvBuilder.endFunction();
+
+  return true;
+}
+
+bool SpirvEmitter::processMeshOrAmplificationShaderAttributes(
+    const FunctionDecl *decl, uint32_t *outVerticesArraySize) {
+  if (auto *numThreadsAttr = decl->getAttr<HLSLNumThreadsAttr>()) {
+    uint32_t x, y, z;
+    x = static_cast<uint32_t>(numThreadsAttr->getX());
+    y = static_cast<uint32_t>(numThreadsAttr->getY());
+    z = static_cast<uint32_t>(numThreadsAttr->getZ());
+    spvBuilder.addExecutionMode(entryFunction, spv::ExecutionMode::LocalSize,
+                                {x, y, z}, decl->getLocation());
+  }
+
+  // Early return for amplification shaders as they only take the 'numthreads'
+  // attribute.
+  if (spvContext.isAS())
+    return true;
+
+  spv::ExecutionMode outputPrimitive = spv::ExecutionMode::Max;
+  if (auto *outputTopology = decl->getAttr<HLSLOutputTopologyAttr>()) {
+    const auto topology = outputTopology->getTopology().lower();
+    outputPrimitive =
+        llvm::StringSwitch<spv::ExecutionMode>(topology)
+            .Case("point", spv::ExecutionMode::OutputPoints)
+            .Case("line", spv::ExecutionMode::OutputLinesNV)
+            .Case("triangle", spv::ExecutionMode::OutputTrianglesNV);
+    if (outputPrimitive != spv::ExecutionMode::Max) {
+      spvBuilder.addExecutionMode(entryFunction, outputPrimitive, {},
+                                  decl->getLocation());
+    } else {
+      emitError("unknown output topology in mesh shader",
+                outputTopology->getLocation());
+      return false;
+    }
+  }
+
+  uint32_t numVertices = 0;
+  uint32_t numIndices = 0;
+  uint32_t numPrimitives = 0;
+  bool payloadDeclSeen = false;
+
+  for (uint32_t i = 0; i < decl->getNumParams(); i++) {
+    const auto param = decl->getParamDecl(i);
+    const auto paramType = param->getType();
+    const auto paramLoc = param->getLocation();
+    if (param->hasAttr<HLSLVerticesAttr>() ||
+        param->hasAttr<HLSLIndicesAttr>() ||
+        param->hasAttr<HLSLPrimitivesAttr>()) {
+      uint32_t arraySize = 0;
+      if (const auto *arrayType =
+              astContext.getAsConstantArrayType(paramType)) {
+        const auto eleType =
+            arrayType->getElementType()->getCanonicalTypeUnqualified();
+        if (param->hasAttr<HLSLIndicesAttr>()) {
+          switch (outputPrimitive) {
+          case spv::ExecutionMode::OutputPoints:
+            if (eleType != astContext.UnsignedIntTy) {
+              emitError("expected 1D array of uint type", paramLoc);
+              return false;
+            }
+            break;
+          case spv::ExecutionMode::OutputLinesNV: {
+            QualType baseType;
+            uint32_t length;
+            if (!isVectorType(eleType, &baseType, &length) ||
+                baseType != astContext.UnsignedIntTy || length != 2) {
+              emitError("expected 1D array of uint2 type", paramLoc);
+              return false;
+            }
+            break;
+          }
+          case spv::ExecutionMode::OutputTrianglesNV: {
+            QualType baseType;
+            uint32_t length;
+            if (!isVectorType(eleType, &baseType, &length) ||
+                baseType != astContext.UnsignedIntTy || length != 3) {
+              emitError("expected 1D array of uint3 type", paramLoc);
+              return false;
+            }
+            break;
+          }
+          default:
+            assert(false && "unexpected spirv execution mode");
+          }
+        } else if (!eleType->isStructureType()) {
+          // vertices/primitives objects
+          emitError("expected 1D array of struct type", paramLoc);
+          return false;
+        }
+        arraySize = static_cast<uint32_t>(arrayType->getSize().getZExtValue());
+      } else {
+        emitError("expected 1D array of indices/vertices/primitives object",
+                  paramLoc);
+        return false;
+      }
+      if (param->hasAttr<HLSLVerticesAttr>()) {
+        if (numVertices != 0) {
+          emitError("only one object with 'vertices' modifier is allowed",
+                    paramLoc);
+          return false;
+        }
+        numVertices = arraySize;
+      } else if (param->hasAttr<HLSLIndicesAttr>()) {
+        if (numIndices != 0) {
+          emitError("only one object with 'indices' modifier is allowed",
+                    paramLoc);
+          return false;
+        }
+        numIndices = arraySize;
+      } else if (param->hasAttr<HLSLPrimitivesAttr>()) {
+        if (numPrimitives != 0) {
+          emitError("only one object with 'primitives' modifier is allowed",
+                    paramLoc);
+          return false;
+        }
+        numPrimitives = arraySize;
+      }
+    } else if (param->hasAttr<HLSLPayloadAttr>()) {
+      if (payloadDeclSeen) {
+        emitError("only one object with 'payload' modifier is allowed",
+                  paramLoc);
+        return false;
+      }
+      payloadDeclSeen = true;
+      if (!paramType->isStructureType()) {
+        emitError("expected payload of struct type", paramLoc);
+        return false;
+      }
+    }
+  }
+
+  // Vertex attribute array is a mandatory param to mesh entry function.
+  if (numVertices != 0) {
+    *outVerticesArraySize = numVertices;
+    spvBuilder.addExecutionMode(
+        entryFunction, spv::ExecutionMode::OutputVertices,
+        {static_cast<uint32_t>(numVertices)}, decl->getLocation());
+  } else {
+    emitError("expected vertices object declaration", decl->getLocation());
+    return false;
+  }
+
+  // Vertex indices array is a mandatory param to mesh entry function.
+  if (numIndices != 0) {
+    spvBuilder.addExecutionMode(
+        entryFunction, spv::ExecutionMode::OutputPrimitivesNV,
+        {static_cast<uint32_t>(numIndices)}, decl->getLocation());
+    // Primitive attribute array is an optional param to mesh entry function,
+    // but the array size should match the indices array.
+    if (numPrimitives != 0 && numPrimitives != numIndices) {
+      emitError("array size of primitives object should match 'indices' object",
+                decl->getLocation());
+      return false;
+    }
+  } else {
+    emitError("expected indices object declaration", decl->getLocation());
+    return false;
+  }
 
   return true;
 }
@@ -9790,15 +10607,12 @@ bool SpirvEmitter::emitEntryFunctionWrapper(const FunctionDecl *decl,
   uint32_t inputArraySize = 0;
   uint32_t outputArraySize = 0;
 
-  // Construct the wrapper function signature.
-  auto *funcType = spvContext.getFunctionType(astContext.VoidTy, {});
-
   // The wrapper entry function surely does not have pre-assigned <result-id>
   // for it like other functions that got added to the work queue following
   // function calls. And the wrapper is the entry function.
   entryFunction =
-      spvBuilder.beginFunction(astContext.VoidTy, funcType,
-                               /*SourceLocation*/ {}, decl->getName());
+      spvBuilder.beginFunction(astContext.VoidTy, /* param QualTypes */ {},
+                               decl->getLocStart(), decl->getName());
   // Note this should happen before using declIdMapper for other tasks.
   declIdMapper.setEntryFunction(entryFunction);
 
@@ -9844,6 +10658,9 @@ bool SpirvEmitter::emitEntryFunctionWrapper(const FunctionDecl *decl,
     if (!processGeometryShaderAttributes(decl, &inputArraySize))
       return false;
     // The per-vertex output of GS is not an array.
+  } else if (spvContext.isMS() || spvContext.isAS()) {
+    if (!processMeshOrAmplificationShaderAttributes(decl, &outputArraySize))
+      return false;
   }
 
   // Go through all parameters and record the declaration of SV_ClipDistance
@@ -9872,7 +10689,7 @@ bool SpirvEmitter::emitEntryFunctionWrapper(const FunctionDecl *decl,
   // offset of SV_ClipDistance/SV_CullDistance variables within the array.
   declIdMapper.glPerVertex.calculateClipCullDistanceArraySize();
 
-  if (!spvContext.isCS()) {
+  if (!spvContext.isCS() && !spvContext.isAS()) {
     // Generate stand-alone builtins of Position, ClipDistance, and
     // CullDistance, which belongs to gl_PerVertex.
     declIdMapper.glPerVertex.generateVars(inputArraySize, outputArraySize);
@@ -9884,9 +10701,11 @@ bool SpirvEmitter::emitEntryFunctionWrapper(const FunctionDecl *decl,
 
   // Initialize all global variables at the beginning of the wrapper
   for (const VarDecl *varDecl : toInitGloalVars) {
-    const auto varInfo = declIdMapper.getDeclEvalInfo(varDecl);
+    const auto varInfo =
+        declIdMapper.getDeclEvalInfo(varDecl, varDecl->getLocation());
     if (const auto *init = varDecl->getInit()) {
-      storeValue(varInfo, doExpr(init), varDecl->getType());
+      storeValue(varInfo, loadIfGLValue(init), varDecl->getType(),
+                 init->getLocStart());
 
       // Update counter variable associated with global variables
       tryToAssignCounterVar(varDecl, init);
@@ -9895,7 +10714,7 @@ bool SpirvEmitter::emitEntryFunctionWrapper(const FunctionDecl *decl,
     // resource objects
     else if (!hlsl::IsHLSLResourceType(varDecl->getType())) {
       auto *nullValue = spvBuilder.getConstantNull(varDecl->getType());
-      spvBuilder.createStore(varInfo, nullValue);
+      spvBuilder.createStore(varInfo, nullValue, varDecl->getLocation());
     }
   }
 
@@ -9928,7 +10747,7 @@ bool SpirvEmitter::emitEntryFunctionWrapper(const FunctionDecl *decl,
 
       // Only initialize the temporary variable if the parameter is indeed used.
       if (param->isUsed()) {
-        spvBuilder.createStore(tempVar, loadedValue);
+        spvBuilder.createStore(tempVar, loadedValue, param->getLocation());
       }
 
       // Record the temporary variable holding SV_OutputControlPointID,
@@ -9945,7 +10764,8 @@ bool SpirvEmitter::emitEntryFunctionWrapper(const FunctionDecl *decl,
 
   // Call the original entry function
   const QualType retType = decl->getReturnType();
-  auto *retVal = spvBuilder.createFunctionCall(retType, entryFuncInstr, params);
+  auto *retVal = spvBuilder.createFunctionCall(retType, entryFuncInstr, params,
+                                               decl->getLocStart());
 
   // Create and write stage output variables for return value. Special case for
   // Hull shaders since they operate differently in 2 ways:
@@ -9983,14 +10803,19 @@ bool SpirvEmitter::emitEntryFunctionWrapper(const FunctionDecl *decl,
       // .Append() intrinsic method. No need to load the parameter since we
       // won't need to write back here.
       if (param->isUsed() && !spvContext.isGS())
-        loadedParam = spvBuilder.createLoad(param->getType(), params[i]);
+        loadedParam = spvBuilder.createLoad(param->getType(), params[i],
+                                            param->getLocStart());
 
       if (!declIdMapper.createStageOutputVar(param, loadedParam, false))
         return false;
     }
   }
 
-  spvBuilder.createReturn(decl->getBody()->getLocEnd());
+  // For wrapper of entry point, it is better not to specify SourceLocation
+  // for return statement, because it is not the location of the actual
+  // return and emitting the location of the end of entry function makes
+  // us confused. It is better to emit debug line just before OpFunctionEnd.
+  spvBuilder.createReturn(/* SourceLocation */ {});
   spvBuilder.endFunction();
 
   // For Hull shaders, there is no explicit call to the PCF in the HLSL source.
@@ -10009,12 +10834,14 @@ bool SpirvEmitter::processHSEntryPointOutputAndPCF(
   // This method may only be called for Hull shaders.
   assert(spvContext.isHS());
 
+  auto loc = hullMainFuncDecl->getLocation();
+  auto locEnd = hullMainFuncDecl->getLocEnd();
+
   // For Hull shaders, the real output is an array of size
   // numOutputControlPoints. The results of the main should be written to the
   // correct offset in the array (based on InvocationID).
   if (!numOutputControlPoints) {
-    emitError("number of output control points cannot be zero",
-              hullMainFuncDecl->getLocation());
+    emitError("number of output control points cannot be zero", loc);
     return false;
   }
   // TODO: We should be able to handle cases where the SV_OutputControlPointID
@@ -10022,12 +10849,11 @@ bool SpirvEmitter::processHSEntryPointOutputAndPCF(
   if (!outputControlPointId) {
     emitError(
         "SV_OutputControlPointID semantic must be provided in hull shader",
-        hullMainFuncDecl->getLocation());
+        loc);
     return false;
   }
   if (!patchConstFunc) {
-    emitError("patch constant function not defined in hull shader",
-              hullMainFuncDecl->getLocation());
+    emitError("patch constant function not defined in hull shader", loc);
     return false;
   }
 
@@ -10039,12 +10865,11 @@ bool SpirvEmitter::processHSEntryPointOutputAndPCF(
     const QualType hullMainRetType = astContext.getConstantArrayType(
         retType, llvm::APInt(32, numOutputControlPoints),
         clang::ArrayType::Normal, 0);
-    hullMainOutputPatch = spvBuilder.addFnVar(
-        hullMainRetType, /*SourceLocation*/ {}, "temp.var.hullMainRetVal");
+    hullMainOutputPatch =
+        spvBuilder.addFnVar(hullMainRetType, locEnd, "temp.var.hullMainRetVal");
     auto *tempLocation = spvBuilder.createAccessChain(
-        spvContext.getPointerType(retType, spv::StorageClass::Function),
-        hullMainOutputPatch, {outputControlPointId});
-    spvBuilder.createStore(tempLocation, retVal);
+        retType, hullMainOutputPatch, {outputControlPointId}, locEnd);
+    spvBuilder.createStore(tempLocation, retVal, locEnd);
   }
 
   // Now create a barrier before calling the Patch Constant Function (PCF).
@@ -10060,10 +10885,11 @@ bool SpirvEmitter::processHSEntryPointOutputAndPCF(
   // and we only allow ID 0 to call the PCF.
   auto *condition = spvBuilder.createBinaryOp(
       spv::Op::OpIEqual, astContext.BoolTy, outputControlPointId,
-      spvBuilder.getConstantInt(astContext.UnsignedIntTy, llvm::APInt(32, 0)));
+      spvBuilder.getConstantInt(astContext.UnsignedIntTy, llvm::APInt(32, 0)),
+      loc);
   auto *thenBB = spvBuilder.createBasicBlock("if.true");
   auto *mergeBB = spvBuilder.createBasicBlock("if.merge");
-  spvBuilder.createConditionalBranch(condition, thenBB, mergeBB, mergeBB);
+  spvBuilder.createConditionalBranch(condition, thenBB, mergeBB, loc, mergeBB);
   spvBuilder.addSuccessor(thenBB);
   spvBuilder.addSuccessor(mergeBB);
   spvBuilder.setMergeTarget(mergeBB);
@@ -10085,12 +10911,12 @@ bool SpirvEmitter::processHSEntryPointOutputAndPCF(
       [this](const ParmVarDecl *param) {
         const QualType type = param->getType();
         std::string tempVarName = "param.var." + param->getNameAsString();
-        auto *tempVar =
-            spvBuilder.addFnVar(type, param->getLocation(), tempVarName,
-                                param->hasAttr<HLSLPreciseAttr>());
+        auto paramLoc = param->getLocation();
+        auto *tempVar = spvBuilder.addFnVar(type, paramLoc, tempVarName,
+                                            param->hasAttr<HLSLPreciseAttr>());
         SpirvInstruction *loadedValue = nullptr;
         declIdMapper.createStageInputVar(param, &loadedValue, /*forPCF*/ true);
-        spvBuilder.createStore(tempVar, loadedValue);
+        spvBuilder.createStore(tempVar, loadedValue, paramLoc);
         return tempVar;
       };
 
@@ -10119,13 +10945,13 @@ bool SpirvEmitter::processHSEntryPointOutputAndPCF(
           << param->getName();
     }
   }
-  auto *pcfResultId =
-      spvBuilder.createFunctionCall(pcfRetType, pcfId, {pcfParams});
+  auto *pcfResultId = spvBuilder.createFunctionCall(
+      pcfRetType, pcfId, {pcfParams}, hullMainFuncDecl->getLocStart());
   if (!declIdMapper.createStageOutputVar(patchConstFunc, pcfResultId,
                                          /*forPCF*/ true))
     return false;
 
-  spvBuilder.createBranch(mergeBB);
+  spvBuilder.createBranch(mergeBB, locEnd);
   spvBuilder.addSuccessor(mergeBB);
   spvBuilder.setInsertPoint(mergeBB);
   return true;
@@ -10250,7 +11076,7 @@ void SpirvEmitter::processCaseStmtOrDefaultStmt(const Stmt *stmt) {
     // We are about to handle the case passed in as parameter. If the current
     // basic block is not terminated, it means the previous case is a fall
     // through case. We need to link it to the case to be processed.
-    spvBuilder.createBranch(caseBB);
+    spvBuilder.createBranch(caseBB, stmt->getLocStart());
     spvBuilder.addSuccessor(caseBB);
   }
   spvBuilder.setInsertPoint(caseBB);
@@ -10289,7 +11115,7 @@ void SpirvEmitter::processSwitchStmtUsingSpirvOpSwitch(
   doStmt(switchStmt->getBody());
 
   if (!spvBuilder.isCurrentBasicBlockTerminated())
-    spvBuilder.createBranch(mergeBB);
+    spvBuilder.createBranch(mergeBB, switchStmt->getLocEnd());
   spvBuilder.setInsertPoint(mergeBB);
   breakStack.pop();
 }
@@ -10382,7 +11208,8 @@ void SpirvEmitter::processSwitchStmtUsingIfStmts(const SwitchStmt *switchStmt) {
 
 SpirvInstruction *SpirvEmitter::extractVecFromVec4(SpirvInstruction *from,
                                                    uint32_t targetVecSize,
-                                                   QualType targetElemType) {
+                                                   QualType targetElemType,
+                                                   SourceLocation loc) {
   assert(targetVecSize > 0 && targetVecSize < 5);
   const QualType retType =
       targetVecSize == 1
@@ -10390,27 +11217,18 @@ SpirvInstruction *SpirvEmitter::extractVecFromVec4(SpirvInstruction *from,
           : astContext.getExtVectorType(targetElemType, targetVecSize);
   switch (targetVecSize) {
   case 1:
-    return spvBuilder.createCompositeExtract(retType, from, {0});
+    return spvBuilder.createCompositeExtract(retType, from, {0}, loc);
     break;
   case 2:
-    return spvBuilder.createVectorShuffle(retType, from, from, {0, 1});
+    return spvBuilder.createVectorShuffle(retType, from, from, {0, 1}, loc);
     break;
   case 3:
-    return spvBuilder.createVectorShuffle(retType, from, from, {0, 1, 2});
+    return spvBuilder.createVectorShuffle(retType, from, from, {0, 1, 2}, loc);
     break;
   case 4:
     return from;
   default:
     llvm_unreachable("vector element count must be 1, 2, 3, or 4");
-  }
-}
-
-void SpirvEmitter::emitDebugLine(SourceLocation loc) {
-  if (spirvOptions.debugInfoLine && mainSourceFile != nullptr) {
-    auto floc = FullSourceLoc(loc, theCompilerInstance.getSourceManager());
-    uint32_t line = floc.getSpellingLineNumber();
-    uint32_t column = floc.getSpellingColumnNumber();
-    spvBuilder.createLineInfo(mainSourceFile, line, column);
   }
 }
 

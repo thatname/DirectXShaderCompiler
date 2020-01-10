@@ -102,20 +102,24 @@ Decl *Parser::ParseConstBuffer(unsigned Context, SourceLocation &DeclEnd,
   Actions.ActOnStartHLSLBufferView();
   Parser::DeclGroupPtrTy dcl = ParseDeclGroup(PDS, Declarator::FileContext);
 
+  // If parsing of decl group fails, then decl group must have been illformed. Bail out!
+  // Note that we don't have to generate any diagnostics here as it was already
+  // generated previously in ParseDirectDeclarator().
+  if (!dcl)
+    return nullptr;
+
   // Check if the register type is valid
   NamedDecl *namedDecl = cast<NamedDecl>(dcl.get().getSingleDecl());
   ArrayRef<hlsl::UnusualAnnotation*> annotations = namedDecl->getUnusualAnnotations();
   for (hlsl::UnusualAnnotation* annotation : annotations) {
     if (const auto *regAssignment = dyn_cast<hlsl::RegisterAssignment>(annotation)) {
-      // SPIRV Change Starts - skip the check if space-only for SPIR-V
-      if (getLangOpts().SPIRV && regAssignment->isSpaceOnly())
+      if (regAssignment->isSpaceOnly())
         continue;
-      // SPIRV Change Ends
       if (isCBuffer && regAssignment->RegisterType != 'b' && regAssignment->RegisterType != 'B') {
-        Diag(namedDecl->getLocation(), diag::err_hlsl_unsupported_cbuffer_register);
+        Diag(namedDecl->getLocation(), diag::err_hlsl_incorrect_bind_semantic) << "'b'";
       }
       else if (!isCBuffer && regAssignment->RegisterType != 't' && regAssignment->RegisterType != 'T') {
-        Diag(namedDecl->getLocation(), diag::err_hlsl_unsupported_tbuffer_register);
+        Diag(namedDecl->getLocation(), diag::err_hlsl_incorrect_bind_semantic) << "'t'";
       }
     }
   }

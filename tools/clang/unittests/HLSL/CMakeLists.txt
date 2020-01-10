@@ -4,9 +4,8 @@ if(WIN32)
 find_package(TAEF REQUIRED)
 find_package(DiaSDK REQUIRED) # Used for constants and declarations.
 find_package(D3D12 REQUIRED) # Used for ExecutionTest.cpp.
-ENDif(WIN32)
+endif(WIN32)
 
-if(WIN32)
 set( LLVM_LINK_COMPONENTS
   support
   mssupport
@@ -21,8 +20,10 @@ set( LLVM_LINK_COMPONENTS
   analysis
   ipa
   irreader
+  transformutils  # for CloneModule
   )
 
+if(WIN32)
 set(HLSL_IGNORE_SOURCES
   TestMain.cpp
   HLSLTestOptions.cpp
@@ -56,12 +57,6 @@ add_clang_library(clang-hlsl-tests SHARED
   clang-hlsl-tests.rc
   )
 else (WIN32)
-set( LLVM_LINK_COMPONENTS
-  support
-  mssupport
-  dxcsupport
-  )
-
 set(HLSL_IGNORE_SOURCES
   ExecutionTest.cpp
   LinkerTest.cpp

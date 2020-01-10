@@ -108,6 +108,9 @@ FunctionPass *createScalarReplAggregatesPass(signed Threshold = -1,
                                              signed ArrayElementThreshold = -1,
                                              signed ScalarLoadThreshold = -1);
 // HLSL Change Begins
+FunctionPass* createHLExpandStoreIntrinsicsPass();
+void initializeHLExpandStoreIntrinsicsPass(PassRegistry&);
+
 //===----------------------------------------------------------------------===//
 //
 // ScalarReplAggregatesHLSL - Break up alloca's of aggregates into multiple allocas
@@ -131,8 +134,24 @@ void initializeSROA_Parameter_HLSLPass(PassRegistry&);
 Pass *createDxilFixConstArrayInitializerPass();
 void initializeDxilFixConstArrayInitializerPass(PassRegistry&);
 
+Pass *createDxilConditionalMem2RegPass(bool NoOpt);
+void initializeDxilConditionalMem2RegPass(PassRegistry&);
+
 Pass *createDxilLoopUnrollPass(unsigned MaxIterationAttempt);
 void initializeDxilLoopUnrollPass(PassRegistry&);
+
+Pass *createDxilEraseDeadRegionPass();
+void initializeDxilEraseDeadRegionPass(PassRegistry&);
+
+Pass *createDxilEliminateVectorPass();
+void initializeDxilEliminateVectorPass(PassRegistry&);
+
+Pass *createDxilInsertNoopsPass();
+void initializeDxilInsertNoopsPass(PassRegistry&);
+
+Pass *createDxilFinalizeNoopsPass();
+void initializeDxilFinalizeNoopsPass(PassRegistry&);
+
 //===----------------------------------------------------------------------===//
 //
 // LowerStaticGlobalIntoAlloca. Replace static globals with alloca if only used
@@ -484,6 +503,7 @@ FunctionPass *createSampleProfileLoaderPass(StringRef Name);
 // ScalarizerPass - Converts vector operations into scalar operations
 //
 FunctionPass *createScalarizerPass();
+FunctionPass *createScalarizerPass(bool NoOpt);
 
 //===----------------------------------------------------------------------===//
 //

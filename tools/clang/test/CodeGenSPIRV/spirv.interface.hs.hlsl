@@ -69,39 +69,39 @@ struct HsPcfOut
 // CHECK: OpEntryPoint TessellationControl %main "main" %gl_ClipDistance %gl_CullDistance %gl_ClipDistance_0 %gl_CullDistance_0 %gl_Position %in_var_BAZ %gl_PointSize %gl_InvocationID %gl_PrimitiveID %gl_Position_0 %out_var_FOO %gl_PointSize_0 %out_var_BAR %gl_TessLevelOuter %gl_TessLevelInner %out_var_TEXCOORD %out_var_WEIGHT
 
 // CHECK: OpDecorate %gl_ClipDistance BuiltIn ClipDistance
-// CHECK: OpDecorateStringGOOGLE %gl_ClipDistance HlslSemanticGOOGLE "SV_ClipDistance"
+// CHECK: OpDecorateString %gl_ClipDistance UserSemantic "SV_ClipDistance"
 // CHECK: OpDecorate %gl_CullDistance BuiltIn CullDistance
-// CHECK: OpDecorateStringGOOGLE %gl_CullDistance HlslSemanticGOOGLE "SV_CullDistance"
+// CHECK: OpDecorateString %gl_CullDistance UserSemantic "SV_CullDistance"
 // CHECK: OpDecorate %gl_ClipDistance_0 BuiltIn ClipDistance
-// CHECK: OpDecorateStringGOOGLE %gl_ClipDistance_0 HlslSemanticGOOGLE "SV_ClipDistance"
+// CHECK: OpDecorateString %gl_ClipDistance_0 UserSemantic "SV_ClipDistance"
 // CHECK: OpDecorate %gl_CullDistance_0 BuiltIn CullDistance
-// CHECK: OpDecorateStringGOOGLE %gl_CullDistance_0 HlslSemanticGOOGLE "SV_CullDistance"
+// CHECK: OpDecorateString %gl_CullDistance_0 UserSemantic "SV_CullDistance"
 
 // CHECK: OpDecorate %gl_Position BuiltIn Position
-// CHECK: OpDecorateStringGOOGLE %gl_Position HlslSemanticGOOGLE "SV_Position"
-// CHECK: OpDecorateStringGOOGLE %in_var_BAZ HlslSemanticGOOGLE "BAZ"
+// CHECK: OpDecorateString %gl_Position UserSemantic "SV_Position"
+// CHECK: OpDecorateString %in_var_BAZ UserSemantic "BAZ"
 // CHECK: OpDecorate %gl_PointSize BuiltIn PointSize
-// CHECK: OpDecorateStringGOOGLE %gl_PointSize HlslSemanticGOOGLE "PSIZE"
+// CHECK: OpDecorateString %gl_PointSize UserSemantic "PSIZE"
 // CHECK: OpDecorate %gl_InvocationID BuiltIn InvocationId
-// CHECK: OpDecorateStringGOOGLE %gl_InvocationID HlslSemanticGOOGLE "SV_OutputControlPointID"
+// CHECK: OpDecorateString %gl_InvocationID UserSemantic "SV_OutputControlPointID"
 // CHECK: OpDecorate %gl_PrimitiveID BuiltIn PrimitiveId
-// CHECK: OpDecorateStringGOOGLE %gl_PrimitiveID HlslSemanticGOOGLE "SV_PrimitiveID"
+// CHECK: OpDecorateString %gl_PrimitiveID UserSemantic "SV_PrimitiveID"
 
 // CHECK: OpDecorate %gl_Position_0 BuiltIn Position
-// CHECK: OpDecorateStringGOOGLE %gl_Position_0 HlslSemanticGOOGLE "SV_Position"
-// CHECK: OpDecorateStringGOOGLE %out_var_FOO HlslSemanticGOOGLE "FOO"
+// CHECK: OpDecorateString %gl_Position_0 UserSemantic "SV_Position"
+// CHECK: OpDecorateString %out_var_FOO UserSemantic "FOO"
 // CHECK: OpDecorate %gl_PointSize_0 BuiltIn PointSize
-// CHECK: OpDecorateStringGOOGLE %gl_PointSize_0 HlslSemanticGOOGLE "PSIZE"
-// CHECK: OpDecorateStringGOOGLE %out_var_BAR HlslSemanticGOOGLE "BAR"
+// CHECK: OpDecorateString %gl_PointSize_0 UserSemantic "PSIZE"
+// CHECK: OpDecorateString %out_var_BAR UserSemantic "BAR"
 // CHECK: OpDecorate %gl_TessLevelOuter BuiltIn TessLevelOuter
-// CHECK: OpDecorateStringGOOGLE %gl_TessLevelOuter HlslSemanticGOOGLE "SV_TessFactor"
+// CHECK: OpDecorateString %gl_TessLevelOuter UserSemantic "SV_TessFactor"
 // CHECK: OpDecorate %gl_TessLevelOuter Patch
 // CHECK: OpDecorate %gl_TessLevelInner BuiltIn TessLevelInner
-// CHECK: OpDecorateStringGOOGLE %gl_TessLevelInner HlslSemanticGOOGLE "SV_InsideTessFactor"
+// CHECK: OpDecorateString %gl_TessLevelInner UserSemantic "SV_InsideTessFactor"
 // CHECK: OpDecorate %gl_TessLevelInner Patch
-// CHECK: OpDecorateStringGOOGLE %out_var_TEXCOORD HlslSemanticGOOGLE "TEXCOORD"
+// CHECK: OpDecorateString %out_var_TEXCOORD UserSemantic "TEXCOORD"
 // CHECK: OpDecorate %out_var_TEXCOORD Patch
-// CHECK: OpDecorateStringGOOGLE %out_var_WEIGHT HlslSemanticGOOGLE "WEIGHT"
+// CHECK: OpDecorateString %out_var_WEIGHT UserSemantic "WEIGHT"
 // CHECK: OpDecorate %out_var_WEIGHT Patch
 // CHECK: OpDecorate %in_var_BAZ Location 0
 // CHECK: OpDecorate %out_var_BAR Location 0
@@ -266,13 +266,16 @@ HsCpOut main(InputPatch<HsCpIn, NumOutPoints> patch, uint cpId : SV_OutputContro
 
 // Write out HsCpOut::cull9 into gl_CullDistance[]
 // CHECK-NEXT:      [[cull9:%\d+]] = OpCompositeExtract %v3float [[ret]] 0
-// CHECK-NEXT:       [[ptr0:%\d+]] = OpAccessChain %_ptr_Output_float %gl_CullDistance_0 [[invoId]] %uint_2
+// CHECK-NEXT:      [[ind20:%\d+]] = OpIAdd %uint %uint_2 %uint_0
+// CHECK-NEXT:       [[ptr0:%\d+]] = OpAccessChain %_ptr_Output_float %gl_CullDistance_0 [[invoId]] [[ind20]]
 // CHECK-NEXT:       [[val0:%\d+]] = OpCompositeExtract %float [[cull9]] 0
 // CHECK-NEXT:                       OpStore [[ptr0]] [[val0]]
-// CHECK-NEXT:       [[ptr1:%\d+]] = OpAccessChain %_ptr_Output_float %gl_CullDistance_0 [[invoId]] %uint_3
+// CHECK-NEXT:      [[ind21:%\d+]] = OpIAdd %uint %uint_2 %uint_1
+// CHECK-NEXT:       [[ptr1:%\d+]] = OpAccessChain %_ptr_Output_float %gl_CullDistance_0 [[invoId]] [[ind21]]
 // CHECK-NEXT:       [[val1:%\d+]] = OpCompositeExtract %float [[cull9]] 1
 // CHECK-NEXT:                       OpStore [[ptr1]] [[val1]]
-// CHECK-NEXT:       [[ptr2:%\d+]] = OpAccessChain %_ptr_Output_float %gl_CullDistance_0 [[invoId]] %uint_4
+// CHECK-NEXT:      [[ind22:%\d+]] = OpIAdd %uint %uint_2 %uint_2
+// CHECK-NEXT:       [[ptr2:%\d+]] = OpAccessChain %_ptr_Output_float %gl_CullDistance_0 [[invoId]] [[ind22]]
 // CHECK-NEXT:       [[val2:%\d+]] = OpCompositeExtract %float [[cull9]] 2
 // CHECK-NEXT:                       OpStore [[ptr2]] [[val2]]
 
@@ -291,10 +294,12 @@ HsCpOut main(InputPatch<HsCpIn, NumOutPoints> patch, uint cpId : SV_OutputContro
 
 // Write out HsCpOut::CpInner1::CpInner2::cull6 to gl_CullDistance
 // CHECK-NEXT:   [[outCull6:%\d+]] = OpCompositeExtract %v2float [[outInner2]] 1
-// CHECK-NEXT:       [[ptr0:%\d+]] = OpAccessChain %_ptr_Output_float %gl_CullDistance_0 [[invoId]] %uint_0
+// CHECK-NEXT:      [[ind00:%\d+]] = OpIAdd %uint %uint_0 %uint_0
+// CHECK-NEXT:       [[ptr0:%\d+]] = OpAccessChain %_ptr_Output_float %gl_CullDistance_0 [[invoId]] [[ind00]]
 // CHECK-NEXT:       [[val0:%\d+]] = OpCompositeExtract %float [[outCull6]] 0
 // CHECK-NEXT:                       OpStore [[ptr0]] [[val0]]
-// CHECK-NEXT:       [[ptr1:%\d+]] = OpAccessChain %_ptr_Output_float %gl_CullDistance_0 [[invoId]] %uint_1
+// CHECK-NEXT:      [[ind01:%\d+]] = OpIAdd %uint %uint_0 %uint_1
+// CHECK-NEXT:       [[ptr1:%\d+]] = OpAccessChain %_ptr_Output_float %gl_CullDistance_0 [[invoId]] [[ind01]]
 // CHECK-NEXT:       [[val1:%\d+]] = OpCompositeExtract %float [[outCull6]] 1
 // CHECK-NEXT:                       OpStore [[ptr1]] [[val1]]
 

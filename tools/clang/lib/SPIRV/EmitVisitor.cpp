@@ -43,6 +43,43 @@ void chopString(llvm::StringRef original,
   }
 }
 
+/// Returns true if an OpLine instruction can be emitted for the given OpCode.
+/// According to the SPIR-V Spec section 2.4 (Logical Layout of a Module), the
+/// first section to allow use of OpLine debug information is after all
+/// annotation instructions.
+bool isOpLineLegalForOp(spv::Op op) {
+  switch (op) {
+    // Preamble binary
+  case spv::Op::OpCapability:
+  case spv::Op::OpExtension:
+  case spv::Op::OpExtInstImport:
+  case spv::Op::OpMemoryModel:
+  case spv::Op::OpEntryPoint:
+  case spv::Op::OpExecutionMode:
+  case spv::Op::OpExecutionModeId:
+    // Debug binary
+  case spv::Op::OpString:
+  case spv::Op::OpSource:
+  case spv::Op::OpSourceExtension:
+  case spv::Op::OpSourceContinued:
+  case spv::Op::OpName:
+  case spv::Op::OpMemberName:
+    // Annotation binary
+  case spv::Op::OpModuleProcessed:
+  case spv::Op::OpDecorate:
+  case spv::Op::OpDecorateId:
+  case spv::Op::OpMemberDecorate:
+  case spv::Op::OpGroupDecorate:
+  case spv::Op::OpGroupMemberDecorate:
+  case spv::Op::OpDecorationGroup:
+  case spv::Op::OpDecorateStringGOOGLE:
+  case spv::Op::OpMemberDecorateStringGOOGLE:
+    return false;
+  default:
+    return true;
+  }
+}
+
 constexpr uint32_t kGeneratorNumber = 14;
 constexpr uint32_t kToolVersion = 0;
 
@@ -79,7 +116,68 @@ void EmitVisitor::emitDebugNameForInstruction(uint32_t resultId,
   curInst.push_back(resultId);
   encodeString(debugName);
   curInst[0] |= static_cast<uint32_t>(curInst.size()) << 16;
-  debugBinary.insert(debugBinary.end(), curInst.begin(), curInst.end());
+  debugVariableBinary.insert(debugVariableBinary.end(), curInst.begin(),
+                             curInst.end());
+}
+
+void EmitVisitor::emitDebugLine(spv::Op op, const SourceLocation &loc) {
+  // Based on SPIR-V spec, OpSelectionMerge must immediately precede either an
+  // OpBranchConditional or OpSwitch instruction. Similarly OpLoopMerge must
+  // immediately precede either an OpBranch or OpBranchConditional instruction.
+  if (lastOpWasMergeInst) {
+    lastOpWasMergeInst = false;
+    return;
+  }
+
+  if (op == spv::Op::OpSelectionMerge || op == spv::Op::OpLoopMerge)
+    lastOpWasMergeInst = true;
+
+  if (!isOpLineLegalForOp(op))
+    return;
+
+  if (!spvOptions.debugInfoLine)
+    return;
+
+  auto fileId = debugMainFileId;
+  const auto &sm = astContext.getSourceManager();
+  const char *fileName = sm.getPresumedLoc(loc).getFilename();
+  if (fileName) {
+    auto it = debugFileIdMap.find(fileName);
+    if (it == debugFileIdMap.end()) {
+      // Emit the OpString for this new fileName.
+      SpirvString *inst =
+          new (context) SpirvString(/*SourceLocation*/ {}, fileName);
+      visit(inst);
+      it = debugFileIdMap.find(fileName);
+    }
+    fileId = it->second;
+  }
+
+  if (!fileId) {
+    emitError("spvOptions.debugInfoLine is true but no fileId was set");
+    return;
+  }
+
+  uint32_t line = sm.getPresumedLineNumber(loc);
+  uint32_t column = sm.getPresumedColumnNumber(loc);
+
+  if (!line || !column)
+    return;
+
+  if (line == debugLine && column == debugColumn)
+    return;
+
+  // We must update these two values to emit the next Opline.
+  debugLine = line;
+  debugColumn = column;
+
+  curInst.clear();
+  curInst.push_back(static_cast<uint32_t>(spv::Op::OpLine));
+  curInst.push_back(fileId);
+  curInst.push_back(line);
+  curInst.push_back(column);
+  curInst[0] |= static_cast<uint32_t>(curInst.size()) << 16;
+  mainBinary.insert(mainBinary.end(), curInst.begin(), curInst.end());
 }
 
 void EmitVisitor::initInstruction(SpirvInstruction *inst) {
@@ -105,12 +203,17 @@ void EmitVisitor::initInstruction(SpirvInstruction *inst) {
                                spv::Decoration::NoContraction, {});
   }
 
+  const auto op = inst->getopcode();
+  emitDebugLine(op, inst->getSourceLocation());
+
   // Initialize the current instruction for emitting.
   curInst.clear();
-  curInst.push_back(static_cast<uint32_t>(inst->getopcode()));
+  curInst.push_back(static_cast<uint32_t>(op));
 }
 
-void EmitVisitor::initInstruction(spv::Op op) {
+void EmitVisitor::initInstruction(spv::Op op, const SourceLocation &loc) {
+  emitDebugLine(op, loc);
+
   curInst.clear();
   curInst.push_back(static_cast<uint32_t>(op));
 }
@@ -132,9 +235,13 @@ void EmitVisitor::finalizeInstruction() {
   case spv::Op::OpSource:
   case spv::Op::OpSourceExtension:
   case spv::Op::OpSourceContinued:
+    debugFileBinary.insert(debugFileBinary.end(), curInst.begin(),
+                           curInst.end());
+    break;
   case spv::Op::OpName:
   case spv::Op::OpMemberName:
-    debugBinary.insert(debugBinary.end(), curInst.begin(), curInst.end());
+    debugVariableBinary.insert(debugVariableBinary.end(), curInst.begin(),
+                               curInst.end());
     break;
   case spv::Op::OpModuleProcessed:
   case spv::Op::OpDecorate:
@@ -172,7 +279,9 @@ std::vector<uint32_t> EmitVisitor::takeBinary() {
   auto headerBinary = header.takeBinary();
   result.insert(result.end(), headerBinary.begin(), headerBinary.end());
   result.insert(result.end(), preambleBinary.begin(), preambleBinary.end());
-  result.insert(result.end(), debugBinary.begin(), debugBinary.end());
+  result.insert(result.end(), debugFileBinary.begin(), debugFileBinary.end());
+  result.insert(result.end(), debugVariableBinary.begin(),
+                debugVariableBinary.end());
   result.insert(result.end(), annotationsBinary.begin(),
                 annotationsBinary.end());
   result.insert(result.end(), typeConstantBinary.begin(),
@@ -200,7 +309,7 @@ bool EmitVisitor::visit(SpirvFunction *fn, Phase phase) {
     const uint32_t functionTypeId = typeHandler.emitType(fn->getFunctionType());
 
     // Emit OpFunction
-    initInstruction(spv::Op::OpFunction);
+    initInstruction(spv::Op::OpFunction, fn->getSourceLocation());
     curInst.push_back(returnTypeId);
     curInst.push_back(getOrAssignResultId<SpirvFunction>(fn));
     curInst.push_back(
@@ -218,7 +327,7 @@ bool EmitVisitor::visit(SpirvFunction *fn, Phase phase) {
   // After emitting the function
   else if (phase == Visitor::Phase::Done) {
     // Emit OpFunctionEnd
-    initInstruction(spv::Op::OpFunctionEnd);
+    initInstruction(spv::Op::OpFunctionEnd, /* SourceLocation */ {});
     finalizeInstruction();
   }
 
@@ -231,7 +340,7 @@ bool EmitVisitor::visit(SpirvBasicBlock *bb, Phase phase) {
   // Before emitting the basic block.
   if (phase == Visitor::Phase::Init) {
     // Emit OpLabel
-    initInstruction(spv::Op::OpLabel);
+    initInstruction(spv::Op::OpLabel, /* SourceLocation */ {});
     curInst.push_back(getOrAssignResultId<SpirvBasicBlock>(bb));
     finalizeInstruction();
     emitDebugNameForInstruction(getOrAssignResultId<SpirvBasicBlock>(bb),
@@ -300,13 +409,24 @@ bool EmitVisitor::visit(SpirvString *inst) {
   curInst.push_back(getOrAssignResultId<SpirvInstruction>(inst));
   encodeString(inst->getString());
   finalizeInstruction();
+
+  if (spvOptions.debugInfoLine) {
+    if (debugFileIdMap.find(inst->getString()) != debugFileIdMap.end())
+      return true;
+    debugFileIdMap[inst->getString()] =
+        getOrAssignResultId<SpirvInstruction>(inst);
+  }
   return true;
 }
 
 bool EmitVisitor::visit(SpirvSource *inst) {
   // Emit the OpString for the file name.
-  if (inst->hasFile())
+  if (inst->hasFile()) {
     visit(inst->getFile());
+
+    if (spvOptions.debugInfoLine && !debugMainFileId)
+      debugMainFileId = debugFileIdMap[inst->getFile()->getString()];
+  }
 
   // Chop up the source into multiple segments if it is too long.
   llvm::Optional<llvm::StringRef> firstSnippet = llvm::None;
@@ -326,27 +446,30 @@ bool EmitVisitor::visit(SpirvSource *inst) {
   }
   if (firstSnippet.hasValue()) {
     // Note: in order to improve performance and avoid multiple copies, we
-    // encode this (potentially large) string directly into the debugBinary.
+    // encode this (potentially large) string directly into the debugFileBinary.
     const auto &words = string::encodeSPIRVString(firstSnippet.getValue());
     const auto numWordsInInstr = curInst.size() + words.size();
     curInst[0] |= static_cast<uint32_t>(numWordsInInstr) << 16;
-    debugBinary.insert(debugBinary.end(), curInst.begin(), curInst.end());
-    debugBinary.insert(debugBinary.end(), words.begin(), words.end());
+    debugFileBinary.insert(debugFileBinary.end(), curInst.begin(),
+                           curInst.end());
+    debugFileBinary.insert(debugFileBinary.end(), words.begin(), words.end());
   } else {
     curInst[0] |= static_cast<uint32_t>(curInst.size()) << 16;
-    debugBinary.insert(debugBinary.end(), curInst.begin(), curInst.end());
+    debugFileBinary.insert(debugFileBinary.end(), curInst.begin(),
+                           curInst.end());
   }
 
   // Now emit OpSourceContinued for the [second:last] snippet.
   for (uint32_t i = 1; i < choppedSrcCode.size(); ++i) {
-    initInstruction(spv::Op::OpSourceContinued);
+    initInstruction(spv::Op::OpSourceContinued, /* SourceLocation */ {});
     // Note: in order to improve performance and avoid multiple copies, we
-    // encode this (potentially large) string directly into the debugBinary.
+    // encode this (potentially large) string directly into the debugFileBinary.
     const auto &words = string::encodeSPIRVString(choppedSrcCode[i]);
     const auto numWordsInInstr = curInst.size() + words.size();
     curInst[0] |= static_cast<uint32_t>(numWordsInInstr) << 16;
-    debugBinary.insert(debugBinary.end(), curInst.begin(), curInst.end());
-    debugBinary.insert(debugBinary.end(), words.begin(), words.end());
+    debugFileBinary.insert(debugFileBinary.end(), curInst.begin(),
+                           curInst.end());
+    debugFileBinary.insert(debugFileBinary.end(), words.begin(), words.end());
   }
 
   return true;
@@ -355,24 +478,6 @@ bool EmitVisitor::visit(SpirvSource *inst) {
 bool EmitVisitor::visit(SpirvModuleProcessed *inst) {
   initInstruction(inst);
   encodeString(inst->getProcess());
-  finalizeInstruction();
-  return true;
-}
-
-bool EmitVisitor::visit(SpirvLineInfo *inst) {
-  if (!spvOptions.debugInfoLine)
-    return true;
-
-  SpirvString *file = inst->getSourceFile();
-  uint32_t line = inst->getSourceLine();
-  uint32_t column = inst->getSourceColumn();
-  if (!file || line == 0 || column == 0)
-    return true;
-
-  initInstruction(inst);
-  curInst.push_back(getOrAssignResultId<SpirvInstruction>(file));
-  curInst.push_back(line);
-  curInst.push_back(column);
   finalizeInstruction();
   return true;
 }
@@ -406,6 +511,13 @@ bool EmitVisitor::visit(SpirvVariable *inst) {
   finalizeInstruction();
   emitDebugNameForInstruction(getOrAssignResultId<SpirvInstruction>(inst),
                               inst->getDebugName());
+  if (spvOptions.enableReflect && inst->hasBinding() &&
+      !inst->getHlslUserType().empty()) {
+    typeHandler.emitDecoration(
+        getOrAssignResultId<SpirvInstruction>(inst),
+        spv::Decoration::UserTypeGOOGLE,
+        string::encodeSPIRVString(inst->getHlslUserType().lower()));
+  }
   return true;
 }
 
@@ -1528,6 +1640,11 @@ void EmitTypeHandler::emitDecoration(uint32_t typeResultId,
 
   spv::Op op =
       memberIndex.hasValue() ? spv::Op::OpMemberDecorate : spv::Op::OpDecorate;
+  if (decoration == spv::Decoration::UserTypeGOOGLE) {
+    op = memberIndex.hasValue() ? spv::Op::OpMemberDecorateString
+                                : spv::Op::OpDecorateString;
+  }
+
   assert(curDecorationInst.empty());
   curDecorationInst.push_back(static_cast<uint32_t>(op));
   curDecorationInst.push_back(typeResultId);
@@ -1558,7 +1675,8 @@ void EmitTypeHandler::emitNameForType(llvm::StringRef name,
   const auto &words = string::encodeSPIRVString(name);
   nameInstr.insert(nameInstr.end(), words.begin(), words.end());
   nameInstr[0] |= static_cast<uint32_t>(nameInstr.size()) << 16;
-  debugBinary->insert(debugBinary->end(), nameInstr.begin(), nameInstr.end());
+  debugVariableBinary->insert(debugVariableBinary->end(), nameInstr.begin(),
+                              nameInstr.end());
 }
 
 } // end namespace spirv

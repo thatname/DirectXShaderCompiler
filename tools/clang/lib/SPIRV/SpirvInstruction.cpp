@@ -33,7 +33,6 @@ DEFINE_INVOKE_VISITOR_FOR_CLASS(SpirvExecutionMode)
 DEFINE_INVOKE_VISITOR_FOR_CLASS(SpirvString)
 DEFINE_INVOKE_VISITOR_FOR_CLASS(SpirvSource)
 DEFINE_INVOKE_VISITOR_FOR_CLASS(SpirvModuleProcessed)
-DEFINE_INVOKE_VISITOR_FOR_CLASS(SpirvLineInfo)
 DEFINE_INVOKE_VISITOR_FOR_CLASS(SpirvDecoration)
 DEFINE_INVOKE_VISITOR_FOR_CLASS(SpirvVariable)
 
@@ -194,11 +193,6 @@ SpirvModuleProcessed::SpirvModuleProcessed(SourceLocation loc,
                        QualType(), loc),
       process(processStr) {}
 
-SpirvLineInfo::SpirvLineInfo(SpirvString *srcFile, uint32_t srcLine,
-                             uint32_t srcCol)
-    : SpirvInstruction(IK_LineInfo, spv::Op::OpLine, QualType(), {}),
-      file(srcFile), line(srcLine), column(srcCol) {}
-
 SpirvDecoration::SpirvDecoration(SourceLocation loc,
                                  SpirvInstruction *targetInst,
                                  spv::Decoration decor,
@@ -232,7 +226,8 @@ SpirvDecoration::SpirvDecoration(SourceLocation loc,
 
 spv::Op SpirvDecoration::getDecorateOpcode(
     spv::Decoration decoration, const llvm::Optional<uint32_t> &memberIndex) {
-  if (decoration == spv::Decoration::HlslSemanticGOOGLE)
+  if (decoration == spv::Decoration::HlslSemanticGOOGLE ||
+      decoration == spv::Decoration::UserTypeGOOGLE)
     return memberIndex.hasValue() ? spv::Op::OpMemberDecorateStringGOOGLE
                                   : spv::Op::OpDecorateStringGOOGLE;
 
@@ -251,7 +246,8 @@ SpirvVariable::SpirvVariable(QualType resultType, SourceLocation loc,
                              spv::StorageClass sc, bool precise,
                              SpirvInstruction *initializerInst)
     : SpirvInstruction(IK_Variable, spv::Op::OpVariable, resultType, loc),
-      initializer(initializerInst) {
+      initializer(initializerInst), descriptorSet(-1), binding(-1),
+      hlslUserType("") {
   setStorageClass(sc);
   setPrecise(precise);
 }

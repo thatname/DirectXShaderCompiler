@@ -35,12 +35,13 @@ bool disassembleSpirvBinary(std::vector<uint32_t> &binary,
 }
 
 bool validateSpirvBinary(spv_target_env env, std::vector<uint32_t> &binary,
-                         bool relaxLogicalPointer, bool glLayout, bool dxLayout,
-                         bool scalarLayout, std::string *message) {
+                         bool beforeHlslLegalization, bool glLayout,
+                         bool dxLayout, bool scalarLayout,
+                         std::string *message) {
   spvtools::ValidatorOptions options;
-  options.SetRelaxLogicalPointer(relaxLogicalPointer);
+  options.SetBeforeHlslLegalization(beforeHlslLegalization);
   if (dxLayout || scalarLayout) {
-    options.SetSkipBlockLayout(true);
+    options.SetScalarBlockLayout(true);
   } else if (glLayout) {
     // The default for spirv-val.
   } else {
@@ -140,7 +141,6 @@ bool runCompilerWithSpirvGeneration(const llvm::StringRef inputFilePath,
   try {
     dxc::DxcDllSupport dllSupport;
     IFT(dllSupport.Initialize());
-    DxcInitThreadMalloc();
 
     if (hlsl::options::initHlslOptTable())
       throw std::bad_alloc();
@@ -211,7 +211,6 @@ bool runCompilerWithSpirvGeneration(const llvm::StringRef inputFilePath,
     success = false;
   }
 
-  DxcCleanupThreadMalloc();
   return success;
 }
 

@@ -63,11 +63,7 @@ void CapabilityVisitor::addCapabilityForType(const SpirvType *type,
     switch (floatType->getBitwidth()) {
     case 16: {
       // Usage of a 16-bit float type.
-      // It looks like the validator does not approve of Float16
-      // capability even though we do use the necessary extension.
-      // TODO: Re-enable adding Float16 capability below.
-      // addCapability(spv::Capability::Float16);
-      addExtension(Extension::AMD_gpu_shader_half_float, "16-bit float", loc);
+      addCapability(spv::Capability::Float16);
 
       // Usage of a 16-bit float type as stage I/O.
       if (sc == spv::StorageClass::Input || sc == spv::StorageClass::Output) {
@@ -183,7 +179,7 @@ void CapabilityVisitor::addCapabilityForType(const SpirvType *type,
   }
   // Struct type
   else if (const auto *structType = dyn_cast<StructType>(type)) {
-    if (SpirvType::isOrContains16BitType(structType)) {
+    if (SpirvType::isOrContainsType<NumericalType, 16>(structType)) {
       addExtension(Extension::KHR_16bit_storage, "16-bit types in resource",
                    loc);
       if (sc == spv::StorageClass::PushConstant) {
@@ -277,8 +273,9 @@ bool CapabilityVisitor::visit(SpirvDecoration *decor) {
       break;
     }
     case spv::BuiltIn::PrimitiveId: {
-      // PrimitiveID can be used as PSIn
-      if (shaderModel == spv::ExecutionModel::Fragment)
+      // PrimitiveID can be used as PSIn or MSPOut.
+      if (shaderModel == spv::ExecutionModel::Fragment ||
+          shaderModel == spv::ExecutionModel::MeshNV)
         addCapability(spv::Capability::Geometry);
       break;
     }
@@ -289,8 +286,9 @@ bool CapabilityVisitor::visit(SpirvDecoration *decor) {
         addExtension(Extension::EXT_shader_viewport_index_layer,
                      "SV_RenderTargetArrayIndex", loc);
         addCapability(spv::Capability::ShaderViewportIndexLayerEXT);
-      } else if (shaderModel == spv::ExecutionModel::Fragment) {
-        // SV_RenderTargetArrayIndex can be used as PSIn.
+      } else if (shaderModel == spv::ExecutionModel::Fragment ||
+                 shaderModel == spv::ExecutionModel::MeshNV) {
+        // SV_RenderTargetArrayIndex can be used as PSIn or MSPOut.
         addCapability(spv::Capability::Geometry);
       }
       break;
@@ -303,8 +301,9 @@ bool CapabilityVisitor::visit(SpirvDecoration *decor) {
                      "SV_ViewPortArrayIndex", loc);
         addCapability(spv::Capability::ShaderViewportIndexLayerEXT);
       } else if (shaderModel == spv::ExecutionModel::Fragment ||
-                 shaderModel == spv::ExecutionModel::Geometry) {
-        // SV_ViewportArrayIndex can be used as PSIn.
+                 shaderModel == spv::ExecutionModel::Geometry ||
+                 shaderModel == spv::ExecutionModel::MeshNV) {
+        // SV_ViewportArrayIndex can be used as PSIn or GSOut or MSPOut.
         addCapability(spv::Capability::MultiViewport);
       }
       break;
@@ -326,6 +325,13 @@ bool CapabilityVisitor::visit(SpirvDecoration *decor) {
     case spv::BuiltIn::BaryCoordPullModelAMD: {
       addExtension(Extension::AMD_shader_explicit_vertex_parameter,
                    "SV_Barycentrics", loc);
+      break;
+    }
+    case spv::BuiltIn::FragSizeEXT: {
+      addExtension(Extension::EXT_fragment_invocation_density, "SV_ShadingRate",
+                   loc);
+      addCapability(spv::Capability::FragmentDensityEXT);
+      break;
     }
     default:
       break;
@@ -378,6 +384,7 @@ bool CapabilityVisitor::visit(SpirvImageSparseTexelsResident *instr) {
   addCapabilityForType(instr->getResultType(), instr->getSourceLocation(),
                        instr->getStorageClass());
   addCapability(spv::Capability::ImageGatherExtended);
+  addCapability(spv::Capability::SparseResidency);
   return true;
 }
 
@@ -459,6 +466,15 @@ bool CapabilityVisitor::visitInstruction(SpirvInstruction *instr) {
   case spv::Op::OpGroupNonUniformQuadSwap:
     addCapability(spv::Capability::GroupNonUniformQuad);
     break;
+  case spv::Op::OpVariable: {
+    if (spvOptions.enableReflect &&
+        !cast<SpirvVariable>(instr)->getHlslUserType().empty()) {
+      addExtension(Extension::GOOGLE_user_type, "HLSL User Type", loc);
+      addExtension(Extension::GOOGLE_hlsl_functionality1, "HLSL User Type",
+                   loc);
+    }
+    break;
+  }
   default:
     break;
   }
@@ -490,6 +506,11 @@ bool CapabilityVisitor::visit(SpirvEntryPoint *entryPoint) {
     addCapability(spv::Capability::RayTracingNV);
     addExtension(Extension::NV_ray_tracing, "SPV_NV_ray_tracing", {});
     break;
+  case spv::ExecutionModel::MeshNV:
+  case spv::ExecutionModel::TaskNV:
+    addCapability(spv::Capability::MeshShadingNV);
+    addExtension(Extension::NV_mesh_shader, "SPV_NV_mesh_shader", {});
+    break;
   default:
     llvm_unreachable("found unknown shader model");
     break;
@@ -505,6 +526,26 @@ bool CapabilityVisitor::visit(SpirvExecutionMode *execMode) {
                  "[[vk::post_depth_coverage]]", execMode->getSourceLocation());
   }
   return true;
+}
+
+bool CapabilityVisitor::visit(SpirvExtInst *instr) {
+  // OpExtInst using the GLSL extended instruction allows only 32-bit types by
+  // default for interpolation instructions. The AMD_gpu_shader_half_float
+  // extension adds support for 16-bit floating-point component types for these
+  // instructions:
+  // InterpolateAtCentroid, InterpolateAtSample, InterpolateAtOffset
+  if (SpirvType::isOrContainsType<FloatType, 16>(instr->getResultType()))
+    switch (instr->getInstruction()) {
+    case GLSLstd450::GLSLstd450InterpolateAtCentroid:
+    case GLSLstd450::GLSLstd450InterpolateAtSample:
+    case GLSLstd450::GLSLstd450InterpolateAtOffset:
+      addExtension(Extension::AMD_gpu_shader_half_float, "16-bit float",
+                   instr->getSourceLocation());
+    default:
+      break;
+    }
+
+  return visitInstruction(instr);
 }
 
 } // end namespace spirv

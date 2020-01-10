@@ -54,7 +54,8 @@ public:
   /// on failure.
   ///
   /// At any time, there can only exist at most one function under building.
-  SpirvFunction *beginFunction(QualType returnType, SpirvType *functionType,
+  SpirvFunction *beginFunction(QualType returnType,
+                               llvm::ArrayRef<QualType> paramTypes,
                                SourceLocation, llvm::StringRef name = "",
                                bool isPrecise = false,
                                SpirvFunction *func = nullptr);
@@ -113,19 +114,14 @@ public:
   SpirvCompositeConstruct *
   createCompositeConstruct(QualType resultType,
                            llvm::ArrayRef<SpirvInstruction *> constituents,
-                           SourceLocation loc = {});
-  SpirvCompositeConstruct *
-  createCompositeConstruct(const SpirvType *resultType,
-                           llvm::ArrayRef<SpirvInstruction *> constituents,
-                           SourceLocation loc = {});
+                           SourceLocation loc);
 
   /// \brief Creates a composite extract instruction. The given composite is
   /// indexed using the given literal indexes to obtain the resulting element.
   /// Returns the instruction pointer for the extracted element.
   SpirvCompositeExtract *
   createCompositeExtract(QualType resultType, SpirvInstruction *composite,
-                         llvm::ArrayRef<uint32_t> indexes,
-                         SourceLocation loc = {});
+                         llvm::ArrayRef<uint32_t> indexes, SourceLocation loc);
 
   /// \brief Creates a composite insert instruction. The given object will
   /// replace the component in the composite at the given indices. Returns the
@@ -134,7 +130,7 @@ public:
                                               SpirvInstruction *composite,
                                               llvm::ArrayRef<uint32_t> indices,
                                               SpirvInstruction *object,
-                                              SourceLocation loc = {});
+                                              SourceLocation loc);
 
   /// \brief Creates a vector shuffle instruction of selecting from the two
   /// vectors using selectors and returns the instruction pointer of the result
@@ -143,56 +139,55 @@ public:
                                           SpirvInstruction *vector1,
                                           SpirvInstruction *vector2,
                                           llvm::ArrayRef<uint32_t> selectors,
-                                          SourceLocation loc = {});
+                                          SourceLocation loc);
 
   /// \brief Creates a load instruction loading the value of the given
   /// <result-type> from the given pointer. Returns the instruction pointer for
   /// the loaded value.
   SpirvLoad *createLoad(QualType resultType, SpirvInstruction *pointer,
-                        SourceLocation loc = {});
+                        SourceLocation loc);
   SpirvLoad *createLoad(const SpirvType *resultType, SpirvInstruction *pointer,
-                        SourceLocation loc = {});
+                        SourceLocation loc);
 
   /// \brief Creates a store instruction storing the given value into the given
   /// address.
   void createStore(SpirvInstruction *address, SpirvInstruction *value,
-                   SourceLocation loc = {});
+                   SourceLocation loc);
 
   /// \brief Creates a function call instruction and returns the instruction
   /// pointer for the return value.
   SpirvFunctionCall *
   createFunctionCall(QualType returnType, SpirvFunction *func,
                      llvm::ArrayRef<SpirvInstruction *> params,
-                     SourceLocation loc = {});
+                     SourceLocation loc);
 
   /// \brief Creates an access chain instruction to retrieve the element from
   /// the given base by walking through the given indexes. Returns the
   /// instruction pointer for the pointer to the element.
+  /// Note: The given 'resultType' should be the underlying value type, not the
+  /// pointer type. The type lowering pass automatically adds pointerness and
+  /// proper storage class (based on the access base) to the result type.
   SpirvAccessChain *
   createAccessChain(QualType resultType, SpirvInstruction *base,
                     llvm::ArrayRef<SpirvInstruction *> indexes,
-                    SourceLocation loc = {});
-  SpirvAccessChain *
-  createAccessChain(const SpirvType *resultType, SpirvInstruction *base,
-                    llvm::ArrayRef<SpirvInstruction *> indexes,
-                    SourceLocation loc = {});
+                    SourceLocation loc);
 
   /// \brief Creates a unary operation with the given SPIR-V opcode. Returns
   /// the instruction pointer for the result.
   SpirvUnaryOp *createUnaryOp(spv::Op op, QualType resultType,
-                              SpirvInstruction *operand,
-                              SourceLocation loc = {});
+                              SpirvInstruction *operand, SourceLocation loc);
 
   /// \brief Creates a binary operation with the given SPIR-V opcode. Returns
   /// the instruction pointer for the result.
   SpirvBinaryOp *createBinaryOp(spv::Op op, QualType resultType,
                                 SpirvInstruction *lhs, SpirvInstruction *rhs,
-                                SourceLocation loc = {});
+                                SourceLocation loc);
 
-  SpirvSpecConstantBinaryOp *
-  createSpecConstantBinaryOp(spv::Op op, QualType resultType,
-                             SpirvInstruction *lhs, SpirvInstruction *rhs,
-                             SourceLocation loc = {});
+  SpirvSpecConstantBinaryOp *createSpecConstantBinaryOp(spv::Op op,
+                                                        QualType resultType,
+                                                        SpirvInstruction *lhs,
+                                                        SpirvInstruction *rhs,
+                                                        SourceLocation loc);
 
   /// \brief Creates an operation with the given OpGroupNonUniform* SPIR-V
   /// opcode.
@@ -264,7 +259,7 @@ public:
                     SpirvInstruction *constOffset, SpirvInstruction *varOffset,
                     SpirvInstruction *constOffsets, SpirvInstruction *sample,
                     SpirvInstruction *minLod, SpirvInstruction *residencyCodeId,
-                    SourceLocation loc = {});
+                    SourceLocation loc);
 
   /// \brief Creates SPIR-V instructions for reading a texel from an image. If
   /// doImageFetch is true, OpImageFetch is used. OpImageRead is used otherwise.
@@ -280,12 +275,12 @@ public:
       SpirvInstruction *lod, SpirvInstruction *constOffset,
       SpirvInstruction *varOffset, SpirvInstruction *constOffsets,
       SpirvInstruction *sample, SpirvInstruction *residencyCode,
-      SourceLocation loc = {});
+      SourceLocation loc);
 
   /// \brief Creates SPIR-V instructions for writing to the given image.
   void createImageWrite(QualType imageType, SpirvInstruction *image,
                         SpirvInstruction *coord, SpirvInstruction *texel,
-                        SourceLocation loc = {});
+                        SourceLocation loc);
 
   /// \brief Creates SPIR-V instructions for gathering the given image.
   ///
@@ -324,8 +319,7 @@ public:
   /// cases and returns the instruction pointer.
   SpirvSelect *createSelect(QualType resultType, SpirvInstruction *condition,
                             SpirvInstruction *trueValue,
-                            SpirvInstruction *falseValue,
-                            SourceLocation);
+                            SpirvInstruction *falseValue, SourceLocation);
 
   /// \brief Creates a switch statement for the given selector, default, and
   /// branches. Results in OpSelectionMerge followed by OpSwitch.
@@ -342,10 +336,9 @@ public:
   /// If mergeBB and continueBB are non-null, it creates an OpLoopMerge
   /// instruction followed by an unconditional branch to the given target label.
   void createBranch(
-      SpirvBasicBlock *targetLabel, SpirvBasicBlock *mergeBB = nullptr,
-      SpirvBasicBlock *continueBB = nullptr,
-      spv::LoopControlMask loopControl = spv::LoopControlMask::MaskNone,
-      SourceLocation loc = {});
+      SpirvBasicBlock *targetLabel, SourceLocation loc,
+      SpirvBasicBlock *mergeBB = nullptr, SpirvBasicBlock *continueBB = nullptr,
+      spv::LoopControlMask loopControl = spv::LoopControlMask::MaskNone);
 
   /// \brief Creates a conditional branch. An OpSelectionMerge instruction
   /// will be created if mergeLabel is not null and continueLabel is null.
@@ -356,12 +349,12 @@ public:
   /// Otherwise, MaskNone will be used.
   void createConditionalBranch(
       SpirvInstruction *condition, SpirvBasicBlock *trueLabel,
-      SpirvBasicBlock *falseLabel, SpirvBasicBlock *mergeLabel = nullptr,
+      SpirvBasicBlock *falseLabel, SourceLocation loc,
+      SpirvBasicBlock *mergeLabel = nullptr,
       SpirvBasicBlock *continueLabel = nullptr,
       spv::SelectionControlMask selectionControl =
           spv::SelectionControlMask::MaskNone,
-      spv::LoopControlMask loopControl = spv::LoopControlMask::MaskNone,
-      SourceLocation loc = {});
+      spv::LoopControlMask loopControl = spv::LoopControlMask::MaskNone);
 
   /// \brief Creates a return instruction.
   void createReturn(SourceLocation);
@@ -413,8 +406,6 @@ public:
                                       SpirvInstruction *structure,
                                       uint32_t arrayMember);
 
-  void createLineInfo(SpirvString *file, uint32_t line, uint32_t column);
-
   /// \brief Creates SPIR-V instructions for NV raytracing ops.
   SpirvInstruction *
   createRayTracingOpsNV(spv::Op opcode, QualType resultType,
@@ -433,7 +424,7 @@ public:
   /// \brief Sets the shader model version, source file name, and source file
   /// content. Returns the SpirvString instruction of the file name.
   inline SpirvString *setDebugSource(uint32_t major, uint32_t minor,
-                                     llvm::StringRef name,
+                                     const std::vector<llvm::StringRef> &name,
                                      llvm::StringRef content);
 
   /// \brief Adds an execution mode to the module under construction.
@@ -455,7 +446,7 @@ public:
   /// constructed in this method.
   SpirvVariable *addStageIOVar(QualType type, spv::StorageClass storageClass,
                                std::string name, bool isPrecise,
-                               SourceLocation loc = {});
+                               SourceLocation loc);
 
   /// \brief Adds a stage builtin variable whose value is of the given type.
   ///
@@ -464,7 +455,7 @@ public:
   SpirvVariable *addStageBuiltinVar(QualType type,
                                     spv::StorageClass storageClass,
                                     spv::BuiltIn, bool isPrecise,
-                                    SourceLocation loc = {});
+                                    SourceLocation loc);
 
   /// \brief Adds a module variable. This variable should not have the Function
   /// storage class.
@@ -490,7 +481,7 @@ public:
 
   /// \brief Decorates the given target with the given descriptor set and
   /// binding number.
-  void decorateDSetBinding(SpirvInstruction *target, uint32_t setNumber,
+  void decorateDSetBinding(SpirvVariable *target, uint32_t setNumber,
                            uint32_t bindingNumber);
 
   /// \brief Decorates the given target with the given SpecId.
@@ -527,6 +518,13 @@ public:
 
   /// \brief Decorates the given target with NoContraction
   void decorateNoContraction(SpirvInstruction *target, SourceLocation);
+
+  /// \brief Decorates the given target with PerPrimitiveNV
+  void decoratePerPrimitiveNV(SpirvInstruction *target, SourceLocation);
+
+  /// \brief Decorates the given target with PerTaskNV
+  void decoratePerTaskNV(SpirvInstruction *target, uint32_t offset,
+                         SourceLocation);
 
   /// --- Constants ---
   /// Each of these methods can acquire a unique constant from the SpirvContext,
@@ -616,22 +614,33 @@ void SpirvBuilder::addEntryPoint(spv::ExecutionModel em, SpirvFunction *target,
       target->getSourceLocation(), em, target, targetName, interfaces));
 }
 
-SpirvString *SpirvBuilder::setDebugSource(uint32_t major, uint32_t minor,
-                                          llvm::StringRef name,
-                                          llvm::StringRef content) {
+SpirvString *
+SpirvBuilder::setDebugSource(uint32_t major, uint32_t minor,
+                             const std::vector<llvm::StringRef> &fileNames,
+                             llvm::StringRef content) {
   uint32_t version = 100 * major + 10 * minor;
+  SpirvSource *mainSource = nullptr;
+  for (const auto &name : fileNames) {
+    SpirvString *fileString =
+        name.empty() ? nullptr
+                     : new (context) SpirvString(/*SourceLocation*/ {}, name);
+    SpirvSource *debugSource = new (context)
+        SpirvSource(/*SourceLocation*/ {}, spv::SourceLanguage::HLSL, version,
+                    fileString, content);
+    module->addDebugSource(debugSource);
+    if (!mainSource)
+      mainSource = debugSource;
+  }
 
-  SpirvString *fileString =
-      name.empty() ? nullptr
-                   : new (context) SpirvString(/*SourceLocation*/ {}, name);
-
-  SpirvSource *debugSource = new (context)
-      SpirvSource(/*SourceLocation*/ {}, spv::SourceLanguage::HLSL, version,
-                  fileString, content);
-
-  module->addDebugSource(debugSource);
-
-  return fileString;
+  // If mainSource is nullptr, fileNames is empty and no input file is
+  // specified. We must create a SpirvSource for OpSource HLSL <version>.
+  if (!mainSource) {
+    mainSource = new (context)
+        SpirvSource(/*SourceLocation*/ {}, spv::SourceLanguage::HLSL, version,
+                    nullptr, content);
+    module->addDebugSource(mainSource);
+  }
+  return mainSource->getFile();
 }
 
 void SpirvBuilder::addExecutionMode(SpirvFunction *entryPoint,

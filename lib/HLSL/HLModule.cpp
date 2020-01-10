@@ -14,6 +14,7 @@
 #include "dxc/DXIL/DxilCBuffer.h"
 #include "dxc/HLSL/HLModule.h"
 #include "dxc/DXIL/DxilTypeSystem.h"
+#include "dxc/DXIL/DxilUtil.h"
 #include "dxc/Support/WinAdapter.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -756,7 +757,7 @@ void HLModule::LoadDxilResourceBaseFromMDNode(MDNode *MD, DxilResourceBase &R) {
   return m_pMDHelper->LoadDxilResourceBaseFromMDNode(MD, R);
 }
 
-void HLModule::AddResourceWithGlobalVariableAndMDNode(llvm::Constant *GV,
+DxilResourceBase *HLModule::AddResourceWithGlobalVariableAndMDNode(llvm::Constant *GV,
                                                       llvm::MDNode *MD) {
   IFTBOOL(MD->getNumOperands() >= DxilMDHelper::kHLDxilResourceAttributeNumFields,
           DXC_E_INCORRECT_DXIL_METADATA);
@@ -770,7 +771,7 @@ void HLModule::AddResourceWithGlobalVariableAndMDNode(llvm::Constant *GV,
   Type *Ty = GV->getType()->getPointerElementType();
   if (ArrayType *AT = dyn_cast<ArrayType>(Ty))
     rangeSize = AT->getNumElements();
-
+  DxilResourceBase *R = nullptr;
   switch (RC) {
   case DxilResource::Class::Sampler: {
     std::unique_ptr<DxilSampler> S = llvm::make_unique<DxilSampler>();
@@ -778,6 +779,7 @@ void HLModule::AddResourceWithGlobalVariableAndMDNode(llvm::Constant *GV,
     S->SetGlobalSymbol(GV);
     S->SetGlobalName(GV->getName());
     S->SetRangeSize(rangeSize);
+    R = S.get();
     AddSampler(std::move(S));
   } break;
   case DxilResource::Class::SRV: {
@@ -786,6 +788,7 @@ void HLModule::AddResourceWithGlobalVariableAndMDNode(llvm::Constant *GV,
     Res->SetGlobalSymbol(GV);
     Res->SetGlobalName(GV->getName());
     Res->SetRangeSize(rangeSize);
+    R = Res.get();
     AddSRV(std::move(Res));
   } break;
   case DxilResource::Class::UAV: {
@@ -794,21 +797,160 @@ void HLModule::AddResourceWithGlobalVariableAndMDNode(llvm::Constant *GV,
     Res->SetGlobalSymbol(GV);
     Res->SetGlobalName(GV->getName());
     Res->SetRangeSize(rangeSize);
+    R = Res.get();
     AddUAV(std::move(Res));
   } break;
   default:
     DXASSERT(0, "Invalid metadata for AddResourceWithGlobalVariableAndMDNode");
   }
+  return R;
+}
+
+static uint64_t getRegBindingKey(unsigned CbID, unsigned ConstantIdx) {
+  return (uint64_t)(CbID) << 32 | ConstantIdx;
+}
+
+void HLModule::AddRegBinding(unsigned CbID, unsigned ConstantIdx, unsigned Srv, unsigned Uav,
+                             unsigned Sampler) {
+  uint64_t Key = getRegBindingKey(CbID, ConstantIdx);
+  m_SrvBindingInCB[Key] = Srv;
+  m_UavBindingInCB[Key] = Uav;
+  m_SamplerBindingInCB[Key] = Sampler;
+}
+
+static DXIL::ResourceClass GetRCFromType(Type *ResTy, Module &M) {
+  MDNode *MD = HLModule::GetDxilResourceAttrib(ResTy, M);
+  if (!MD)
+    return DXIL::ResourceClass::Invalid;
+  DxilResource::Class RC =
+      static_cast<DxilResource::Class>(DxilMDHelper::ConstMDToUint32(
+          MD->getOperand(DxilMDHelper::kHLDxilResourceAttributeClass)));
+  return RC;
+}
+
+static unsigned CountResNum(Module &M, Type *Ty, DXIL::ResourceClass RC) {
+  // Count num of RCs.
+  unsigned ArraySize = 1;
+  while (ArrayType *AT = dyn_cast<ArrayType>(Ty)) {
+    ArraySize *= AT->getNumElements();
+    Ty = AT->getElementType();
+  }
+
+  if (!Ty->isAggregateType())
+    return 0;
+
+  StructType *ST = dyn_cast<StructType>(Ty);
+  DXIL::ResourceClass TmpRC = GetRCFromType(ST, M);
+  if (TmpRC == RC)
+    return ArraySize;
+
+  unsigned Size = 0;
+  for (Type *EltTy : ST->elements()) {
+    Size += CountResNum(M, EltTy, RC);
+  }
+
+  return Size * ArraySize;
+}
+// Note: the rule for register binding on struct array is like this:
+// struct X {
+//   Texture2D x;
+//   SamplerState s ;
+//   Texture2D y;
+// };
+// X x[2] : register(t3) : register(s3);
+// x[0].x t3
+// x[0].s s3
+// x[0].y t4
+// x[1].x t5
+// x[1].s s4
+// x[1].y t6
+// So x[0].x and x[1].x not in an array.
+static unsigned CalcRegBinding(gep_type_iterator GEPIt, gep_type_iterator E,
+                               Module &M, DXIL::ResourceClass RC) {
+  unsigned NumRC = 0;
+  // Count GEP offset when only count RC size.
+  for (; GEPIt != E; GEPIt++) {
+    Type *Ty = *GEPIt;
+    Value *idx = GEPIt.getOperand();
+    Constant *constIdx = dyn_cast<Constant>(idx);
+    unsigned immIdx = constIdx->getUniqueInteger().getLimitedValue();
+    // Not support dynamic indexing.
+    // Array should be just 1d res array as global res.
+    if (ArrayType *AT = dyn_cast<ArrayType>(Ty)) {
+      NumRC += immIdx * CountResNum(M, AT->getElementType(), RC);
+    } else if (StructType *ST = dyn_cast<StructType>(Ty)) {
+      for (unsigned i=0;i<immIdx;i++) {
+        NumRC += CountResNum(M, ST->getElementType(i), RC);
+      }
+    }
+  }
+  return NumRC;
+}
+
+unsigned HLModule::GetBindingForResourceInCB(GetElementPtrInst *CbPtr,
+                                             GlobalVariable *CbGV) {
+  if (!CbPtr->hasAllConstantIndices()) {
+    // Not support dynmaic indexing resource array inside cb.
+    string ErrorMsg("Index for resource array inside cbuffer must be a literal expression");
+    dxilutil::EmitErrorOnInstruction(
+        CbPtr,
+        ErrorMsg);
+    return UINT_MAX;
+  }
+  Module &M = *m_pModule;
+  Type *ResTy = CbPtr->getResultElementType();
+  DxilResource::Class RC = GetRCFromType(ResTy, M);
+
+  unsigned RegBinding = UINT_MAX;
+  for (auto &CB : m_CBuffers) {
+    if (CbGV != CB->GetGlobalSymbol())
+      continue;
+
+    gep_type_iterator GEPIt = gep_type_begin(CbPtr), E = gep_type_end(CbPtr);
+    // The pointer index.
+    GEPIt++;
+    unsigned ID = CB->GetID();
+    unsigned idx = cast<ConstantInt>(GEPIt.getOperand())->getLimitedValue();
+    // The first level index to get current constant.
+    GEPIt++;
+
+    uint64_t Key = getRegBindingKey(ID, idx);
+    switch (RC) {
+    default:
+      break;
+    case DXIL::ResourceClass::SRV:
+      if (m_SrvBindingInCB.count(Key))
+        RegBinding = m_SrvBindingInCB[Key];
+      break;
+    case DXIL::ResourceClass::UAV:
+      if (m_UavBindingInCB.count(Key))
+        RegBinding = m_UavBindingInCB[Key];
+      break;
+    case DXIL::ResourceClass::Sampler:
+      if (m_SamplerBindingInCB.count(Key))
+        RegBinding = m_SamplerBindingInCB[Key];
+      break;
+    }
+    if (RegBinding == UINT_MAX)
+      break;
+
+    // Calc RegBinding.
+    RegBinding += CalcRegBinding(GEPIt, E, M, RC);
+
+    break;
+  }
+  return RegBinding;
 }
 
 // TODO: Don't check names.
 bool HLModule::IsStreamOutputType(llvm::Type *Ty) {
   if (StructType *ST = dyn_cast<StructType>(Ty)) {
-    if (ST->getName().startswith("class.PointStream"))
+    StringRef name = ST->getName();
+    if (name.startswith("class.PointStream"))
       return true;
-    if (ST->getName().startswith("class.LineStream"))
+    if (name.startswith("class.LineStream"))
       return true;
-    if (ST->getName().startswith("class.TriangleStream"))
+    if (name.startswith("class.TriangleStream"))
       return true;
   }
   return false;
@@ -831,6 +973,8 @@ void HLModule::GetParameterRowsAndCols(Type *Ty, unsigned &rows, unsigned &cols,
   bool skipOneLevelArray = inputQual == DxilParamInputQual::InputPatch;
   skipOneLevelArray |= inputQual == DxilParamInputQual::OutputPatch;
   skipOneLevelArray |= inputQual == DxilParamInputQual::InputPrimitive;
+  skipOneLevelArray |= inputQual == DxilParamInputQual::OutVertices;
+  skipOneLevelArray |= inputQual == DxilParamInputQual::OutPrimitives;
 
   if (skipOneLevelArray) {
     if (Ty->isArrayTy())
@@ -1097,8 +1241,13 @@ void HLModule::MarkPreciseAttributeOnPtrWithFunctionCall(llvm::Value *Ptr,
           MarkPreciseAttributeOnValWithFunctionCall(arg, Builder, M);
         }
       } else {
-        IRBuilder<> Builder(CI->getNextNode());
-        MarkPreciseAttributeOnValWithFunctionCall(CI, Builder, M);
+        if (CI->getType()->isPointerTy()) {
+          // For instance, matrix subscript...
+          MarkPreciseAttributeOnPtrWithFunctionCall(CI, M);
+        } else {
+          IRBuilder<> Builder(CI->getNextNode());
+          MarkPreciseAttributeOnValWithFunctionCall(CI, Builder, M);
+        }
       }
     } else {
       // Must be GEP here.

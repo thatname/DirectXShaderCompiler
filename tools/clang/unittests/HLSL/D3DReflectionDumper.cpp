@@ -58,7 +58,8 @@ LPCSTR ToString(D3D_SHADER_INPUT_TYPE Type) {
   case D3D_SIT_UAV_APPEND_STRUCTURED: return "D3D_SIT_UAV_APPEND_STRUCTURED";
   case D3D_SIT_UAV_CONSUME_STRUCTURED: return "D3D_SIT_UAV_CONSUME_STRUCTURED";
   case D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER: return "D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER";
-  case D3D_SIT_RTACCELERATIONSTRUCTURE: return "D3D_SIT_RTACCELERATIONSTRUCTURE";
+  case (D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER + 1): return "D3D_SIT_RTACCELERATIONSTRUCTURE";
+  case (D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER + 2): return "D3D_SIT_UAV_FEEDBACKTEXTURE";
   default: return nullptr;
   }
 }
@@ -308,6 +309,8 @@ void D3DReflectionDumper::DumpShaderVersion(UINT Version) {
   case (UINT)hlsl::DXIL::ShaderKind::ClosestHit: szType = "ClosestHit"; break;
   case (UINT)hlsl::DXIL::ShaderKind::Miss: szType = "Miss"; break;
   case (UINT)hlsl::DXIL::ShaderKind::Callable: szType = "Callable"; break;
+  case (UINT)hlsl::DXIL::ShaderKind::Mesh: szType = "Mesh"; break;
+  case (UINT)hlsl::DXIL::ShaderKind::Amplification: szType = "Amplification"; break;
   case (UINT)hlsl::DXIL::ShaderKind::Invalid: szType = "Invalid"; break;
   }
   UINT Major = D3D12_SHVER_GET_MAJOR(Version);

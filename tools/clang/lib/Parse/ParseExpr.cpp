@@ -794,9 +794,15 @@ HLSLReservedKeyword:
   case tok::kw_sample:
   case tok::kw_globallycoherent:
   case tok::kw_center:
+  case tok::kw_indices:
+  case tok::kw_vertices:
+  case tok::kw_primitives:
+  case tok::kw_payload:
     // Back-compat: 'precise', 'globallycoherent', 'center' and 'sample' are keywords when used as an interpolation 
     // modifiers, but in FXC they can also be used an identifiers. No interpolation modifiers are expected here
     // so we need to change the token type to tok::identifier and fall through to the next case.
+    // Similarly 'indices', 'vertices', 'primitives' and 'payload' are keywords when used
+    // as a type qualifer in mesh shader, but may still be used as a variable name.
     Tok.setKind(tok::identifier);
     __fallthrough;
     // HLSL Change Ends
@@ -1137,7 +1143,7 @@ HLSLReservedKeyword:
   case tok::kw_vec_step:   // unary-expression: OpenCL 'vec_step' expression
   // unary-expression: '__builtin_omp_required_simd_align' '(' type-name ')'
   case tok::kw___builtin_omp_required_simd_align:
-    if (getLangOpts().HLSL) { goto HLSLReservedKeyword; } // HLSL Change - not supported
+    if (getLangOpts().HLSL && Tok.getKind() != tok::kw_sizeof) { goto HLSLReservedKeyword; } // HLSL Change - not supported
     return ParseUnaryExprOrTypeTraitExpression();
   case tok::ampamp: {      // unary-expression: '&&' identifier
     // HLSL Change Starts
@@ -1722,6 +1728,10 @@ Parser::ParsePostfixExpressionSuffix(ExprResult LHS) {
         case tok::kw_globallycoherent:
         case tok::kw_precise:
         case tok::kw_sample:
+        case tok::kw_indices:
+        case tok::kw_vertices:
+        case tok::kw_primitives:
+        case tok::kw_payload:
           Tok.setKind(tok::identifier);
           Tok.setIdentifierInfo(PP.getIdentifierInfo(getKeywordSpelling(tk)));
           break;
@@ -1809,7 +1819,10 @@ Parser::ParseExprAfterUnaryExprOrTypeTrait(const Token &OpTok,
                                            bool &isCastExpr,
                                            ParsedType &CastTy,
                                            SourceRange &CastRange) {
-  assert(!getLangOpts().HLSL && "not supported for HLSL - unreachable"); // HLSL Change
+  // HLSL Change Begin
+  assert((!getLangOpts().HLSL || OpTok.getKind() == tok::kw_sizeof)
+    && "not supported for HLSL - unreachable");
+  // HLSL Change End
 
   assert(OpTok.isOneOf(tok::kw_typeof, tok::kw_sizeof, tok::kw___alignof,
                        tok::kw_alignof, tok::kw__Alignof, tok::kw_vec_step,
@@ -1897,7 +1910,10 @@ Parser::ParseExprAfterUnaryExprOrTypeTrait(const Token &OpTok,
 /// [C++11] 'alignof' '(' type-id ')'
 /// \endverbatim
 ExprResult Parser::ParseUnaryExprOrTypeTraitExpression() {
-  assert(!getLangOpts().HLSL && "not supported for HLSL - unreachable"); // HLSL Change
+  // HLSL Change Begin
+  assert((!getLangOpts().HLSL || Tok.getKind() == tok::kw_sizeof)
+    && "not supported for HLSL - unreachable");
+  // HLSL Change End
   assert(Tok.isOneOf(tok::kw_sizeof, tok::kw___alignof, tok::kw_alignof,
                      tok::kw__Alignof, tok::kw_vec_step,
                      tok::kw___builtin_omp_required_simd_align) &&
@@ -1906,7 +1922,7 @@ ExprResult Parser::ParseUnaryExprOrTypeTraitExpression() {
   ConsumeToken();
 
   // [C++11] 'sizeof' '...' '(' identifier ')'
-  if (Tok.is(tok::ellipsis) && OpTok.is(tok::kw_sizeof)) {
+  if (Tok.is(tok::ellipsis) && OpTok.is(tok::kw_sizeof) && !getLangOpts().HLSL) { // HLSL Change
     SourceLocation EllipsisLoc = ConsumeToken();
     SourceLocation LParenLoc, RParenLoc;
     IdentifierInfo *Name = nullptr;

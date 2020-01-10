@@ -15,6 +15,7 @@
 #include "dxc/Support/HLSLOptions.h"
 #include "dxc/Support/Global.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/FileSystem.h"
@@ -31,7 +32,7 @@ bool TestModuleSetup() {
     return false;
   if (FAILED(DxcInitThreadMalloc()))
     return false;
-  DxcSetThreadMallocOrDefault(nullptr);
+  DxcSetThreadMallocToDefault();
 
   if (hlsl::options::initHlslOptTable()) {
     return false;
@@ -133,13 +134,14 @@ bool CheckOperationResultMsgs(IDxcOperationResult *pResult,
                               llvm::ArrayRef<LPCSTR> pErrorMsgs,
                               bool maySucceedAnyway, bool bRegex) {
   HRESULT status;
-  CComPtr<IDxcBlobEncoding> text;
+  CComPtr<IDxcBlobEncoding> textBlob;
   if (!pResult)
     return true;
   VERIFY_SUCCEEDED(pResult->GetStatus(&status));
-  VERIFY_SUCCEEDED(pResult->GetErrorBuffer(&text));
-  const char *pStart = text ? (const char *)text->GetBufferPointer() : nullptr;
-  const char *pEnd = text ? pStart + text->GetBufferSize() : nullptr;
+  VERIFY_SUCCEEDED(pResult->GetErrorBuffer(&textBlob));
+  std::string textUtf8 = BlobToUtf8(textBlob);
+  const char *pStart = !textUtf8.empty() ? textUtf8.c_str() : nullptr;
+  const char *pEnd = !textUtf8.empty() ? pStart + textUtf8.length() : nullptr;
   if (pErrorMsgs.empty() || (pErrorMsgs.size() == 1 && !pErrorMsgs[0])) {
     if (FAILED(status) && pStart) {
       WEX::Logging::Log::Comment(WEX::Common::String().Format(
@@ -151,9 +153,7 @@ bool CheckOperationResultMsgs(IDxcOperationResult *pResult,
     if (SUCCEEDED(status) && maySucceedAnyway) {
       return false;
     }
-    CheckMsgs(llvm::StringRef((const char *)text->GetBufferPointer(),
-                              text->GetBufferSize()),
-              pErrorMsgs, bRegex);
+    CheckMsgs(textUtf8, pErrorMsgs, bRegex);
   }
   return true;
 }
@@ -218,22 +218,77 @@ void SplitPassList(LPWSTR pPassesBuffer, std::vector<LPCWSTR> &passes) {
   }
 }
 
-std::wstring BlobToUtf16(_In_ IDxcBlob *pBlob) {
-  CComPtr<IDxcBlobEncoding> pBlobEncoding;
+std::string BlobToUtf8(_In_ IDxcBlob *pBlob) {
+  if (!pBlob)
+    return std::string();
   const UINT CP_UTF16 = 1200;
+  CComPtr<IDxcBlobUtf8> pBlobUtf8;
+  if (SUCCEEDED(pBlob->QueryInterface(&pBlobUtf8)))
+    return std::string(pBlobUtf8->GetStringPointer(), pBlobUtf8->GetStringLength());
+  CComPtr<IDxcBlobEncoding> pBlobEncoding;
+  IFT(pBlob->QueryInterface(&pBlobEncoding));
+  //if (FAILED(pBlob->QueryInterface(&pBlobEncoding))) {
+  //  // Assume it is already UTF-8
+  //  return std::string((const char*)pBlob->GetBufferPointer(),
+  //                     pBlob->GetBufferSize());
+  //}
+  BOOL known;
+  UINT32 codePage;
+  IFT(pBlobEncoding->GetEncoding(&known, &codePage));
+  if (!known) {
+    throw std::runtime_error("unknown codepage for blob.");
+  }
+  std::string result;
+  if (codePage == CP_UTF16) {
+    const wchar_t* text = (const wchar_t *)pBlob->GetBufferPointer();
+    size_t length = pBlob->GetBufferSize() / 2;
+    if (length >= 1 && text[length-1] == L'\0')
+      length -= 1;  // Exclude null-terminator
+    Unicode::UTF16ToUTF8String(text, length, &result);
+    return result;
+  } else if (codePage == CP_UTF8) {
+    const char* text = (const char *)pBlob->GetBufferPointer();
+    size_t length = pBlob->GetBufferSize();
+    if (length >= 1 && text[length-1] == '\0')
+      length -= 1;  // Exclude null-terminator
+    result.resize(length);
+    memcpy((void *)result.data(), text, length);
+    return result;
+  } else {
+    throw std::runtime_error("Unsupported codepage.");
+  }
+}
+
+std::wstring BlobToUtf16(_In_ IDxcBlob *pBlob) {
+  if (!pBlob)
+    return std::wstring();
+  const UINT CP_UTF16 = 1200;
+  CComPtr<IDxcBlobUtf16> pBlobUtf16;
+  if (SUCCEEDED(pBlob->QueryInterface(&pBlobUtf16)))
+    return std::wstring(pBlobUtf16->GetStringPointer(), pBlobUtf16->GetStringLength());
+  CComPtr<IDxcBlobEncoding> pBlobEncoding;
   IFT(pBlob->QueryInterface(&pBlobEncoding));
   BOOL known;
   UINT32 codePage;
   IFT(pBlobEncoding->GetEncoding(&known, &codePage));
+  if (!known) {
+    throw std::runtime_error("unknown codepage for blob.");
+  }
   std::wstring result;
   if (codePage == CP_UTF16) {
-    result.resize(pBlob->GetBufferSize() + 1);
-    memcpy((void *)result.data(), pBlob->GetBufferPointer(),
-           pBlob->GetBufferSize());
+    const wchar_t* text = (const wchar_t *)pBlob->GetBufferPointer();
+    size_t length = pBlob->GetBufferSize() / 2;
+    if (length >= 1 && text[length-1] == L'\0')
+      length -= 1;  // Exclude null-terminator
+    result.resize(length);
+    memcpy((void *)result.data(), text, length);
     return result;
   } else if (codePage == CP_UTF8) {
-    Unicode::UTF8ToUTF16String((char *)pBlob->GetBufferPointer(),
-                               pBlob->GetBufferSize(), &result);
+    const char* text = (const char *)pBlob->GetBufferPointer();
+    size_t length = pBlob->GetBufferSize();
+    if (length >= 1 && text[length-1] == '\0')
+      length -= 1;  // Exclude null-terminator
+    Unicode::UTF8ToUTF16String(text, length, &result);
     return result;
   } else {
     throw std::runtime_error("Unsupported codepage.");
@@ -316,6 +371,35 @@ void VerifyCompileOK(dxc::DxcDllSupport &dllSupport, LPCSTR pText,
   VERIFY_SUCCEEDED(pResult->GetStatus(&hrCompile));
   VERIFY_SUCCEEDED(hrCompile);
   VERIFY_SUCCEEDED(pResult->GetResult(ppResult));
+}
+
+HRESULT GetVersion(dxc::DxcDllSupport& DllSupport, REFCLSID clsid, unsigned &Major, unsigned &Minor) {
+  CComPtr<IUnknown> pUnk;
+  if (SUCCEEDED(DllSupport.CreateInstance(clsid, &pUnk))) {
+    CComPtr<IDxcVersionInfo> pVersionInfo;
+    IFR(pUnk.QueryInterface(&pVersionInfo));
+    IFR(pVersionInfo->GetVersion(&Major, &Minor));
+  }
+  return S_OK;
+}
+
+bool ParseTargetProfile(llvm::StringRef targetProfile, llvm::StringRef &outStage, unsigned &outMajor, unsigned &outMinor) {
+  auto stage_model = targetProfile.split("_");
+  auto major_minor = stage_model.second.split("_");
+  llvm::APInt major;
+  if (major_minor.first.getAsInteger(16, major))
+    return false;
+  if (major_minor.second.compare("x") == 0) {
+    outMinor = 0xF;   // indicates offline target
+  } else {
+    llvm::APInt minor;
+    if (major_minor.second.getAsInteger(16, minor))
+      return false;
+    outMinor = (unsigned)minor.getLimitedValue();
+  }
+  outStage = stage_model.first;
+  outMajor = (unsigned)major.getLimitedValue();
+  return true;
 }
 
 // VersionSupportInfo Implementation

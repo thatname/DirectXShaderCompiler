@@ -25,7 +25,6 @@
 #include "llvm/ADT/SmallVector.h"
 
 #include "GlPerVertex.h"
-#include "SpirvEvalInfo.h"
 
 namespace clang {
 namespace spirv {
@@ -112,20 +111,35 @@ private:
 
 class ResourceVar {
 public:
-  ResourceVar(SpirvVariable *var, SourceLocation loc,
+  ResourceVar(SpirvVariable *var, const Decl *decl, SourceLocation loc,
               const hlsl::RegisterAssignment *r, const VKBindingAttr *b,
-              const VKCounterBindingAttr *cb, bool counter = false)
+              const VKCounterBindingAttr *cb, bool counter = false,
+              bool globalsBuffer = false)
       : variable(var), srcLoc(loc), reg(r), binding(b), counterBinding(cb),
-        isCounterVar(counter) {}
+        isCounterVar(counter), isGlobalsCBuffer(globalsBuffer), arraySize(1) {
+    if (decl) {
+      if (const ValueDecl *valueDecl = dyn_cast<ValueDecl>(decl)) {
+        const QualType type = valueDecl->getType();
+        if (!type.isNull() && type->isConstantArrayType()) {
+          if (auto constArrayType = dyn_cast<ConstantArrayType>(type)) {
+            arraySize =
+                static_cast<uint32_t>(constArrayType->getSize().getZExtValue());
+          }
+        }
+      }
+    }
+  }
 
   SpirvVariable *getSpirvInstr() const { return variable; }
   SourceLocation getSourceLocation() const { return srcLoc; }
   const hlsl::RegisterAssignment *getRegister() const { return reg; }
   const VKBindingAttr *getBinding() const { return binding; }
   bool isCounter() const { return isCounterVar; }
+  bool isGlobalsBuffer() const { return isGlobalsCBuffer; }
   const VKCounterBindingAttr *getCounterBinding() const {
     return counterBinding;
   }
+  uint32_t getArraySize() const { return arraySize; }
 
 private:
   SpirvVariable *variable;                    ///< The variable
@@ -134,6 +148,8 @@ private:
   const VKBindingAttr *binding;               ///< Vulkan binding assignment
   const VKCounterBindingAttr *counterBinding; ///< Vulkan counter binding
   bool isCounterVar;                          ///< Couter variable or not
+  bool isGlobalsCBuffer;                      ///< $Globals cbuffer or not
+  uint32_t arraySize;                         ///< Size if resource is an array
 };
 
 /// A (instruction-pointer, is-alias-or-not) pair for counter variables
@@ -295,6 +311,18 @@ public:
   SpirvVariable *createRayTracingNVStageVar(spv::StorageClass sc,
                                             const VarDecl *decl);
 
+  /// \brief Creates the taskNV stage variables for payload struct variable
+  /// and returns true on success. SPIR-V instructions will also be generated
+  /// to load/store the contents from/to *value. payloadMemOffset is incremented
+  /// based on payload struct member size, alignment and offset, and SPIR-V
+  /// decorations PerTaskNV and Offset are assigned to each member.
+  bool createPayloadStageVars(const hlsl::SigPoint *sigPoint,
+                              spv::StorageClass sc, const NamedDecl *decl,
+                              bool asInput, QualType type,
+                              const llvm::StringRef namePrefix,
+                              SpirvInstruction **value,
+                              uint32_t payloadMemOffset = 0);
+
   /// \brief Creates a function-scope paramter in the current function and
   /// returns its instruction.
   SpirvFunctionParameter *createFnParam(const ParmVarDecl *param);
@@ -317,6 +345,9 @@ public:
 
   /// \brief Creates an external-visible variable and returns its instruction.
   SpirvVariable *createExternVar(const VarDecl *var);
+
+  /// \brief Creates an Enum constant.
+  void createEnumConstant(const EnumConstantDecl *decl);
 
   /// \brief Creates a cbuffer/tbuffer from the given decl.
   ///
@@ -367,6 +398,10 @@ public:
   /// stages.
   void createRayTracingNVImplicitVar(const VarDecl *varDecl);
 
+  /// \brief Creates a ShaderRecordBufferNV block from the given decl.
+  SpirvVariable *createShaderRecordBufferNV(const VarDecl *decl);
+  SpirvVariable *createShaderRecordBufferNV(const HLSLBufferDecl *decl);
+
 private:
   /// The struct containing SPIR-V information of a AST Decl.
   struct DeclSpirvInfo {
@@ -393,7 +428,7 @@ public:
   /// \brief Returns the information for the given decl.
   ///
   /// This method will panic if the given decl is not registered.
-  SpirvInstruction *getDeclEvalInfo(const ValueDecl *decl);
+  SpirvInstruction *getDeclEvalInfo(const ValueDecl *decl, SourceLocation loc);
 
   /// \brief Returns the instruction pointer for the given function if already
   /// registered; otherwise, treats the given function as a normal decl and
@@ -450,11 +485,13 @@ public:
                              SpirvInstruction *value);
 
   /// \brief Negates to get the additive inverse of SV_Position.y if requested.
-  SpirvInstruction *invertYIfRequested(SpirvInstruction *position);
+  SpirvInstruction *invertYIfRequested(SpirvInstruction *position,
+                                       SourceLocation loc);
 
   /// \brief Reciprocates to get the multiplicative inverse of SV_Position.w
   /// if requested.
-  SpirvInstruction *invertWIfRequested(SpirvInstruction *position);
+  SpirvInstruction *invertWIfRequested(SpirvInstruction *position,
+                                       SourceLocation loc);
 
   /// \brief Decorates all stage input and output variables with proper
   /// location and returns true on success.
@@ -471,6 +508,16 @@ public:
   bool decorateResourceBindings();
 
   bool requiresLegalization() const { return needsLegalization; }
+ 
+  /// \brief Returns the given decl's HLSL semantic information.
+  static SemanticInfo getStageVarSemantic(const NamedDecl *decl);
+
+  /// \brief Returns SPIR-V instruction for given stage var decl.
+  SpirvInstruction *getStageVarInstruction(const DeclaratorDecl *decl) {
+    auto *value = stageVarInstructions.lookup(decl);
+    assert(value);
+    return value;
+  }
 
 private:
   /// \brief Wrapper method to create a fatal error message and report it
@@ -528,6 +575,7 @@ private:
     TBuffer,
     PushConstant,
     Globals,
+    ShaderRecordBufferNV,
   };
 
   /// Creates a variable of struct type with explicit layout decorations.
@@ -547,9 +595,6 @@ private:
   SpirvVariable *createStructOrStructArrayVarOfExplicitLayout(
       const DeclContext *decl, int arraySize, ContextUsageKind usageKind,
       llvm::StringRef typeName, llvm::StringRef varName);
-
-  /// Returns the given decl's HLSL semantic information.
-  static SemanticInfo getStageVarSemantic(const NamedDecl *decl);
 
   /// Creates all the stage variables mapped from semantics on the given decl.
   /// Returns true on sucess.
@@ -627,8 +672,8 @@ private:
 
   /// Decorates varInstr of the given asType with proper interpolation modes
   /// considering the attributes on the given decl.
-  void decoratePSInterpolationMode(const NamedDecl *decl, QualType asType,
-                                   SpirvVariable *varInstr);
+  void decorateInterpolationMode(const NamedDecl *decl, QualType asType,
+                                 SpirvVariable *varInstr);
 
   /// Returns the proper SPIR-V storage class (Input or Output) for the given
   /// SigPoint.
@@ -748,7 +793,8 @@ void CounterIdAliasPair::assign(const CounterIdAliasPair &srcPair,
                                 SpirvBuilder &builder,
                                 SpirvContext &context) const {
   assert(isAlias);
-  builder.createStore(counterVar, srcPair.get(builder, context));
+  builder.createStore(counterVar, srcPair.get(builder, context),
+                      /* SourceLocation */ {});
 }
 
 DeclResultIdMapper::DeclResultIdMapper(ASTContext &context,
@@ -764,8 +810,9 @@ DeclResultIdMapper::DeclResultIdMapper(ASTContext &context,
       glPerVertex(context, spirvContext, spirvBuilder) {}
 
 bool DeclResultIdMapper::decorateStageIOLocations() {
-  if (spvContext.isRay()) {
-    // No location assignment for any raytracing stage variables
+  if (spvContext.isRay() || spvContext.isAS()) {
+    // No location assignment for any raytracing stage variables or
+    // amplification shader variables
     return true;
   }
   // Try both input and output even if input location assignment failed

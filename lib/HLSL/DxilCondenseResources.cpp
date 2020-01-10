@@ -21,6 +21,7 @@
 #include "dxc/DXIL/DxilUtil.h"
 #include "dxc/HLSL/HLMatrixType.h"
 #include "dxc/HLSL/HLModule.h"
+#include "dxc/HLSL/DxilValueCache.h"
 
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -168,22 +169,21 @@ private:
     }
 
     // Allocate unallocated resources
-    const unsigned space = AutoBindingSpace;
-    typename SpacesAllocator<unsigned, T>::Allocator &alloc0 = SAlloc.Get(space);
-    typename SpacesAllocator<unsigned, T>::Allocator &reservedAlloc0 = ReservedRegisters.Get(space);
     for (auto &res : resourceList) {
       if (res->IsAllocated())
         continue;
 
-      DXASSERT(res->GetSpaceID() == 0,
-        "otherwise non-zero space has no user register assignment");
+      unsigned space = res->GetSpaceID();
+      if (space == UINT_MAX) space = AutoBindingSpace;
+      typename SpacesAllocator<unsigned, T>::Allocator& alloc = SAlloc.Get(space);
+      typename SpacesAllocator<unsigned, T>::Allocator& reservedAlloc = ReservedRegisters.Get(space);
 
       unsigned reg = 0;
       unsigned end = 0;
       bool allocateSpaceFound = false;
       if (res->IsUnbounded()) {
-        if (alloc0.GetUnbounded() != nullptr) {
-          const T *unbounded = alloc0.GetUnbounded();
+        if (alloc.GetUnbounded() != nullptr) {
+          const T *unbounded = alloc.GetUnbounded();
           Ctx.emitError(Twine("more than one unbounded resource (") +
             unbounded->GetGlobalName() + Twine(" and ") +
             res->GetGlobalName() + Twine(") in space ") +
@@ -191,26 +191,26 @@ private:
           continue;
         }
 
-        if (reservedAlloc0.FindForUnbounded(reg)) {
+        if (reservedAlloc.FindForUnbounded(reg)) {
           end = UINT_MAX;
           allocateSpaceFound = true;
         }
       }
-      else if (reservedAlloc0.Find(res->GetRangeSize(), reg)) {
+      else if (reservedAlloc.Find(res->GetRangeSize(), reg)) {
         end = reg + res->GetRangeSize() - 1;
         allocateSpaceFound = true;
       }
 
       if (allocateSpaceFound) {
-        bool success = reservedAlloc0.Insert(res.get(), reg, end) == nullptr;
+        bool success = reservedAlloc.Insert(res.get(), reg, end) == nullptr;
         DXASSERT_NOMSG(success);
 
-        success = alloc0.Insert(res.get(), reg, end) == nullptr;
+        success = alloc.Insert(res.get(), reg, end) == nullptr;
         DXASSERT_NOMSG(success);
 
         if (res->IsUnbounded()) {
-          alloc0.SetUnbounded(res.get());
-          reservedAlloc0.SetUnbounded(res.get());
+          alloc.SetUnbounded(res.get());
+          reservedAlloc.SetUnbounded(res.get());
         }
 
         res->SetLowerBound(reg);
@@ -423,6 +423,168 @@ ModulePass *llvm::createDxilCondenseResourcesPass() {
 
 INITIALIZE_PASS(DxilCondenseResources, "hlsl-dxil-condense", "DXIL Condense Resources", false, false)
 
+static
+bool LegalizeResourcesPHIs(Module &M, DxilValueCache *DVC) {
+
+  // Simple pass to collect resource PHI's
+  SmallVector<PHINode *, 8> PHIs;
+  for (Function &F : M) {
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        if (PHINode *PN = dyn_cast<PHINode>(&I)) {
+          if (hlsl::dxilutil::IsHLSLObjectType(PN->getType())) {
+            PHIs.push_back(PN);
+          }
+        }
+        else {
+          break;
+        }
+
+      }
+    }
+  }
+
+  if (PHIs.empty())
+    return false;
+
+  // Do a very simple CFG simplification of removing diamond graphs.
+  std::vector<BasicBlock *> DeadBlocks;
+  std::unordered_set<BasicBlock *> DeadBlocksSet;
+  for (PHINode *PN : PHIs) {
+    for (unsigned i = 0; i < PN->getNumIncomingValues(); i++) {
+      BasicBlock *BB = PN->getIncomingBlock(i);
+      if (DeadBlocksSet.count(BB)) continue;
+      if (DVC->IsNeverReachable(BB)) {
+        DeadBlocksSet.insert(BB);
+        DeadBlocks.push_back(BB);
+      }
+    }
+  }
+
+  bool Changed = false;
+  SmallVector<Value *, 3> CleanupValues;
+  SmallPtrSet<Value *, 3> CleanupValuesSet;
+  auto AddCleanupValues = [&CleanupValues, &CleanupValuesSet](Value *V) {
+    if (!CleanupValuesSet.count(V)) {
+      CleanupValuesSet.insert(V);
+      CleanupValues.push_back(V);
+    }
+  };
+
+  for (unsigned i = 0; i < DeadBlocks.size(); i++) {
+    BasicBlock *BB = DeadBlocks[i];
+    BasicBlock *Pred = BB->getSinglePredecessor();
+    BasicBlock *Succ = BB->getSingleSuccessor();
+
+    if (!Pred || !Succ)
+      continue;
+
+    // A very simple folding of diamond graph.
+    BranchInst *Br = cast<BranchInst>(Pred->getTerminator());
+    BasicBlock *Peer = nullptr;
+    if (Br->isConditional())
+      Peer = Br->getSuccessor(0) == BB ? 
+          Br->getSuccessor(1) : Br->getSuccessor(0);
+
+    if (Peer && Peer->getSingleSuccessor() == Succ) {
+      Changed = true;
+
+      BranchInst::Create(Peer, Pred);
+
+      Br->dropAllReferences();
+      Br->eraseFromParent();
+      auto PhiEnd = PHIs.end();
+      for (Instruction &I : *Succ)
+        if (PHINode *PN = dyn_cast<PHINode>(&I)) {
+          if (Instruction *IncomingI = dyn_cast<Instruction>(PN->getIncomingValueForBlock(BB))) {
+            if (!DeadBlocksSet.count(IncomingI->getParent()))
+              AddCleanupValues(IncomingI); // Mark the incoming value for deletion
+          }
+          PN->removeIncomingValue(BB);
+
+          if (PN->getNumIncomingValues() == 1) {
+            PN->replaceAllUsesWith(PN->getIncomingValue(0));
+            PhiEnd = std::remove(PHIs.begin(), PhiEnd, PN);
+            AddCleanupValues(PN); // Mark for deletion
+          }
+        }
+        else
+          break;
+
+      BB->dropAllReferences();
+      while (!BB->empty()){
+        Instruction *ChildI = &*BB->rbegin();
+        if (PHINode *PN = dyn_cast<PHINode>(ChildI))
+          PhiEnd = std::remove(PHIs.begin(), PhiEnd, PN);
+        ChildI->eraseFromParent();
+      }
+      BB->eraseFromParent();
+    }
+  }
+
+  unsigned Attempts = PHIs.size();
+  for (unsigned AttemptIdx = 0; AttemptIdx < Attempts; AttemptIdx++) {
+    bool LocalChanged = false;
+    for (auto It = PHIs.begin(); It != PHIs.end();) {
+      PHINode *PN = *It;
+      if (Value *V = DVC->GetValue(PN)) {
+
+        PHIs.erase(It);
+        AddCleanupValues(PN); // Mark for deletion later
+        PN->replaceAllUsesWith(V);
+        Changed = true;
+        LocalChanged = true;
+
+        for (unsigned i = 0, C = PN->getNumIncomingValues(); i < C; i++) {
+          Value *IncomingV = PN->getIncomingValue(i);
+          if (IncomingV != V)
+            AddCleanupValues(IncomingV); // Mark the incoming value for deletion later
+        }
+      }
+      else {
+        It++;
+      }
+    }
+
+    if (!LocalChanged)
+      break;
+  }
+
+  // Simple DCE to remove all dependencies of the resource PHI nodes we removed.
+  // This may be a little too agressive
+  for (;;) {
+    bool LocalChanged = false;
+    // Must use a numeric idx instead of an interator, because
+    // we're modifying the array as we go. Iterator gets invalidated
+    // because they're just pointers.
+    for (unsigned Idx = 0; Idx < CleanupValues.size();) {
+      Value *V = CleanupValues[Idx];
+      if (Instruction *I = dyn_cast<Instruction>(V)) {
+        if (I->user_empty()) {
+          // Add dependencies to process
+          for (Value *Op : I->operands()) {
+            AddCleanupValues(Op);
+          }
+          LocalChanged = true;
+          I->eraseFromParent();
+          CleanupValues.erase(CleanupValues.begin() + Idx);
+        }
+        else {
+          Idx++;
+        }
+      }
+      else {
+        CleanupValues.erase(CleanupValues.begin() + Idx);
+      }
+    }
+
+    Changed |= LocalChanged;
+    if (!LocalChanged)
+      break;
+  }
+  return Changed;
+}
+
 namespace {
 class DxilLowerCreateHandleForLib : public ModulePass {
 private:
@@ -434,6 +596,10 @@ private:
 public:
   static char ID; // Pass identification, replacement for typeid
   explicit DxilLowerCreateHandleForLib() : ModulePass(ID) {}
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<DxilValueCache>();
+  }
 
   const char *getPassName() const override {
     return "DXIL Lower createHandleForLib";
@@ -478,8 +644,14 @@ public:
 
     bChanged |= ResourceRegisterAllocator.AllocateRegisters(DM);
 
+    // Fill in top-level CBuffer variable usage bit
+    UpdateCBufferUsage();
+
     if (m_bIsLib && DM.GetShaderModel()->GetMinor() == ShaderModel::kOfflineMinor)
       return bChanged;
+
+    DxilValueCache *DVC = &getAnalysis<DxilValueCache>();
+    bChanged |= LegalizeResourcesPHIs(M, DVC);
 
     // Make sure no select on resource.
     bChanged |= RemovePhiOnResource();
@@ -495,8 +667,14 @@ public:
 
     GenerateDxilResourceHandles();
 
+    // TODO: Update types earlier for libraries and replace users, to
+    //       avoid having to preserve HL struct annotation.
+    // Note 1: Needs to happen after legalize
+    // Note 2: Cannot do this easily/trivially if any functions have
+    //         resource arguments (in offline linking target).
     if (DM.GetOP()->UseMinPrecision())
       UpdateStructTypeForLegacyLayout();
+
     // Change resource symbol into undef.
     UpdateResourceSymbols();
 
@@ -517,6 +695,7 @@ private:
   // Switch CBuffer for SRV for TBuffers.
   bool PatchTBuffers(DxilModule &DM);
   void PatchTBufferUse(Value *V, DxilModule &DM);
+  void UpdateCBufferUsage();
 };
 
 } // namespace
@@ -1222,6 +1401,7 @@ public:
     // generate stores of incoming indices to corresponding index pointers
     if (Stores.empty())
       return;
+    Type *i32Ty = IntegerType::getInt32Ty(Stores[0]->getContext());
     for (auto V : Stores) {
       StoreInst *SI = cast<StoreInst>(V);
       IRBuilder<> Builder(SI);
@@ -1230,16 +1410,24 @@ public:
       Value *Val = SI->getValueOperand();
       IndexVector &ptrIndices = ResToIdxReplacement[Ptr];
       IndexVector &valIndices = ResToIdxReplacement[Val];
-      DXASSERT_NOMSG(ptrIndices.size() == valIndices.size());
+      // If Val is not found, it is treated as an undef value that will translate
+      // to an undef index, which may still be valid if it's never used.
+      Value *UndefIndex = valIndices.size() > 0 ? nullptr : UndefValue::get(i32Ty);
+      DXASSERT_NOMSG(valIndices.size() == 0 || ptrIndices.size() == valIndices.size());
       idxVector.resize(ptrIndices.size(), nullptr);
       for (unsigned i = 0; i < idxVector.size(); i++) {
-        idxVector[i] = Builder.CreateStore(valIndices[i], ptrIndices[i]);
+        idxVector[i] = Builder.CreateStore(
+          UndefIndex ? UndefIndex : valIndices[i],
+          ptrIndices[i]);
       }
     }
   }
 
   // For each Phi/Select: update matching incoming values for new phis
   void UpdateSelects() {
+    if (Selects.empty())
+      return;
+    Type *i32Ty = IntegerType::getInt32Ty(Selects[0]->getContext());
     for (auto V : Selects) {
       // update incoming index values corresponding to incoming resource values
       IndexVector &idxVector = ResToIdxReplacement[V];
@@ -1247,12 +1435,17 @@ public:
       unsigned numOperands = I->getNumOperands();
       unsigned startOp = isa<PHINode>(V) ? 0 : 1;
       for (unsigned iOp = startOp; iOp < numOperands; iOp++) {
-        IndexVector &incomingIndices = ResToIdxReplacement[I->getOperand(iOp)];
-        DXASSERT_NOMSG(idxVector.size() == incomingIndices.size());
+        Value *Val = I->getOperand(iOp);
+        IndexVector &incomingIndices = ResToIdxReplacement[Val];
+        // If Val is not found, it is treated as an undef value that will translate
+        // to an undef index, which may still be valid if it's never used.
+        Value *UndefIndex = incomingIndices.size() > 0 ? nullptr : UndefValue::get(i32Ty);
+        DXASSERT_NOMSG(incomingIndices.size() == 0 || idxVector.size() == incomingIndices.size());
         for (unsigned i = 0; i < idxVector.size(); i++) {
           // must be instruction (phi/select)
           Instruction *indexI = cast<Instruction>(idxVector[i]);
-          indexI->setOperand(iOp, incomingIndices[i]);
+          indexI->setOperand(iOp,
+            UndefIndex ? UndefIndex : incomingIndices[i]);
         }
 
         // Now clear incoming operand (adding to cleanup) to break cycles
@@ -1522,10 +1715,10 @@ bool DxilLowerCreateHandleForLib::RemovePhiOnResource() {
 // LegacyLayout.
 namespace {
 
-StructType *UpdateStructTypeForLegacyLayout(StructType *ST, bool IsCBuf,
+StructType *UpdateStructTypeForLegacyLayout(StructType *ST,
                                             DxilTypeSystem &TypeSys, Module &M);
 
-Type *UpdateFieldTypeForLegacyLayout(Type *Ty, bool IsCBuf,
+Type *UpdateFieldTypeForLegacyLayout(Type *Ty,
                                      DxilFieldAnnotation &annotation,
                                      DxilTypeSystem &TypeSys, Module &M) {
   DXASSERT(!Ty->isPointerTy(), "struct field should not be a pointer");
@@ -1533,7 +1726,7 @@ Type *UpdateFieldTypeForLegacyLayout(Type *Ty, bool IsCBuf,
   if (Ty->isArrayTy()) {
     Type *EltTy = Ty->getArrayElementType();
     Type *UpdatedTy =
-        UpdateFieldTypeForLegacyLayout(EltTy, IsCBuf, annotation, TypeSys, M);
+        UpdateFieldTypeForLegacyLayout(EltTy, annotation, TypeSys, M);
     if (EltTy == UpdatedTy)
       return Ty;
     else
@@ -1555,20 +1748,23 @@ Type *UpdateFieldTypeForLegacyLayout(Type *Ty, bool IsCBuf,
       cols = matrix.Rows;
       rows = matrix.Cols;
     }
-    // CBuffer matrix must 4 * 4 bytes align.
-    if (IsCBuf)
-      cols = 4;
 
     EltTy =
-        UpdateFieldTypeForLegacyLayout(EltTy, IsCBuf, annotation, TypeSys, M);
+        UpdateFieldTypeForLegacyLayout(EltTy, annotation, TypeSys, M);
     Type *rowTy = VectorType::get(EltTy, cols);
-    return ArrayType::get(rowTy, rows);
+
+    // Matrix should be aligned like array if rows > 1,
+    // otherwise, it's just like a vector.
+    if (rows > 1)
+      return ArrayType::get(rowTy, rows);
+    else
+      return rowTy;
   } else if (StructType *ST = dyn_cast<StructType>(Ty)) {
-    return UpdateStructTypeForLegacyLayout(ST, IsCBuf, TypeSys, M);
+    return UpdateStructTypeForLegacyLayout(ST, TypeSys, M);
   } else if (Ty->isVectorTy()) {
     Type *EltTy = Ty->getVectorElementType();
     Type *UpdatedTy =
-        UpdateFieldTypeForLegacyLayout(EltTy, IsCBuf, annotation, TypeSys, M);
+        UpdateFieldTypeForLegacyLayout(EltTy, annotation, TypeSys, M);
     if (EltTy == UpdatedTy)
       return Ty;
     else
@@ -1588,14 +1784,18 @@ Type *UpdateFieldTypeForLegacyLayout(Type *Ty, bool IsCBuf,
   }
 }
 
-StructType *UpdateStructTypeForLegacyLayout(StructType *ST, bool IsCBuf,
+StructType *UpdateStructTypeForLegacyLayout(StructType *ST,
                                             DxilTypeSystem &TypeSys,
                                             Module &M) {
   bool bUpdated = false;
   unsigned fieldsCount = ST->getNumElements();
   std::vector<Type *> fieldTypes(fieldsCount);
   DxilStructAnnotation *SA = TypeSys.GetStructAnnotation(ST);
-  DXASSERT(SA, "must have annotation for struct type");
+
+  // After reflection is stripped from library, this will be null if no update is required.
+  if (!SA) {
+    return ST;
+  }
 
   if (SA->IsEmptyStruct()) {
     return ST;
@@ -1604,7 +1804,7 @@ StructType *UpdateStructTypeForLegacyLayout(StructType *ST, bool IsCBuf,
   for (unsigned i = 0; i < fieldsCount; i++) {
     Type *EltTy = ST->getElementType(i);
     Type *UpdatedTy = UpdateFieldTypeForLegacyLayout(
-        EltTy, IsCBuf, SA->GetFieldAnnotation(i), TypeSys, M);
+        EltTy, SA->GetFieldAnnotation(i), TypeSys, M);
     fieldTypes[i] = UpdatedTy;
     if (EltTy != UpdatedTy)
       bUpdated = true;
@@ -1622,6 +1822,9 @@ StructType *UpdateStructTypeForLegacyLayout(StructType *ST, bool IsCBuf,
     DxilStructAnnotation *NewSA = TypeSys.AddStructAnnotation(NewST);
     // Clone annotation.
     *NewSA = *SA;
+    // Make sure we set the struct type back to the new one, since the
+    // clone would have clobbered it with the old one.
+    NewSA->SetStructType(NewST);
     return NewST;
   }
 }
@@ -1630,12 +1833,9 @@ void UpdateStructTypeForLegacyLayout(DxilResourceBase &Res,
                                      DxilTypeSystem &TypeSys, Module &M) {
   Constant *Symbol = Res.GetGlobalSymbol();
   Type *ElemTy = Symbol->getType()->getPointerElementType();
-  bool IsResourceArray = Res.GetRangeSize() != 1;
-  if (IsResourceArray) {
-    // Support Array of struct buffer.
-    if (ElemTy->isArrayTy())
-      ElemTy = ElemTy->getArrayElementType();
-  }
+  // Support Array of ConstantBuffer/StructuredBuffer.
+  llvm::SmallVector<unsigned, 4> arrayDims;
+  ElemTy = dxilutil::StripArrayTypes(ElemTy, &arrayDims);
   StructType *ST = cast<StructType>(ElemTy);
   if (ST->isOpaque()) {
     DXASSERT(Res.GetClass() == DxilResourceBase::Class::CBuffer,
@@ -1644,15 +1844,10 @@ void UpdateStructTypeForLegacyLayout(DxilResourceBase &Res,
   }
 
   Type *UpdatedST =
-      UpdateStructTypeForLegacyLayout(ST, IsResourceArray, TypeSys, M);
+      UpdateStructTypeForLegacyLayout(ST, TypeSys, M);
   if (ST != UpdatedST) {
-    Type *Ty = Symbol->getType()->getPointerElementType();
-    if (IsResourceArray) {
-      // Support Array of struct buffer.
-      if (Ty->isArrayTy()) {
-        UpdatedST = ArrayType::get(UpdatedST, Ty->getArrayNumElements());
-      }
-    }
+    // Support Array of ConstantBuffer/StructuredBuffer.
+    UpdatedST = dxilutil::WrapInArrayTypes(UpdatedST, arrayDims);
     GlobalVariable *NewGV = cast<GlobalVariable>(
         M.getOrInsertGlobal(Symbol->getName().str() + "_legacy", UpdatedST));
     Res.SetGlobalSymbol(NewGV);
@@ -1720,15 +1915,11 @@ void DxilLowerCreateHandleForLib::UpdateStructTypeForLegacyLayout() {
 
 // Change ResourceSymbol to undef if don't need.
 void DxilLowerCreateHandleForLib::UpdateResourceSymbols() {
-  std::vector<GlobalVariable *> &LLVMUsed = m_DM->GetLLVMUsed();
-
-  auto UpdateResourceSymbol = [&LLVMUsed, this](DxilResourceBase *res) {
+  auto UpdateResourceSymbol = [](DxilResourceBase *res) {
     if (GlobalVariable *GV = dyn_cast<GlobalVariable>(res->GetGlobalSymbol())) {
       GV->removeDeadConstantUsers();
       DXASSERT(GV->user_empty(), "else resource not lowered");
       res->SetGlobalSymbol(UndefValue::get(GV->getType()));
-      if (m_HasDbgInfo)
-        LLVMUsed.emplace_back(GV);
     }
   };
 
@@ -2098,6 +2289,145 @@ bool DxilLowerCreateHandleForLib::PatchTBuffers(DxilModule &DM) {
   return bChanged;
 }
 
+// Find the imm offset part from a value.
+// It must exist unless offset is 0.
+static unsigned GetCBOffset(Value *V) {
+  if (ConstantInt *Imm = dyn_cast<ConstantInt>(V))
+    return Imm->getLimitedValue();
+  else if (UnaryInstruction *UI = dyn_cast<UnaryInstruction>(V)) {
+    return 0;
+  } else if (BinaryOperator *BO = dyn_cast<BinaryOperator>(V)) {
+    switch (BO->getOpcode()) {
+    case Instruction::Add: {
+      unsigned left = GetCBOffset(BO->getOperand(0));
+      unsigned right = GetCBOffset(BO->getOperand(1));
+      return left + right;
+    } break;
+    case Instruction::Or: {
+      unsigned left = GetCBOffset(BO->getOperand(0));
+      unsigned right = GetCBOffset(BO->getOperand(1));
+      return left | right;
+    } break;
+    default:
+      return 0;
+    }
+  } else {
+    return 0;
+  }
+}
+
+typedef std::map<unsigned, DxilFieldAnnotation*> FieldAnnotationByOffsetMap;
+
+static void MarkCBUse(unsigned offset, FieldAnnotationByOffsetMap &fieldMap) {
+  auto it = fieldMap.upper_bound(offset);
+  it--;
+  if (it != fieldMap.end())
+    it->second->SetCBVarUsed(true);
+}
+
+static unsigned GetOffsetForCBExtractValue(ExtractValueInst *EV, bool bMinPrecision) {
+  DXASSERT(EV->getNumIndices() == 1, "otherwise, unexpected indices/type for extractvalue");
+  unsigned typeSize = 4;
+  unsigned bits = EV->getType()->getScalarSizeInBits();
+  if (bits == 64)
+    typeSize = 8;
+  else if (bits == 16 && !bMinPrecision)
+    typeSize = 2;
+  return (EV->getIndices().front() * typeSize);
+}
+
+static void CollectInPhiChain(PHINode *cbUser, unsigned offset,
+                              std::unordered_set<Value *> &userSet,
+                              FieldAnnotationByOffsetMap &fieldMap,
+                              bool bMinPrecision) {
+  if (userSet.count(cbUser) > 0)
+    return;
+
+  userSet.insert(cbUser);
+  for (User *cbU : cbUser->users()) {
+    if (ExtractValueInst *EV = dyn_cast<ExtractValueInst>(cbU)) {
+      MarkCBUse(offset + GetOffsetForCBExtractValue(EV, bMinPrecision), fieldMap);
+    } else {
+      PHINode *phi = cast<PHINode>(cbU);
+      CollectInPhiChain(phi, offset, userSet, fieldMap, bMinPrecision);
+    }
+  }
+}
+
+static void CollectCBufferMemberUsage(Value *V,
+                                      FieldAnnotationByOffsetMap &legacyFieldMap,
+                                      FieldAnnotationByOffsetMap &newFieldMap,
+                                      hlsl::OP *hlslOP, bool bMinPrecision) {
+  for (auto U : V->users()) {
+    if (Constant *C = dyn_cast<Constant>(U)) {
+      CollectCBufferMemberUsage(C, legacyFieldMap, newFieldMap, hlslOP, bMinPrecision);
+    } else if (LoadInst *LI = dyn_cast<LoadInst>(U)) {
+      CollectCBufferMemberUsage(U, legacyFieldMap, newFieldMap, hlslOP, bMinPrecision);
+    } else if (CallInst *CI = dyn_cast<CallInst>(U)) {
+      if (hlslOP->IsDxilOpFuncCallInst(CI)) {
+        hlsl::OP::OpCode op = hlslOP->GetDxilOpFuncCallInst(CI);
+        if (op == DXIL::OpCode::CreateHandleForLib) {
+          CollectCBufferMemberUsage(U, legacyFieldMap, newFieldMap, hlslOP, bMinPrecision);
+        } else if (op == DXIL::OpCode::CBufferLoadLegacy) {
+          DxilInst_CBufferLoadLegacy cbload(CI);
+          Value *resIndex = cbload.get_regIndex();
+          unsigned offset = GetCBOffset(resIndex);
+          offset <<= 4; // translate 16-byte vector index to byte offset
+          for (User *cbU : U->users()) {
+            if (ExtractValueInst *EV = dyn_cast<ExtractValueInst>(cbU)) {
+              MarkCBUse(offset + GetOffsetForCBExtractValue(EV, bMinPrecision), legacyFieldMap);
+            } else {
+              PHINode *phi = cast<PHINode>(cbU);
+              std::unordered_set<Value *> userSet;
+              CollectInPhiChain(phi, offset, userSet, legacyFieldMap, bMinPrecision);
+            }
+          }
+        } else if (op == DXIL::OpCode::CBufferLoad) {
+          DxilInst_CBufferLoad cbload(CI);
+          Value *byteOffset = cbload.get_byteOffset();
+          unsigned offset = GetCBOffset(byteOffset);
+          MarkCBUse(offset, newFieldMap);
+        }
+      }
+    }
+  }
+}
+
+void DxilLowerCreateHandleForLib::UpdateCBufferUsage() {
+  DxilTypeSystem &TypeSys = m_DM->GetTypeSystem();
+  hlsl::OP *hlslOP = m_DM->GetOP();
+  const DataLayout &DL = m_DM->GetModule()->getDataLayout();
+  const auto &CBuffers = m_DM->GetCBuffers();
+  for (auto it = CBuffers.begin(); it != CBuffers.end(); it++) {
+    DxilCBuffer *CB = it->get();
+    GlobalVariable *GV = dyn_cast<GlobalVariable>(CB->GetGlobalSymbol());
+    if (GV == nullptr)
+      continue;
+    Type *ElemTy = GV->getType()->getPointerElementType();
+    ElemTy = dxilutil::StripArrayTypes(ElemTy, nullptr);
+    StructType *ST = cast<StructType>(ElemTy);
+    DxilStructAnnotation *SA = TypeSys.GetStructAnnotation(ST);
+    if (SA == nullptr)
+      continue;
+    // If elements < 2, it's used if it exists.
+    // Only old-style cbuffer { ... } will have more than one member, and
+    // old-style cbuffers are the only ones that report usage per member.
+    if (ST->getStructNumElements() < 2) {
+      continue;
+    }
+
+    // Create offset maps for legacy layout and new compact layout, while resetting usage flags
+    const StructLayout *SL = DL.getStructLayout(ST);
+    FieldAnnotationByOffsetMap legacyFieldMap, newFieldMap;
+    for (unsigned i = 0; i < SA->GetNumFields(); ++i) {
+      DxilFieldAnnotation &FA = SA->GetFieldAnnotation(i);
+      FA.SetCBVarUsed(false);
+      legacyFieldMap[FA.GetCBufferOffset()] = &FA;
+      newFieldMap[(unsigned)SL->getElementOffset(i)] = &FA;
+    }
+    CollectCBufferMemberUsage(GV, legacyFieldMap, newFieldMap, hlslOP, m_DM->GetUseMinPrecision());
+ }
+}
 
 
 char DxilLowerCreateHandleForLib::ID = 0;
@@ -2106,7 +2436,9 @@ ModulePass *llvm::createDxilLowerCreateHandleForLibPass() {
   return new DxilLowerCreateHandleForLib();
 }
 
-INITIALIZE_PASS(DxilLowerCreateHandleForLib, "hlsl-dxil-lower-handle-for-lib", "DXIL Lower createHandleForLib", false, false)
+INITIALIZE_PASS_BEGIN(DxilLowerCreateHandleForLib, "hlsl-dxil-lower-handle-for-lib", "DXIL Lower createHandleForLib", false, false)
+INITIALIZE_PASS_DEPENDENCY(DxilValueCache)
+INITIALIZE_PASS_END(DxilLowerCreateHandleForLib, "hlsl-dxil-lower-handle-for-lib", "DXIL Lower createHandleForLib", false, false)
 
 
 class DxilAllocateResourcesForLib : public ModulePass {

@@ -10,23 +10,33 @@ add_llvm_library(LLVMHLSL
   DxilEliminateOutputDynamicIndexing.cpp
   DxilExpandTrigIntrinsics.cpp
   DxilGenerationPass.cpp
+  DxilLegalizeEvalOperations.cpp
   DxilLegalizeSampleOffsetPass.cpp
   DxilLinker.cpp
+  DxilPrecisePropagatePass.cpp
   DxilPreparePasses.cpp
+  DxilPromoteResourcePasses.cpp
   DxilPackSignatureElement.cpp
   DxilPatchShaderRecordBindings.cpp
+  DxilNoops.cpp
   DxilPreserveAllOutputs.cpp
   DxilSimpleGVNHoist.cpp
   DxilSignatureValidation.cpp
   DxilTargetLowering.cpp
   DxilTargetTransformInfo.cpp
+  DxilTranslateRawBuffer.cpp
   DxilExportMap.cpp
   DxilValidation.cpp
+  DxilValueCache.cpp
   DxcOptimizer.cpp
+  HLDeadFunctionElimination.cpp
+  HLExpandStoreIntrinsics.cpp
+  HLLowerUDT.cpp
   HLMatrixBitcastLowerPass.cpp
   HLMatrixLowerPass.cpp
   HLMatrixSubscriptUseReplacer.cpp
   HLMatrixType.cpp
+  HLMetadataPasses.cpp
   HLModule.cpp
   HLOperations.cpp
   HLOperationLower.cpp

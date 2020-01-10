@@ -214,9 +214,12 @@ static void ParseRegisterNumberForHLSL(_In_z_ const char *name,
   DXASSERT_NOMSG(registerNumber != nullptr);
   DXASSERT_NOMSG(diagId != nullptr);
 
-  if (*name != 'b' && *name != 'c' && *name != 'i' && *name != 's' &&
-      *name != 't' && *name != 'u' && *name != 'B' && *name != 'C' &&
-	  *name != 'I' && *name != 'S' && *name != 'T' && *name != 'U') {
+  char firstLetter = name[0];
+  if (firstLetter >= 'A' && firstLetter <= 'Z')
+    firstLetter += 'a' - 'A';
+
+  StringRef validExplicitRegisterTypes("bcistu");
+  if (validExplicitRegisterTypes.find(firstLetter) == StringRef::npos) {
     *diagId = diag::err_hlsl_unsupported_register_type;
     *registerType = 0;
     *registerNumber = 0;
@@ -226,7 +229,7 @@ static void ParseRegisterNumberForHLSL(_In_z_ const char *name,
   *registerType = *name;
   ++name;
 
-  // It's valid to omit the register name.
+  // It's valid to omit the register number.
   if (*name) {
     char *nameEnd;
     unsigned long num;
@@ -393,20 +396,11 @@ bool Parser::MaybeParseHLSLAttributes(std::vector<hlsl::UnusualAnnotation *> &ta
       DXASSERT(Tok.is(tok::identifier), "otherwise previous code should have failed");
       unsigned diagId;
 
-      // SPIRV Change Starts
       bool hasOnlySpace = false;
       identifierText = Tok.getIdentifierInfo()->getName().data();
       if (strncmp(identifierText, "space", strlen("space")) == 0) {
-        if (!getLangOpts().SPIRV) {
-          Diag(Tok.getLocation(),
-               diag::err_hlsl_missing_register_type_and_number);
-          SkipUntil(tok::r_paren, StopAtSemi); // skip through )
-          return true;
-        }
         hasOnlySpace = true;
       } else {
-        // SPIRV Change Ends
-
         ParseRegisterNumberForHLSL(
           Tok.getIdentifierInfo()->getName().data(), &r.RegisterType, &r.RegisterNumber, &diagId);
         if (diagId == 0) {
@@ -461,22 +455,19 @@ bool Parser::MaybeParseHLSLAttributes(std::vector<hlsl::UnusualAnnotation *> &ta
             return true;
           }
         }
-
-        // SPIRV Change Starts
       }
       if (hasOnlySpace) {
-        ParseSpaceForHLSL(Tok.getIdentifierInfo()->getName().data(), &r.RegisterSpace, &diagId);
+        unsigned RegisterSpaceValue = 0;
+        ParseSpaceForHLSL(Tok.getIdentifierInfo()->getName().data(), &RegisterSpaceValue, &diagId);
         if (diagId != 0) {
           Diag(Tok.getLocation(), diagId);
           r.setIsValid(false);
         } else {
-          r.setAsSpaceOnly();
+          r.RegisterSpace = RegisterSpaceValue;
           r.setIsValid(true);
         }
         ConsumeToken(); // consume identifier
       } else {
-        // SPIRV Change Ends
-
         if (Tok.is(tok::comma)) {
           ConsumeToken(); // consume comma
           if (!Tok.is(tok::identifier)) {
@@ -484,15 +475,18 @@ bool Parser::MaybeParseHLSLAttributes(std::vector<hlsl::UnusualAnnotation *> &ta
             SkipUntil(tok::r_paren, StopAtSemi); // skip through )
             return true;
           }
-          ParseSpaceForHLSL(Tok.getIdentifierInfo()->getName().data(), &r.RegisterSpace, &diagId);
+          unsigned RegisterSpaceVal = 0;
+          ParseSpaceForHLSL(Tok.getIdentifierInfo()->getName().data(), &RegisterSpaceVal, &diagId);
           if (diagId != 0) {
             Diag(Tok.getLocation(), diagId);
             r.setIsValid(false);
           }
+          else {
+            r.RegisterSpace = RegisterSpaceVal;
+          }
           ConsumeToken(); // consume identifier
         }
-
-      } // SPIRV Change
+      }
 
       if (ExpectAndConsume(tok::r_paren, diag::err_expected)) {
         SkipUntil(tok::r_paren, StopAtSemi); // skip through )
@@ -769,6 +763,10 @@ void Parser::ParseGNUAttributeArgs(IdentifierInfo *AttrName,
     //case AttributeList::AT_HLSLLineAdj:
     //case AttributeList::AT_HLSLTriangle:
     //case AttributeList::AT_HLSLTriangleAdj:
+    //case AttributeList::AT_HLSLIndices:
+    //case AttributeList::AT_HLSLVertices:
+    //case AttributeList::AT_HLSLPrimitives:
+    //case AttributeList::AT_HLSLPayload:
       goto GenericAttributeParse;
     default:
       Diag(AttrNameLoc, diag::err_hlsl_unsupported_construct) << AttrName;
@@ -3793,9 +3791,15 @@ HLSLReservedKeyword:
     case tok::kw_sample:
     case tok::kw_globallycoherent:
     case tok::kw_center:
+    case tok::kw_indices:
+    case tok::kw_vertices:
+    case tok::kw_primitives:
+    case tok::kw_payload:
       // Back-compat: 'precise', 'globallycoherent', 'center' and 'sample' are keywords when used as an interpolation
       // modifiers, but in FXC they can also be used an identifiers. If the decl type has already been specified
       // we need to update the token to be handled as an identifier.
+      // Similarly 'indices', 'vertices', 'primitives' and 'payload' are keywords
+      // when used as a type qualifer in mesh shader, but may still be used as a variable name.
       if (getLangOpts().HLSL) {
         if (DS.getTypeSpecType() != DeclSpec::TST_unspecified) {
           Tok.setKind(tok::identifier);
@@ -5243,6 +5247,10 @@ bool Parser::isDeclarationSpecifier(bool DisambiguatingWithExpression) {
   case tok::kw_triangle:
   case tok::kw_triangleadj:
   case tok::kw_export:
+  case tok::kw_indices:
+  case tok::kw_vertices:
+  case tok::kw_primitives:
+  case tok::kw_payload:
     return true;
   // HLSL Change Ends
 
@@ -6013,6 +6021,9 @@ void Parser::ParseDirectDeclarator(Declarator &D) {
     // FXC they can also be used an identifiers. If the next token is a
     // punctuator, then we are using them as identifers. Need to change
     // the token type to tok::identifier and fall through to the next case.
+    // Similarly 'indices', 'vertices', 'primitives' and 'payload' are keywords
+    // when used as a type qualifer in mesh shader, but may still be used as a
+    // variable name.
     // E.g., <type> left, center, right;
     if (getLangOpts().HLSL) {
       switch (Tok.getKind()) {
@@ -6020,6 +6031,10 @@ void Parser::ParseDirectDeclarator(Declarator &D) {
       case tok::kw_globallycoherent:
       case tok::kw_precise:
       case tok::kw_sample:
+      case tok::kw_indices:
+      case tok::kw_vertices:
+      case tok::kw_primitives:
+      case tok::kw_payload:
         if (tok::isPunctuator(NextToken().getKind()))
           Tok.setKind(tok::identifier);
         break;

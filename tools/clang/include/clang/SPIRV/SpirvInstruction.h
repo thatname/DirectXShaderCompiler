@@ -449,15 +449,6 @@ private:
 /// \brief OpVariable instruction
 class SpirvVariable : public SpirvInstruction {
 public:
-  /// \brief An enum class for representing what the DeclContext is used for
-  enum class ContextUsageKind {
-    CBuffer = 0,
-    TBuffer = 1,
-    PushConstant = 2,
-    Globals = 3,
-    None = 4
-  };
-
   SpirvVariable(QualType resultType, SourceLocation loc, spv::StorageClass sc,
                 bool isPrecise, SpirvInstruction *initializerId = 0);
 
@@ -470,12 +461,18 @@ public:
 
   bool hasInitializer() const { return initializer != nullptr; }
   SpirvInstruction *getInitializer() const { return initializer; }
-  void setContextUsageKind(ContextUsageKind k) { contextUsageKind = k; }
-  ContextUsageKind getContextUsageKind() const { return contextUsageKind; }
+  bool hasBinding() const { return descriptorSet >= 0 || binding >= 0; }
+  llvm::StringRef getHlslUserType() const { return hlslUserType; }
+
+  void setDescriptorSetNo(int32_t dset) { descriptorSet = dset; }
+  void setBindingNo(int32_t b) { binding = b; }
+  void setHlslUserType(llvm::StringRef userType) { hlslUserType = userType; }
 
 private:
   SpirvInstruction *initializer;
-  ContextUsageKind contextUsageKind;
+  int32_t descriptorSet;
+  int32_t binding;
+  std::string hlslUserType;
 };
 
 class SpirvFunctionParameter : public SpirvInstruction {
@@ -993,8 +990,7 @@ protected:
 
 class SpirvConstantBoolean : public SpirvConstant {
 public:
-  SpirvConstantBoolean(QualType type, bool value,
-                       bool isSpecConst = false);
+  SpirvConstantBoolean(QualType type, bool value, bool isSpecConst = false);
 
   // For LLVM-style RTTI
   static bool classof(const SpirvInstruction *inst) {
@@ -1729,29 +1725,6 @@ public:
 private:
   SpirvInstruction *structure;
   uint32_t arrayMember;
-};
-
-// TODO: It'd be better to leave debug info attached to whatever entity they are
-// annotating and have a pass write out the binaries for them directly.
-class SpirvLineInfo : public SpirvInstruction {
-public:
-  SpirvLineInfo(SpirvString *srcFile, uint32_t srcLine, uint32_t srcCol);
-
-  // For LLVM-style RTTI
-  static bool classof(const SpirvInstruction *inst) {
-    return inst->getKind() == IK_LineInfo;
-  }
-
-  bool invokeVisitor(Visitor *v) override;
-
-  SpirvString *getSourceFile() { return file; }
-  uint32_t getSourceLine() { return line; }
-  uint32_t getSourceColumn() { return column; }
-
-private:
-  SpirvString *file;
-  uint32_t line;
-  uint32_t column;
 };
 
 /// \brief Base class for all NV raytracing instructions.

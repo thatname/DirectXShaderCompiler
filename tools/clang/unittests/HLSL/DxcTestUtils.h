@@ -16,6 +16,7 @@
 #include "dxc/dxcapi.h"
 #include "dxc/Support/dxcapi.use.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace hlsl {
 namespace options {
@@ -54,34 +55,64 @@ public:
   int Run();
 };
 
+// The result of running a single command in a run pipeline
+struct FileRunCommandResult {
+  CComPtr<IDxcOperationResult> OpResult; // The operation result, if any.
+  std::string StdOut;
+  std::string StdErr;
+  int ExitCode = 0;
+  bool AbortPipeline = false; // True to prevent running subsequent commands
+
+  static inline FileRunCommandResult Success() {
+    FileRunCommandResult result;
+    result.ExitCode = 0;
+    return std::move(result);
+  }
+
+  static inline FileRunCommandResult Success(std::string StdOut) {
+    FileRunCommandResult result;
+    result.ExitCode = 0;
+    result.StdOut = std::move(StdOut);
+    return std::move(result);
+  }
+
+  static inline FileRunCommandResult Error(int ExitCode, std::string StdErr) {
+    FileRunCommandResult result;
+    result.ExitCode = ExitCode;
+    result.StdErr = std::move(StdErr);
+    return std::move(result);
+  }
+
+  static inline FileRunCommandResult Error(std::string StdErr) {
+    return Error(1, StdErr);
+  }
+};
+
 class FileRunCommandPart {
 public:
   FileRunCommandPart(const std::string &command, const std::string &arguments, LPCWSTR commandFileName);
   FileRunCommandPart(const FileRunCommandPart&) = default;
   FileRunCommandPart(FileRunCommandPart&&) = default;
   
-  void Run(dxc::DxcDllSupport &DllSupport, const FileRunCommandPart *Prior);
+  FileRunCommandResult Run(dxc::DxcDllSupport &DllSupport, const FileRunCommandResult *Prior);
+  FileRunCommandResult RunHashTests(dxc::DxcDllSupport &DllSupport);
   
-  void ReadOptsForDxc(hlsl::options::MainArgs &argStrings, hlsl::options::DxcOpts &Opts);
+  FileRunCommandResult ReadOptsForDxc(hlsl::options::MainArgs &argStrings, hlsl::options::DxcOpts &Opts);
 
   std::string Command;      // Command to run, eg %dxc
   std::string Arguments;    // Arguments to command
   LPCWSTR CommandFileName;  // File name replacement for %s
 
-  // These fields are set after an invocation to Run().
-  CComPtr<IDxcOperationResult> OpResult;  // The operation result, if any.
-  int RunResult;                          // The exit code for the operation.
-  std::string StdOut;                     // Standard output text.
-  std::string StdErr;                     // Standard error text.
-
 private:
-  void RunFileChecker(const FileRunCommandPart *Prior);
-  void RunDxc(dxc::DxcDllSupport &DllSupport, const FileRunCommandPart *Prior);
-  void RunDxv(dxc::DxcDllSupport &DllSupport, const FileRunCommandPart *Prior);
-  void RunOpt(dxc::DxcDllSupport &DllSupport, const FileRunCommandPart *Prior);
-  void RunD3DReflect(dxc::DxcDllSupport &DllSupport, const FileRunCommandPart *Prior);
-  void RunTee(const FileRunCommandPart *Prior);
-  void RunXFail(const FileRunCommandPart *Prior);
+  FileRunCommandResult RunFileChecker(const FileRunCommandResult *Prior);
+  FileRunCommandResult RunDxc(dxc::DxcDllSupport &DllSupport, const FileRunCommandResult *Prior);
+  FileRunCommandResult RunDxv(dxc::DxcDllSupport &DllSupport, const FileRunCommandResult *Prior);
+  FileRunCommandResult RunOpt(dxc::DxcDllSupport &DllSupport, const FileRunCommandResult *Prior);
+  FileRunCommandResult RunD3DReflect(dxc::DxcDllSupport &DllSupport, const FileRunCommandResult *Prior);
+  FileRunCommandResult RunTee(const FileRunCommandResult *Prior);
+  FileRunCommandResult RunXFail(const FileRunCommandResult *Prior);
+  FileRunCommandResult RunDxilVer(dxc::DxcDllSupport& DllSupport, const FileRunCommandResult* Prior);
+  FileRunCommandResult RunDxcHashTest(dxc::DxcDllSupport &DllSupport);
 };
 
 void ParseCommandParts(LPCSTR commands, LPCWSTR fileName, std::vector<FileRunCommandPart> &parts);
@@ -91,17 +122,13 @@ class FileRunTestResult {
 public:
   std::string ErrorMessage;
   int RunResult;
+  static FileRunTestResult RunHashTestFromFileCommands(LPCWSTR fileName);
   static FileRunTestResult RunFromFileCommands(LPCWSTR fileName);
   static FileRunTestResult RunFromFileCommands(LPCWSTR fileName, dxc::DxcDllSupport &dllSupport);
 };
 
-inline std::string BlobToUtf8(_In_ IDxcBlob *pBlob) {
-  if (pBlob == nullptr)
-    return std::string();
-  return std::string((char *)pBlob->GetBufferPointer(), pBlob->GetBufferSize());
-}
-
 void AssembleToContainer(dxc::DxcDllSupport &dllSupport, IDxcBlob *pModule, IDxcBlob **pContainer);
+std::string BlobToUtf8(_In_ IDxcBlob *pBlob);
 std::wstring BlobToUtf16(_In_ IDxcBlob *pBlob);
 void CheckOperationSucceeded(IDxcOperationResult *pResult, IDxcBlob **ppBlob);
 bool CheckOperationResultMsgs(IDxcOperationResult *pResult,
@@ -130,6 +157,9 @@ void VerifyCompileOK(dxc::DxcDllSupport &dllSupport, LPCSTR pText,
 void VerifyCompileOK(dxc::DxcDllSupport &dllSupport, LPCSTR pText,
                      LPWSTR pTargetProfile, std::vector<LPCWSTR> &args,
                      _Outptr_ IDxcBlob **ppResult);
+
+HRESULT GetVersion(dxc::DxcDllSupport& DllSupport, REFCLSID clsid, unsigned &Major, unsigned &Minor);
+bool ParseTargetProfile(llvm::StringRef targetProfile, llvm::StringRef &outStage, unsigned &outMajor, unsigned &outMinor);
 
 class VersionSupportInfo {
 private:
