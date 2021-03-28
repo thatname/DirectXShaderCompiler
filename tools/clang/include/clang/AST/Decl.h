@@ -173,7 +173,7 @@ public:
   /// This requires that the declaration have a name and that it be a simple
   /// identifier.
   StringRef getName() const {
-    assert(Name.isIdentifier() && "Name is not a simple identifier");
+    // assert(Name.isIdentifier() && "Name is not a simple identifier");
     return getIdentifier() ? getIdentifier()->getName() : "";
   }
 
