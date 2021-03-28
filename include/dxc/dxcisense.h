@@ -564,6 +564,39 @@ enum DxcCursorKindFlags
   DxcCursorKind_Unexposed = 0x100,
 };
 
+enum DxcCodeCompleteFlags
+{
+  DxcCodeCompleteFlags_None = 0,
+  DxcCodeCompleteFlags_IncludeMacros = 0x1,
+  DxcCodeCompleteFlags_IncludeCodePatterns = 0x2,
+  DxcCodeCompleteFlags_IncludeBriefComments = 0x4,
+};
+
+enum DxcCompletionChunkKind
+{
+  DxcCompletionChunk_Optional = 0,
+  DxcCompletionChunk_TypedText = 1,
+  DxcCompletionChunk_Text = 2,
+  DxcCompletionChunk_Placeholder = 3,
+  DxcCompletionChunk_Informative = 4,
+  DxcCompletionChunk_CurrentParameter = 5,
+  DxcCompletionChunk_LeftParen = 6,
+  DxcCompletionChunk_RightParen = 7,
+  DxcCompletionChunk_LeftBracket = 8,
+  DxcCompletionChunk_RightBracket = 9,
+  DxcCompletionChunk_LeftBrace = 10,
+  DxcCompletionChunk_RightBrace = 11,
+  DxcCompletionChunk_LeftAngle = 12,
+  DxcCompletionChunk_RightAngle = 13,
+  DxcCompletionChunk_Comma = 14,
+  DxcCompletionChunk_ResultType = 15,
+  DxcCompletionChunk_Colon = 16,
+  DxcCompletionChunk_SemiColon = 17,
+  DxcCompletionChunk_Equal = 18,
+  DxcCompletionChunk_HorizontalSpace = 19,
+  DxcCompletionChunk_VerticalSpace = 20,
+};
+
 struct IDxcCursor;
 struct IDxcDiagnostic;
 struct IDxcFile;
@@ -576,9 +609,12 @@ struct IDxcToken;
 struct IDxcTranslationUnit;
 struct IDxcType;
 struct IDxcUnsavedFile;
+struct IDxcCodeCompleteResults;
+struct IDxcCompletionResult;
+struct IDxcCompletionString;
 
-struct __declspec(uuid("1467b985-288d-4d2a-80c1-ef89c42c40bc"))
-IDxcCursor : public IUnknown
+CROSS_PLATFORM_UUIDOF(IDxcCursor, "1467b985-288d-4d2a-80c1-ef89c42c40bc")
+struct IDxcCursor : public IUnknown
 {
   virtual HRESULT STDMETHODCALLTYPE GetExtent(_Outptr_result_nullonfailure_ IDxcSourceRange** pRange) = 0;
   virtual HRESULT STDMETHODCALLTYPE GetLocation(_Outptr_result_nullonfailure_ IDxcSourceLocation** pResult) = 0;
@@ -616,8 +652,8 @@ IDxcCursor : public IUnknown
   virtual HRESULT STDMETHODCALLTYPE GetSnappedChild(_In_ IDxcSourceLocation* location, _Outptr_result_maybenull_ IDxcCursor** pResult) = 0;
 };
 
-struct __declspec(uuid("4f76b234-3659-4d33-99b0-3b0db994b564"))
-IDxcDiagnostic : public IUnknown
+CROSS_PLATFORM_UUIDOF(IDxcDiagnostic, "4f76b234-3659-4d33-99b0-3b0db994b564")
+struct IDxcDiagnostic : public IUnknown
 {
   virtual HRESULT STDMETHODCALLTYPE FormatDiagnostic(
     DxcDiagnosticDisplayOptions options,
@@ -633,8 +669,8 @@ IDxcDiagnostic : public IUnknown
     _Outptr_result_nullonfailure_ IDxcSourceRange** pReplacementRange, _Outptr_result_maybenull_ LPSTR* pText) = 0;
 };
 
-struct __declspec(uuid("bb2fca9e-1478-47ba-b08c-2c502ada4895"))
-IDxcFile : public IUnknown
+CROSS_PLATFORM_UUIDOF(IDxcFile, "bb2fca9e-1478-47ba-b08c-2c502ada4895")
+struct IDxcFile : public IUnknown
 {
   /// <summary>Gets the file name for this file.</summary>
   virtual HRESULT STDMETHODCALLTYPE GetName(_Outptr_result_maybenull_ LPSTR* pResult) = 0;
@@ -642,16 +678,16 @@ IDxcFile : public IUnknown
   virtual HRESULT STDMETHODCALLTYPE IsEqualTo(_In_ IDxcFile* other, _Out_ BOOL* pResult) = 0;
 };
 
-struct __declspec(uuid("0c364d65-df44-4412-888e-4e552fc5e3d6"))
-IDxcInclusion : public IUnknown
+CROSS_PLATFORM_UUIDOF(IDxcInclusion, "0c364d65-df44-4412-888e-4e552fc5e3d6")
+struct IDxcInclusion : public IUnknown
 {
   virtual HRESULT STDMETHODCALLTYPE GetIncludedFile(_Outptr_result_nullonfailure_ IDxcFile** pResult) = 0;
   virtual HRESULT STDMETHODCALLTYPE GetStackLength(_Out_ unsigned *pResult) = 0;
   virtual HRESULT STDMETHODCALLTYPE GetStackItem(unsigned index, _Outptr_result_nullonfailure_ IDxcSourceLocation **pResult) = 0;
 };
 
-struct __declspec(uuid("b1f99513-46d6-4112-8169-dd0d6053f17d"))
-IDxcIntelliSense : public IUnknown
+CROSS_PLATFORM_UUIDOF(IDxcIntelliSense, "b1f99513-46d6-4112-8169-dd0d6053f17d")
+struct IDxcIntelliSense : public IUnknown
 {
   virtual HRESULT STDMETHODCALLTYPE CreateIndex(_Outptr_result_nullonfailure_ IDxcIndex** index) = 0;
   virtual HRESULT STDMETHODCALLTYPE GetNullLocation(_Outptr_result_nullonfailure_ IDxcSourceLocation** location) = 0;
@@ -664,12 +700,10 @@ IDxcIntelliSense : public IUnknown
     _Out_ DxcDiagnosticDisplayOptions* pValue) = 0;
   virtual HRESULT STDMETHODCALLTYPE GetDefaultEditingTUOptions(_Out_ DxcTranslationUnitFlags* pValue) = 0;
   virtual HRESULT STDMETHODCALLTYPE CreateUnsavedFile(_In_ LPCSTR fileName, _In_ LPCSTR contents, unsigned contentLength, _Outptr_result_nullonfailure_ IDxcUnsavedFile** pResult) = 0;
-
-  DECLARE_CROSS_PLATFORM_UUIDOF(IDxcIntelliSense)
 };
 
-struct __declspec(uuid("937824a0-7f5a-4815-9ba7-7fc0424f4173"))
-IDxcIndex : public IUnknown
+CROSS_PLATFORM_UUIDOF(IDxcIndex, "937824a0-7f5a-4815-9ba7-7fc0424f4173")
+struct IDxcIndex : public IUnknown
 {
   virtual HRESULT STDMETHODCALLTYPE SetGlobalOptions(DxcGlobalOptions options) = 0;
   virtual HRESULT STDMETHODCALLTYPE GetGlobalOptions(_Out_ DxcGlobalOptions* options) = 0;
@@ -683,8 +717,8 @@ IDxcIndex : public IUnknown
       _Out_ IDxcTranslationUnit** pTranslationUnit) = 0;
 };
 
-struct __declspec(uuid("8e7ddf1c-d7d3-4d69-b286-85fccba1e0cf"))
-IDxcSourceLocation : public IUnknown
+CROSS_PLATFORM_UUIDOF(IDxcSourceLocation, "8e7ddf1c-d7d3-4d69-b286-85fccba1e0cf")
+struct IDxcSourceLocation : public IUnknown
 {
   virtual HRESULT STDMETHODCALLTYPE IsEqualTo(_In_ IDxcSourceLocation* other, _Out_ BOOL* pResult) = 0;
   virtual HRESULT STDMETHODCALLTYPE GetSpellingLocation(
@@ -693,10 +727,14 @@ IDxcSourceLocation : public IUnknown
     _Out_opt_ unsigned* pCol,
     _Out_opt_ unsigned* pOffset) = 0;
   virtual HRESULT STDMETHODCALLTYPE IsNull(_Out_ BOOL* pResult) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetPresumedLocation(
+    _Outptr_opt_ LPSTR* pFilename,
+    _Out_opt_ unsigned* pLine,
+    _Out_opt_ unsigned* pCol) = 0;
 };
 
-struct __declspec(uuid("f1359b36-a53f-4e81-b514-b6b84122a13f"))
-IDxcSourceRange : public IUnknown
+CROSS_PLATFORM_UUIDOF(IDxcSourceRange, "f1359b36-a53f-4e81-b514-b6b84122a13f")
+struct IDxcSourceRange : public IUnknown
 {
   virtual HRESULT STDMETHODCALLTYPE IsNull(_Out_ BOOL* pValue) = 0;
   virtual HRESULT STDMETHODCALLTYPE GetStart(_Out_ IDxcSourceLocation** pValue) = 0;
@@ -704,8 +742,8 @@ IDxcSourceRange : public IUnknown
   virtual HRESULT STDMETHODCALLTYPE GetOffsets(_Out_ unsigned* startOffset, _Out_ unsigned* endOffset) = 0;
 };
 
-struct __declspec(uuid("7f90b9ff-a275-4932-97d8-3cfd234482a2"))
-IDxcToken : public IUnknown
+CROSS_PLATFORM_UUIDOF(IDxcToken, "7f90b9ff-a275-4932-97d8-3cfd234482a2")
+struct IDxcToken : public IUnknown
 {
   virtual HRESULT STDMETHODCALLTYPE GetKind(_Out_ DxcTokenKind* pValue) = 0;
   virtual HRESULT STDMETHODCALLTYPE GetLocation(_Out_ IDxcSourceLocation** pValue) = 0;
@@ -713,8 +751,8 @@ IDxcToken : public IUnknown
   virtual HRESULT STDMETHODCALLTYPE GetSpelling(_Out_ LPSTR* pValue) = 0;
 };
 
-struct __declspec(uuid("9677dee0-c0e5-46a1-8b40-3db3168be63d"))
-IDxcTranslationUnit : public IUnknown
+CROSS_PLATFORM_UUIDOF(IDxcTranslationUnit, "9677dee0-c0e5-46a1-8b40-3db3168be63d")
+struct IDxcTranslationUnit : public IUnknown
 {
   virtual HRESULT STDMETHODCALLTYPE GetCursor(_Out_ IDxcCursor** pCursor) = 0;
   virtual HRESULT STDMETHODCALLTYPE Tokenize(
@@ -744,22 +782,50 @@ IDxcTranslationUnit : public IUnknown
     _Out_ unsigned* errorLength,
     _Out_ BSTR* errorMessage) = 0;
   virtual HRESULT STDMETHODCALLTYPE GetInclusionList(_Out_ unsigned* pResultCount, _Outptr_result_buffer_(*pResultCount) IDxcInclusion*** pResult) = 0;
+  virtual HRESULT STDMETHODCALLTYPE CodeCompleteAt(
+      _In_ const char *fileName, unsigned line, unsigned column,
+      _In_ IDxcUnsavedFile** pUnsavedFiles, unsigned numUnsavedFiles,
+      _In_ DxcCodeCompleteFlags options,
+      _Outptr_result_nullonfailure_ IDxcCodeCompleteResults **pResult) = 0;
 };
 
-struct __declspec(uuid("2ec912fd-b144-4a15-ad0d-1c5439c81e46"))
-IDxcType : public IUnknown
+CROSS_PLATFORM_UUIDOF(IDxcType, "2ec912fd-b144-4a15-ad0d-1c5439c81e46")
+struct IDxcType : public IUnknown
 {
   virtual HRESULT STDMETHODCALLTYPE GetSpelling(_Outptr_result_z_ LPSTR* pResult) = 0;
   virtual HRESULT STDMETHODCALLTYPE IsEqualTo(_In_ IDxcType* other, _Out_ BOOL* pResult) = 0;
   virtual HRESULT STDMETHODCALLTYPE GetKind(_Out_ DxcTypeKind* pResult) = 0;
 };
 
-struct __declspec(uuid("8ec00f98-07d0-4e60-9d7c-5a50b5b0017f"))
-IDxcUnsavedFile : public IUnknown
+CROSS_PLATFORM_UUIDOF(IDxcUnsavedFile, "8ec00f98-07d0-4e60-9d7c-5a50b5b0017f")
+struct IDxcUnsavedFile : public IUnknown
 {
   virtual HRESULT STDMETHODCALLTYPE GetFileName(_Outptr_result_z_ LPSTR* pFileName) = 0;
   virtual HRESULT STDMETHODCALLTYPE GetContents(_Outptr_result_z_ LPSTR* pContents) = 0;
   virtual HRESULT STDMETHODCALLTYPE GetLength(_Out_ unsigned* pLength) = 0;
+};
+
+
+CROSS_PLATFORM_UUIDOF(IDxcCodeCompleteResults, "1E06466A-FD8B-45F3-A78F-8A3F76EBB552")
+struct IDxcCodeCompleteResults : public IUnknown
+{
+  virtual HRESULT STDMETHODCALLTYPE GetNumResults(_Out_ unsigned* pResult) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetResultAt(unsigned index, _Outptr_result_nullonfailure_ IDxcCompletionResult** pResult) = 0;
+};
+
+CROSS_PLATFORM_UUIDOF(IDxcCompletionResult, "943C0588-22D0-4784-86FC-701F802AC2B6")
+struct IDxcCompletionResult : public IUnknown
+{
+  virtual HRESULT STDMETHODCALLTYPE GetCursorKind(_Out_ DxcCursorKind* pResult) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetCompletionString(_Outptr_result_nullonfailure_ IDxcCompletionString** pResult) = 0;
+};
+
+CROSS_PLATFORM_UUIDOF(IDxcCompletionString, "06B51E0F-A605-4C69-A110-CD6E14B58EEC")
+struct IDxcCompletionString : public IUnknown
+{
+  virtual HRESULT STDMETHODCALLTYPE GetNumCompletionChunks(_Out_ unsigned* pResult) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetCompletionChunkKind(unsigned chunkNumber, _Out_ DxcCompletionChunkKind* pResult) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetCompletionChunkText(unsigned chunkNumber, _Out_ LPSTR* pResult) = 0;
 };
 
 // Fun fact: 'extern' is required because const is by default static in C++, so
@@ -767,17 +833,16 @@ IDxcUnsavedFile : public IUnknown
 // not by default static in C)
 
 #ifdef _MSC_VER
-#define EXTERN extern
+#define CLSID_SCOPE __declspec(selectany) extern
 #else
-#define EXTERN
+#define CLSID_SCOPE
 #endif
 
-__declspec(selectany)
-EXTERN const CLSID CLSID_DxcIntelliSense = { /* 3047833c-d1c0-4b8e-9d40-102878605985 */
-    0x3047833c,
-    0xd1c0,
-    0x4b8e,
-    {0x9d, 0x40, 0x10, 0x28, 0x78, 0x60, 0x59, 0x85}
-  };
+CLSID_SCOPE const CLSID
+    CLSID_DxcIntelliSense = {/* 3047833c-d1c0-4b8e-9d40-102878605985 */
+                             0x3047833c,
+                             0xd1c0,
+                             0x4b8e,
+                             {0x9d, 0x40, 0x10, 0x28, 0x78, 0x60, 0x59, 0x85}};
 
 #endif

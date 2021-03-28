@@ -11,6 +11,7 @@
 #include "DxilDiaSymbolManager.h"
 
 #include <cctype>
+#include <functional>
 #include <type_traits>
 
 #include <comdef.h>
@@ -18,6 +19,7 @@
 #include "dxc/DxilPIXPasses/DxilPIXVirtualRegisters.h"
 #include "dxc/Support/Unicode.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DebugInfoMetadata.h"
@@ -132,12 +134,43 @@ struct GlobalScopeSymbol : public Symbol {
   HRESULT GetChildren(std::vector<CComPtr<Symbol>> *children) override;
 };
 
+namespace symbol_factory {
+class GlobalScope final : public SymbolManager::SymbolFactory {
+public:
+    GlobalScope(DWORD ID, DWORD ParentID)
+        : SymbolManager::SymbolFactory(ID, ParentID) {}
+
+    virtual HRESULT Create(Session *pSession, Symbol **ppRet) override {
+        IMalloc *pMalloc = pSession->GetMallocNoRef();
+        return hlsl_symbols::GlobalScopeSymbol::Create(pMalloc, pSession, ppRet);
+    }
+};
+}  // namespace symbol_factory
+
 struct CompilandSymbol : public DISymbol<llvm::DICompileUnit *> {
   DXC_MICROCOM_TM_ALLOC(CompilandSymbol)
   explicit CompilandSymbol(IMalloc *M, llvm::DICompileUnit *CU) : DISymbol<llvm::DICompileUnit *>(M, CU) {}
   static HRESULT Create(IMalloc *pMalloc, Session *pSession, llvm::DICompileUnit *CU, Symbol **ppSym);
   HRESULT GetChildren(std::vector<CComPtr<Symbol>> *children) override;
 };
+
+namespace symbol_factory {
+class Compiland final : public SymbolManager::SymbolFactory {
+public:
+    Compiland(DWORD ID, DWORD ParentID, llvm::DICompileUnit *CU)
+        : SymbolManager::SymbolFactory(ID, ParentID), m_CU(CU) {}
+
+    virtual HRESULT Create(Session *pSession, Symbol **ppRet) override {
+        IMalloc *pMalloc = pSession->GetMallocNoRef();
+        IFR(hlsl_symbols::CompilandSymbol::Create(pMalloc, pSession, m_CU, ppRet));
+        (*ppRet)->SetLexicalParent(m_ParentID);
+        return S_OK;
+    }
+
+private:
+    llvm::DICompileUnit *m_CU;
+};
+}  // namespace symbol_factory
 
 struct CompilandDetailsSymbol : public Symbol {
   DXC_MICROCOM_TM_ALLOC(CompilandDetailsSymbol)
@@ -192,6 +225,21 @@ struct CompilandDetailsSymbol : public Symbol {
 #pragma endregion
 };
 
+namespace symbol_factory {
+class CompilandDetails final : public SymbolManager::SymbolFactory {
+public:
+    CompilandDetails(DWORD ID, DWORD ParentID)
+        : SymbolManager::SymbolFactory(ID, ParentID) {}
+
+    virtual HRESULT Create(Session *pSession, Symbol **ppRet) override {
+        IMalloc *pMalloc = pSession->GetMallocNoRef();
+        IFR(hlsl_symbols::CompilandDetailsSymbol::Create(pMalloc, pSession, ppRet));
+        (*ppRet)->SetLexicalParent(m_ParentID);
+        return S_OK;
+    }
+};
+}  // namespace symbol_factory
+
 struct CompilandEnvSymbol : public Symbol {
   DXC_MICROCOM_TM_ALLOC(CompilandEnvSymbol)
   explicit CompilandEnvSymbol(IMalloc *M) : Symbol(M) {}
@@ -203,6 +251,23 @@ struct CompilandEnvSymbol : public Symbol {
   HRESULT GetChildren(std::vector<CComPtr<Symbol>> *children) override;
 };
 
+namespace symbol_factory {
+using CompilandEnvCreateFn = HRESULT(IMalloc *, Session *, Symbol **);
+template<CompilandEnvCreateFn C>
+class CompilandEnv final : public SymbolManager::SymbolFactory {
+public:
+    CompilandEnv(DWORD ID, DWORD ParentID)
+        : SymbolManager::SymbolFactory(ID, ParentID) {}
+
+    virtual HRESULT Create(Session *pSession, Symbol **ppRet) override {
+        IMalloc *pMalloc = pSession->GetMallocNoRef();
+        IFR(C(pMalloc, pSession, ppRet));
+        (*ppRet)->SetLexicalParent(m_ParentID);
+        return S_OK;
+    }
+};
+}  // namespace symbol_factory
+
 struct FunctionSymbol : public TypedSymbol<llvm::DISubprogram *> {
   DXC_MICROCOM_TM_ALLOC(FunctionSymbol)
   FunctionSymbol(IMalloc *M, llvm::DISubprogram *Node, DWORD dwTypeID, llvm::DIType *Type) : TypedSymbol<llvm::DISubprogram *>(M, Node, dwTypeID, Type) {}
@@ -210,12 +275,48 @@ struct FunctionSymbol : public TypedSymbol<llvm::DISubprogram *> {
   HRESULT GetChildren(std::vector<CComPtr<Symbol>> *children) override;
 };
 
+namespace symbol_factory {
+class Function final : public SymbolManager::SymbolFactory {
+public:
+    Function(DWORD ID, DWORD ParentID, llvm::DISubprogram *Node, DWORD TypeID)
+        : SymbolManager::SymbolFactory(ID, ParentID),
+          m_Node(Node), m_TypeID(TypeID) {}
+
+    virtual HRESULT Create(Session *pSession, Symbol **ppRet) override {
+        IMalloc *pMalloc = pSession->GetMallocNoRef();
+        IFR(FunctionSymbol::Create(pMalloc, pSession, m_ID, m_Node, m_TypeID, m_Node->getType(), ppRet));
+        (*ppRet)->SetLexicalParent(m_ParentID);
+        (*ppRet)->SetName(CA2W(m_Node->getName().str().c_str(), CP_UTF8));
+        return S_OK;
+    }
+
+private:
+    llvm::DISubprogram *m_Node;
+    DWORD m_TypeID;
+};
+}  // namespace symbol_factory
+
 struct FunctionBlockSymbol : public Symbol {
   DXC_MICROCOM_TM_ALLOC(FunctionBlockSymbol)
   explicit FunctionBlockSymbol(IMalloc *M) : Symbol(M) {}
   static HRESULT Create(IMalloc *pMalloc, Session *pSession, DWORD dwID, Symbol **ppSym);
   HRESULT GetChildren(std::vector<CComPtr<Symbol>> *children) override;
 };
+
+namespace symbol_factory {
+class FunctionBlock final : public SymbolManager::SymbolFactory {
+public:
+    FunctionBlock(DWORD ID, DWORD ParentID)
+        : SymbolManager::SymbolFactory(ID, ParentID) {}
+
+    virtual HRESULT Create(Session *pSession, Symbol **ppRet) override {
+        IMalloc *pMalloc = pSession->GetMallocNoRef();
+        IFR(FunctionBlockSymbol::Create(pMalloc, pSession, m_ID, ppRet));
+        (*ppRet)->SetLexicalParent(m_ParentID);
+        return S_OK;
+    }
+};
+}  // namespace symbol_factory
 
 struct TypeSymbol : public DISymbol<llvm::DIType *> {
   using LazySymbolName = std::function<HRESULT(Session *, std::string *)>;
@@ -234,10 +335,31 @@ struct TypeSymbol : public DISymbol<llvm::DIType *> {
   LazySymbolName m_lazySymbolName;
 };
 
+namespace symbol_factory {
+class Type final : public SymbolManager::SymbolFactory {
+public:
+    Type(DWORD ID, DWORD ParentID, DWORD st, llvm::DIType *Node, TypeSymbol::LazySymbolName LazySymbolName)
+        : SymbolManager::SymbolFactory(ID, ParentID),
+          m_st(st), m_Node(Node), m_LazySymbolName(LazySymbolName) {}
+
+    virtual HRESULT Create(Session *pSession, Symbol **ppRet) override {
+        IMalloc *pMalloc = pSession->GetMallocNoRef();
+        IFR(TypeSymbol::Create(pMalloc, pSession, m_ParentID, m_ID, m_st, m_Node, m_LazySymbolName, ppRet));
+        (*ppRet)->SetLexicalParent(m_ParentID);
+        return S_OK;
+    }
+
+private:
+    DWORD m_st;
+    llvm::DIType *m_Node;
+    TypeSymbol::LazySymbolName m_LazySymbolName;
+};
+}  // namespace symbol_factory
+
 struct TypedefTypeSymbol : public TypeSymbol {
   DXC_MICROCOM_TM_ALLOC(TypedefTypeSymbol)
   TypedefTypeSymbol(IMalloc *M, llvm::DIType *Node, DWORD dwBaseTypeID) : TypeSymbol(M, Node, nullptr), m_dwBaseTypeID(dwBaseTypeID) {}
-  static HRESULT Create(IMalloc *pMalloc, Session *pSession, DWORD dwParentID, DWORD dwID,llvm::DIType *Node, DWORD dwBaseTypeID, Symbol **ppSym);
+  static HRESULT Create(IMalloc *pMalloc, Session *pSession, DWORD dwParentID, DWORD dwID, llvm::DIType *Node, DWORD dwBaseTypeID, Symbol **ppSym);
 
   STDMETHODIMP get_type(
     /* [retval][out] */ IDiaSymbol **ppRetVal) override;
@@ -245,10 +367,31 @@ struct TypedefTypeSymbol : public TypeSymbol {
   const DWORD m_dwBaseTypeID;
 };
 
+namespace symbol_factory {
+class TypedefType final : public SymbolManager::SymbolFactory {
+public:
+    TypedefType(DWORD ID, DWORD ParentID, llvm::DIType *Node, DWORD BaseTypeID)
+        : SymbolManager::SymbolFactory(ID, ParentID),
+          m_Node(Node), m_BaseTypeID(BaseTypeID) {}
+
+    virtual HRESULT Create(Session *pSession, Symbol **ppRet) override {
+        IMalloc *pMalloc = pSession->GetMallocNoRef();
+        IFR(TypedefTypeSymbol::Create(pMalloc, pSession, m_ParentID, m_ID, m_Node, m_BaseTypeID, ppRet));
+        (*ppRet)->SetLexicalParent(m_ParentID);
+        (*ppRet)->SetName(CA2W(m_Node->getName().str().c_str(), CP_UTF8));
+        return S_OK;
+    }
+
+private:
+    llvm::DIType *m_Node;
+    DWORD m_BaseTypeID;
+};
+}  // namespace symbol_factory
+
 struct VectorTypeSymbol : public TypeSymbol {
   DXC_MICROCOM_TM_ALLOC(VectorTypeSymbol)
   VectorTypeSymbol(IMalloc *M, llvm::DIType *Node, DWORD dwElemTyID, std::uint32_t NumElts) : TypeSymbol(M, Node, nullptr), m_ElemTyID(dwElemTyID), m_NumElts(NumElts) {}
-  static HRESULT Create(IMalloc *pMalloc, Session *pSession, DWORD dwParentID, DWORD dwID,llvm::DIType *Node, DWORD dwElemTyID, std::uint32_t NumElts, Symbol **ppSym);
+  static HRESULT Create(IMalloc *pMalloc, Session *pSession, DWORD dwParentID, DWORD dwID, llvm::DIType *Node, DWORD dwElemTyID, std::uint32_t NumElts, Symbol **ppSym);
 
   STDMETHODIMP get_count(
     /* [retval][out] */ DWORD *pRetVal) override;
@@ -259,11 +402,53 @@ struct VectorTypeSymbol : public TypeSymbol {
   std::uint32_t m_NumElts;
 };
 
+namespace symbol_factory {
+class VectorType final : public SymbolManager::SymbolFactory {
+public:
+    VectorType(DWORD ID, DWORD ParentID, llvm::DIType *Node, DWORD ElemTyID, std::uint32_t NumElts)
+        : SymbolManager::SymbolFactory(ID, ParentID),
+          m_Node(Node), m_ElemTyID(ElemTyID), m_NumElts(NumElts) {}
+
+    virtual HRESULT Create(Session *pSession, Symbol **ppRet) override {
+        IMalloc *pMalloc = pSession->GetMallocNoRef();
+        IFR(VectorTypeSymbol::Create(pMalloc, pSession, m_ParentID, m_ID, m_Node, m_ElemTyID, m_NumElts, ppRet));
+        (*ppRet)->SetLexicalParent(m_ParentID);
+        (*ppRet)->SetName(CA2W(m_Node->getName().str().c_str(), CP_UTF8));
+        return S_OK;
+    }
+
+private:
+    llvm::DIType *m_Node;
+    DWORD m_ElemTyID;
+    std::uint32_t m_NumElts;
+};
+}  // namespace symbol_factory
+
 struct UDTSymbol : public TypeSymbol {
   DXC_MICROCOM_TM_ALLOC(UDTSymbol)
   UDTSymbol(IMalloc *M, llvm::DICompositeType *Node, LazySymbolName LazyName) : TypeSymbol(M, Node, LazyName) {}
   static HRESULT Create(IMalloc *pMalloc, Session *pSession, DWORD dwParentID, DWORD dwID, llvm::DICompositeType *Node, LazySymbolName LazySymbolName, Symbol **ppSym);
 };
+
+namespace symbol_factory {
+class UDT final : public SymbolManager::SymbolFactory {
+public:
+    UDT(DWORD ID, DWORD ParentID, llvm::DICompositeType *Node, TypeSymbol::LazySymbolName LazySymbolName)
+        : SymbolManager::SymbolFactory(ID, ParentID),
+          m_Node(Node), m_LazySymbolName(LazySymbolName) {}
+
+    virtual HRESULT Create(Session *pSession, Symbol **ppRet) override {
+        IMalloc *pMalloc = pSession->GetMallocNoRef();
+        IFR(UDTSymbol::Create(pMalloc, pSession, m_ParentID, m_ID, m_Node, m_LazySymbolName, ppRet));
+        (*ppRet)->SetLexicalParent(m_ParentID);
+        return S_OK;
+    }
+
+private:
+    llvm::DICompositeType *m_Node;
+    TypeSymbol::LazySymbolName m_LazySymbolName;
+};
+}  // namespace symbol_factory
 
 struct GlobalVariableSymbol : public TypedSymbol<llvm::DIGlobalVariable *> {
   DXC_MICROCOM_TM_ALLOC(GlobalVariableSymbol)
@@ -271,6 +456,29 @@ struct GlobalVariableSymbol : public TypedSymbol<llvm::DIGlobalVariable *> {
   static HRESULT Create(IMalloc *pMalloc, Session *pSession, DWORD dwID, llvm::DIGlobalVariable *GV, DWORD dwTypeID, llvm::DIType *Type, Symbol **ppSym);
   HRESULT GetChildren(std::vector<CComPtr<Symbol>> *children) override;
 };
+
+namespace symbol_factory {
+class GlobalVariable final : public SymbolManager::SymbolFactory {
+public:
+    GlobalVariable(DWORD ID, DWORD ParentID, llvm::DIGlobalVariable *GV, DWORD TypeID, llvm::DIType *Type)
+        : SymbolManager::SymbolFactory(ID, ParentID),
+          m_GV(GV), m_TypeID(TypeID), m_Type(Type) {}
+
+    virtual HRESULT Create(Session *pSession, Symbol **ppRet) override {
+        IMalloc *pMalloc = pSession->GetMallocNoRef();
+        IFR(GlobalVariableSymbol::Create(pMalloc, pSession, m_ID, m_GV, m_TypeID, m_Type, ppRet));
+        (*ppRet)->SetLexicalParent(m_ParentID);
+        (*ppRet)->SetName(CA2W(m_GV->getName().str().c_str(), CP_UTF8));
+        (*ppRet)->SetIsHLSLData(true);
+        return S_OK;
+    }
+
+private:
+    llvm::DIGlobalVariable *m_GV;
+    DWORD m_TypeID;
+    llvm::DIType *m_Type;
+};
+}  // namespace symbol_factory
 
 struct LocalVariableSymbol : public TypedSymbol<llvm::DIVariable *> {
   DXC_MICROCOM_TM_ALLOC(LocalVariableSymbol)
@@ -299,6 +507,50 @@ struct LocalVariableSymbol : public TypedSymbol<llvm::DIVariable *> {
   const DWORD m_dwDxilRegNum;
 };
 
+namespace symbol_factory {
+class LocalVarInfo {
+public:
+  LocalVarInfo() = default;
+  LocalVarInfo(const LocalVarInfo &) = delete;
+  LocalVarInfo(LocalVarInfo &&) = default;
+
+  DWORD GetVarID() const { return m_dwVarID; }
+  DWORD GetOffsetInUDT() const { return m_dwOffsetInUDT; }
+  DWORD GetDxilRegister() const { return m_dwDxilRegister; }
+
+  void SetVarID(DWORD dwVarID) { m_dwVarID = dwVarID; }
+  void SetOffsetInUDT(DWORD dwOffsetInUDT) { m_dwOffsetInUDT = dwOffsetInUDT; }
+  void SetDxilRegister(DWORD dwDxilReg) { m_dwDxilRegister = dwDxilReg; }
+
+private:
+  DWORD m_dwVarID = 0;
+  DWORD m_dwOffsetInUDT = 0;
+  DWORD m_dwDxilRegister = 0;
+};
+
+class LocalVariable final : public SymbolManager::SymbolFactory {
+public:
+    LocalVariable(DWORD ID, DWORD ParentID, llvm::DIVariable *Node, DWORD TypeID, llvm::DIType *Type, std::shared_ptr<LocalVarInfo> VI)
+        : SymbolManager::SymbolFactory(ID, ParentID),
+          m_Node(Node), m_TypeID(TypeID), m_Type(Type), m_VI(VI) {}
+
+    virtual HRESULT Create(Session *pSession, Symbol **ppRet) override {
+        IMalloc *pMalloc = pSession->GetMallocNoRef();
+        IFR(LocalVariableSymbol::Create(pMalloc, pSession, m_ID, m_Node, m_TypeID, m_Type, m_VI->GetOffsetInUDT(), m_VI->GetDxilRegister(), ppRet));
+        (*ppRet)->SetLexicalParent(m_ParentID);
+        (*ppRet)->SetName(CA2W(m_Node->getName().str().c_str(), CP_UTF8));
+        (*ppRet)->SetDataKind(m_Node->getTag() == llvm::dwarf::DW_TAG_arg_variable ? DataIsParam : DataIsLocal);
+        return S_OK;
+    }
+
+private:
+    llvm::DIVariable *m_Node;
+    DWORD m_TypeID;
+    llvm::DIType *m_Type;
+    std::shared_ptr<LocalVarInfo> m_VI;
+};
+}  // namespace symbol_factory
+
 struct UDTFieldSymbol : public TypedSymbol<llvm::DIDerivedType *> {
   DXC_MICROCOM_TM_ALLOC(UDTFieldSymbol)
   UDTFieldSymbol(IMalloc *M, llvm::DIDerivedType *Node, DWORD dwTypeID, llvm::DIType *Type) : TypedSymbol<llvm::DIDerivedType *>(M, Node, dwTypeID, Type) {}
@@ -308,6 +560,29 @@ struct UDTFieldSymbol : public TypedSymbol<llvm::DIDerivedType *> {
 
   HRESULT GetChildren(std::vector<CComPtr<Symbol>> *children) override;
 };
+
+namespace symbol_factory {
+class UDTField final : public SymbolManager::SymbolFactory {
+public:
+    UDTField(DWORD ID, DWORD ParentID, llvm::DIDerivedType *Node, DWORD TypeID, llvm::DIType *Type)
+        : SymbolManager::SymbolFactory(ID, ParentID),
+          m_Node(Node), m_TypeID(TypeID), m_Type(Type) {}
+
+    virtual HRESULT Create(Session *pSession, Symbol **ppRet) override {
+        IMalloc *pMalloc = pSession->GetMallocNoRef();
+        IFR(UDTFieldSymbol::Create(pMalloc, pSession, m_ID, m_Node, m_TypeID, m_Type, ppRet));
+        (*ppRet)->SetLexicalParent(m_ParentID);
+        (*ppRet)->SetName(CA2W(m_Node->getName().str().c_str(), CP_UTF8));
+        (*ppRet)->SetDataKind(m_Node->isStaticMember() ? DataIsStaticLocal : DataIsMember);
+        return S_OK;
+    }
+
+private:
+    llvm::DIDerivedType *m_Node;
+    DWORD m_TypeID;
+    llvm::DIType *m_Type;
+};
+}  // namespace symbol_factory
 
 class SymbolManagerInit {
 public:
@@ -336,57 +611,65 @@ public:
     std::vector<llvm::DIType *> m_Layout;
     DWORD m_dwCurrentSizeInBytes = 0;
   };
-  using TypeToInfoMap = llvm::DenseMap<llvm::DIType *, TypeInfo>;
+  using TypeToInfoMap = llvm::DenseMap<llvm::DIType *, std::unique_ptr<TypeInfo> >;
 
-  class VarInfo {
-  public:
-    VarInfo() = default;
-    VarInfo(const VarInfo &) = delete;
-    VarInfo(VarInfo &&) = default;
-
-    DWORD GetVarID() const { return m_dwVarID; }
-    DWORD GetOffsetInUDT() const { return m_dwOffsetInUDT; }
-    DWORD GetDxilRegister() const { return m_dwDxilRegister; }
-
-    void SetVarID(DWORD dwVarID) { m_dwVarID = dwVarID; }
-    void SetOffsetInUDT(DWORD dwOffsetInUDT) { m_dwOffsetInUDT = dwOffsetInUDT; }
-    void SetDxilRegister(DWORD dwDxilReg) { m_dwDxilRegister = dwDxilReg; }
-
-  private:
-    DWORD m_dwVarID = 0;
-    DWORD m_dwOffsetInUDT = 0;
-    DWORD m_dwDxilRegister = 0;
-  };
-
-  // Because of the way the VarToID map is constructed, the vector<VarInfo>
-  // may need to grow. The Symbol Constructor for local variable captures
-  // the VarInfo for the local variable it creates, and it needs access to
-  // the information on this map (thus a by-value capture is not enough).
-  // We heap-allocate the VarInfos, and the local variables symbol
+  // Because of the way the VarToID map is constructed, the
+  // vector<LocalVarInfo> may need to grow. The Symbol Constructor for local
+  // variable captures the LocalVarInfo for the local variable it creates, and
+  // it needs access to the information on this map (thus a by-value capture is
+  // not enough). We heap-allocate the VarInfos, and the local variables symbol
   // constructors capture the pointer - meaning everything should be fine
   // even if the vector is moved around.
-  using LocalVarToIDMap = llvm::DenseMap<llvm::DILocalVariable *, std::vector<std::shared_ptr<VarInfo>>>;
+  using LocalVarToIDMap = llvm::DenseMap<
+      llvm::DILocalVariable *,
+      std::vector<std::shared_ptr<symbol_factory::LocalVarInfo>>>;
 
   using UDTFieldToIDMap = llvm::DenseMap<llvm::DIDerivedType *, DWORD>;
 
   SymbolManagerInit(
     Session *pSession,
-    std::vector<SymbolManager::CreateSymbolFn> *pSymCtors,
+    std::vector<std::unique_ptr<SymbolManager::SymbolFactory>> *pSymCtors,
     SymbolManager::ScopeToIDMap *pScopeToSym,
     SymbolManager::IDToLiveRangeMap *pSymToLR);
 
-  HRESULT AddSymbol(DWORD dwParentID, DWORD *pNewSymID, SymbolCtor symCtor);
+  template <typename Factory, typename... Args>
+  HRESULT AddSymbol(DWORD dwParentID, DWORD *pNewSymID, Args&&... args) {
+      if (dwParentID > m_SymCtors.size()) {
+          return E_FAIL;
+      }
+
+      const DWORD dwNewSymID = m_SymCtors.size() + 1;
+      m_SymCtors.emplace_back(std::unique_ptr<Factory>(new Factory(dwNewSymID, dwParentID, std::forward<Args>(args)...)));
+      *pNewSymID = dwNewSymID;
+      IFR(AddParent(dwParentID));
+      return S_OK;
+  }
+
   HRESULT CreateFunctionsForAllCUs();
   HRESULT CreateGlobalVariablesForAllCUs();
   HRESULT CreateLocalVariables();
   HRESULT CreateLiveRanges();
-  HRESULT IsDbgDeclareCall(llvm::Module *M, const llvm::Instruction *I, DWORD *pReg, DWORD *pRegSize, llvm::DILocalVariable **LV, uint64_t *pStartOffset, uint64_t *pEndOffset);
+  HRESULT IsDbgDeclareCall(llvm::Module *M, const llvm::Instruction *I,
+                           DWORD *pReg, DWORD *pRegSize,
+                           llvm::DILocalVariable **LV, uint64_t *pStartOffset,
+                           uint64_t *pEndOffset,
+                           dxil_dia::Session::RVA *pLowestUserRVA,
+                           dxil_dia::Session::RVA *pHighestUserRVA);
   HRESULT GetDxilAllocaRegister(llvm::Instruction *I, DWORD *pRegNum, DWORD *pRegSize);
   HRESULT PopulateParentToChildrenIDMap(SymbolManager::ParentToChildrenMap *pParentToChildren);
 
 private:
   HRESULT GetTypeInfo(llvm::DIType *T, TypeInfo **TI);
-  HRESULT AddType(DWORD dwParentID, llvm::DIType *T, DWORD *pNewSymID, SymbolCtor symCtor);
+
+  template<typename Factory, typename... Args>
+  HRESULT AddType(DWORD dwParentID, llvm::DIType *T, DWORD *pNewSymID, Args&&... args) {
+      IFR(AddSymbol<Factory>(dwParentID, pNewSymID, std::forward<Args>(args)...));
+      if (!m_TypeToInfo.insert(std::make_pair(T, llvm::make_unique<TypeInfo>(*pNewSymID))).second) {
+          return E_FAIL;
+      }
+      return S_OK;
+  }
+
   HRESULT AddParent(DWORD dwParentIndex);
   HRESULT CreateFunctionBlockForLocalScope(llvm::DILocalScope *LS, DWORD *pNewSymID);
   HRESULT CreateFunctionBlockForInstruction(llvm::Instruction *I);
@@ -407,7 +690,7 @@ private:
   HRESULT CreateUDTField(DWORD dwParentID, llvm::DIDerivedType *Field);
 
   Session &m_Session;
-  std::vector<SymbolManager::CreateSymbolFn> &m_SymCtors;
+  std::vector<std::unique_ptr<SymbolManager::SymbolFactory>> &m_SymCtors;
   SymbolManager::ScopeToIDMap &m_ScopeToSym;
   SymbolManager::IDToLiveRangeMap &m_SymToLR;
 
@@ -531,7 +814,45 @@ HRESULT dxil_dia::hlsl_symbols::CompilandDetailsSymbol::GetChildren(std::vector<
 HRESULT dxil_dia::hlsl_symbols::CompilandEnvSymbol::CreateFlags(IMalloc *pMalloc, Session *pSession, Symbol **ppSym) {
   IFR(AllocAndInit(pMalloc, pSession, HlslCompilandEnvFlagsId, SymTagCompilandEnv, (CompilandEnvSymbol**)ppSym));
   (*ppSym)->SetName(L"hlslFlags");
-  (*ppSym)->SetValue(pSession->DxilModuleRef().GetGlobalFlags());
+
+  const char *specialCases[] = { "/T", "-T", "-D", "/D", "-E", "/E", };
+
+  llvm::MDNode *argsNode = pSession->Arguments()->getOperand(0);
+  // Construct a double null terminated string for defines with L"\0" as a delimiter
+  CComBSTR pBSTR;
+  for (llvm::MDNode::op_iterator it = argsNode->op_begin(); it != argsNode->op_end(); ++it) {
+    llvm::StringRef strRef = llvm::dyn_cast<llvm::MDString>(*it)->getString();
+
+    bool skip = false;
+    bool skipTwice = false;
+    for (unsigned i = 0; i < _countof(specialCases); i++) {
+      if (strRef == specialCases[i]) {
+        skipTwice = true;
+        skip = true;
+        break;
+      }
+      else if (strRef.startswith(specialCases[i])) {
+        skip = true;
+        break;
+      }
+    }
+
+    if (skip) {
+      if (skipTwice)
+        ++it;
+      continue;
+    }
+
+    std::string str(strRef.begin(), strRef.size());
+    CA2W cv(str.c_str(), CP_UTF8);
+    pBSTR.Append(cv);
+    pBSTR.Append(L"\0", 1);
+  }
+  pBSTR.Append(L"\0", 1);
+  VARIANT Variant;
+  Variant.bstrVal = pBSTR;
+  Variant.vt = VARENUM::VT_BSTR;
+  (*ppSym)->SetValue(&Variant);
   return S_OK;
 }
 
@@ -558,7 +879,7 @@ HRESULT dxil_dia::hlsl_symbols::CompilandEnvSymbol::CreateDefines(IMalloc *pMall
   for (llvm::MDNode::op_iterator it = definesNode->op_begin(); it != definesNode->op_end(); ++it) {
     llvm::StringRef strRef = llvm::dyn_cast<llvm::MDString>(*it)->getString();
     std::string str(strRef.begin(), strRef.size());
-    CA2W cv(str.c_str());
+    CA2W cv(str.c_str(), CP_UTF8);
     pBSTR.Append(cv);
     pBSTR.Append(L"\0", 1);
   }
@@ -621,7 +942,7 @@ STDMETHODIMP dxil_dia::hlsl_symbols::TypeSymbol::get_name(
     DXASSERT(!this->HasName(), "Setting type name multiple times.");
     std::string Name;
     IFR(m_lazySymbolName(m_pSession, &Name));
-    this->SetName(CA2W(Name.c_str()));
+    this->SetName(CA2W(Name.c_str(), CP_UTF8));
     m_lazySymbolName = nullptr;
   }
   return Symbol::get_name(pRetVal);
@@ -803,7 +1124,7 @@ HRESULT dxil_dia::hlsl_symbols::UDTFieldSymbol::GetChildren(std::vector<CComPtr<
 
 dxil_dia::hlsl_symbols::SymbolManagerInit::SymbolManagerInit(
     Session *pSession,
-    std::vector<SymbolManager::CreateSymbolFn> *pSymCtors,
+    std::vector<std::unique_ptr<SymbolManager::SymbolFactory>> *pSymCtors,
     SymbolManager::ScopeToIDMap *pScopeToSym,
     SymbolManager::IDToLiveRangeMap *pSymToLR)
   : m_Session(*pSession),
@@ -836,27 +1157,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::GetTypeInfo(llvm::DIType *T, 
     return E_FAIL;
   }
 
-  *TI = &tyInfoIt->second;
-  return S_OK;
-}
-
-HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::AddType(DWORD dwParentID, llvm::DIType *T, DWORD *pNewSymID, SymbolCtor symCtor) {
-  IFR(AddSymbol(dwParentID, pNewSymID, symCtor));
-  if (!m_TypeToInfo.insert(std::make_pair(T, TypeInfo(*pNewSymID))).second) {
-    return E_FAIL;
-  }
-  return S_OK;
-}
-
-HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::AddSymbol(DWORD dwParentID, DWORD *pNewSymID, SymbolCtor symCtor) {
-  if (dwParentID > m_SymCtors.size()) {
-    return E_FAIL;
-  }
-
-  const DWORD dwNewSymID = m_SymCtors.size() + 1;
-  m_SymCtors.emplace_back(std::bind(symCtor, std::placeholders::_1, dwNewSymID, std::placeholders::_2));
-  *pNewSymID = dwNewSymID;
-  IFR(AddParent(dwParentID));
+  *TI = tyInfoIt->second.get();
   return S_OK;
 }
 
@@ -884,6 +1185,8 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateFunctionBlockForLocalSc
     }
   } else if (auto *Block = llvm::dyn_cast<llvm::DILexicalBlock>(LS)) {
     ParentLS = Block->getScope();
+  } else if (auto *BlockFile = llvm::dyn_cast<llvm::DILexicalBlockFile>(LS)) {
+    ParentLS = BlockFile->getScope();
   }
 
   if (ParentLS == nullptr) {
@@ -893,12 +1196,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateFunctionBlockForLocalSc
   DWORD dwParentID;
   IFR(CreateFunctionBlockForLocalScope(ParentLS, &dwParentID));
 
-  IFR(AddSymbol(dwParentID, pNewSymID, [dwParentID](Session *pSession, DWORD ID, Symbol **ppSym) -> HRESULT {
-    IMalloc *pMalloc = pSession->GetMallocNoRef();
-    IFR(FunctionBlockSymbol::Create(pMalloc, pSession, ID, ppSym));
-    (*ppSym)->SetLexicalParent(dwParentID);
-    return S_OK;
-  }));
+  IFR(AddSymbol<symbol_factory::FunctionBlock>(dwParentID, pNewSymID));
   m_ScopeToSym.insert(std::make_pair(LS, *pNewSymID));
 
   return S_OK;
@@ -942,23 +1240,31 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateFunctionBlocksForFuncti
 }
 
 HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateFunctionsForCU(llvm::DICompileUnit *CU) {
+  bool FoundFunctions = false;
   for (llvm::DISubprogram *SubProgram : CU->getSubprograms()) {
     DWORD dwNewFunID;
     const DWORD dwParentID = SubProgram->isLocalToUnit() ? HlslCompilandId : HlslProgramId;
     DWORD dwSubprogramTypeID;
     IFR(CreateType(SubProgram->getType(), &dwSubprogramTypeID));
-    IFR(AddSymbol(dwParentID, &dwNewFunID, [SubProgram, dwParentID, dwSubprogramTypeID](Session *pSession, DWORD ID, Symbol **ppSym) -> HRESULT {
-      IMalloc *pMalloc = pSession->GetMallocNoRef();
-      IFR(FunctionSymbol::Create(pMalloc, pSession, ID, SubProgram, dwSubprogramTypeID, SubProgram->getType(), ppSym));
-      (*ppSym)->SetLexicalParent(dwParentID);
-      (*ppSym)->SetName(CA2W(SubProgram->getName().str().c_str()));
-      return S_OK;
-    }));
+    IFR(AddSymbol<symbol_factory::Function>(dwParentID, &dwNewFunID, SubProgram, dwSubprogramTypeID));
     m_ScopeToSym.insert(std::make_pair(SubProgram, dwNewFunID));
+  }
 
+  for (llvm::DISubprogram* SubProgram : CU->getSubprograms()) {
     if (llvm::Function *F = SubProgram->getFunction()) {
       IFR(CreateFunctionBlocksForFunction(F));
+      FoundFunctions = true;
     }
+  }
+
+  if (!FoundFunctions) {
+    // This works around an old bug in dxcompiler whose effects are still
+    // sometimes present in PIX users' traces. (The bug was that the subprogram(s)
+    // weren't pointing to their contained function.)
+    llvm::Module *M = &m_Session.ModuleRef();
+    auto &DM = M->GetDxilModule();
+    llvm::Function *EntryPoint = DM.GetEntryFunction();
+    IFR(CreateFunctionBlocksForFunction(EntryPoint));
   }
 
   return S_OK;
@@ -978,14 +1284,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateGlobalVariablesForCU(ll
     auto *GVType = dyn_cast_to_ditype<llvm::DIType>(GlobalVariable->getType());
     DWORD dwGVTypeID;
     IFR(CreateType(GVType, &dwGVTypeID));
-    IFR(AddSymbol(dwParentID, &dwUnusedNewGVID, [GlobalVariable, dwParentID, dwGVTypeID, GVType](Session *pSession, DWORD ID, Symbol **ppSym) -> HRESULT {
-      IMalloc *pMalloc = pSession->GetMallocNoRef();
-      IFR(GlobalVariableSymbol::Create(pMalloc, pSession, ID, GlobalVariable, dwGVTypeID, GVType, ppSym));
-      (*ppSym)->SetLexicalParent(dwParentID);
-      (*ppSym)->SetName(CA2W(GlobalVariable->getName().str().c_str()));
-      (*ppSym)->SetIsHLSLData(true);
-      return S_OK;
-    }));
+    IFR(AddSymbol<symbol_factory::GlobalVariable>(dwParentID, &dwUnusedNewGVID, GlobalVariable, dwGVTypeID, GVType));
   }
 
   return S_OK;
@@ -1020,7 +1319,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateType(llvm::DIType *Type
 
   auto lsIT = m_TypeToInfo.find(Type);
   if (lsIT != m_TypeToInfo.end()) {
-    *pNewTypeID = lsIT->second.GetTypeID();
+    *pNewTypeID = lsIT->second->GetTypeID();
     return S_OK;
   }
 
@@ -1090,7 +1389,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateSubroutineType(DWORD dw
           if (!name) {
             OS << "???";
           } else {
-            OS << CW2A((BSTR)name);
+            OS << CW2A((BSTR)name, CP_UTF8);
           }
         }
         if (first) {
@@ -1104,12 +1403,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateSubroutineType(DWORD dw
     };
   }
 
-  IFR(AddType(dwParentID, ST, pNewTypeID, [ST, dwParentID, LazyName](Session *pSession, DWORD ID, Symbol **ppSym) -> HRESULT {
-    IMalloc *pMalloc = pSession->GetMallocNoRef();
-    IFR(TypeSymbol::Create(pMalloc, pSession, dwParentID, ID, SymTagFunctionType, ST, LazyName, ppSym));
-    (*ppSym)->SetLexicalParent(dwParentID);
-    return S_OK;
-  }));
+  IFR(AddType<symbol_factory::Type>(dwParentID, ST, pNewTypeID, SymTagFunctionType, ST, LazyName));
 
   return S_OK;
 }
@@ -1125,12 +1419,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateBasicType(DWORD dwParen
     return S_OK;
   };
 
-  IFR(AddType(dwParentID, BT, pNewTypeID, [BT, dwParentID, LazyName](Session *pSession, DWORD ID, Symbol **ppSym) -> HRESULT {
-    IMalloc *pMalloc = pSession->GetMallocNoRef();
-    IFR(TypeSymbol::Create(pMalloc, pSession, dwParentID, ID, SymTagBaseType, BT, LazyName, ppSym));
-    (*ppSym)->SetLexicalParent(dwParentID);
-    return S_OK;
-  }));
+  IFR(AddType<symbol_factory::Type>(dwParentID, BT, pNewTypeID, SymTagBaseType, BT, LazyName));
 
   TypeInfo *TI;
   IFR(GetTypeInfo(BT, &TI));
@@ -1167,7 +1456,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateCompositeType(DWORD dwP
       if (!name) {
         OS << "???";
       } else {
-        OS << CW2A((BSTR)name);
+        OS << CW2A((BSTR)name, CP_UTF8);
       }
 
       OS << "[";
@@ -1189,13 +1478,24 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateCompositeType(DWORD dwP
       return S_OK;
     };
 
-    IFR(AddType(dwParentID, CT, pNewTypeID, [CT, dwParentID, LazyName](Session *pSession, DWORD ID, Symbol **ppSym) -> HRESULT {
-      IMalloc *pMalloc = pSession->GetMallocNoRef();
-      IFR(TypeSymbol::Create(pMalloc, pSession, dwParentID, ID, SymTagArrayType, CT, LazyName, ppSym));
-      (*ppSym)->SetLexicalParent(dwParentID);
-      return S_OK;
-    }));
-
+    IFR(AddType<symbol_factory::Type>(dwParentID, CT, pNewTypeID, SymTagArrayType, CT, LazyName));
+    TypeInfo *ctTI;
+    IFR(GetTypeInfo(CT, &ctTI));
+    TypeInfo *baseTI;
+    IFR(GetTypeInfo(BaseType, &baseTI));
+    int64_t embedCount = 1;
+    for (llvm::DINode *N : CT->getElements()) {
+      if (N != nullptr) {
+        if (auto *SubRange = llvm::dyn_cast<llvm::DISubrange>(N)) {
+          embedCount *= SubRange->getCount();
+        } else {
+          return E_FAIL;
+        }
+      }
+    }
+    for (int64_t i = 0; i < embedCount; ++i) {
+      ctTI->Embed(*baseTI);
+    }
     return S_OK;
   }
   case llvm::dwarf::DW_TAG_class_type: {
@@ -1213,12 +1513,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateCompositeType(DWORD dwP
     return S_OK;
   };
 
-  IFR(AddType(dwParentID, CT, pNewTypeID, [CT, dwParentID, LazyName](Session *pSession, DWORD ID, Symbol **ppSym) -> HRESULT {
-    IMalloc *pMalloc = pSession->GetMallocNoRef();
-    IFR(UDTSymbol::Create(pMalloc, pSession, dwParentID, ID, CT, LazyName, ppSym));
-    (*ppSym)->SetLexicalParent(dwParentID);
-    return S_OK;
-  }));
+  IFR(AddType<symbol_factory::UDT>(dwParentID, CT, pNewTypeID, CT, LazyName));
 
   TypeInfo *udtTI;
   IFR(GetTypeInfo(CT, &udtTI));
@@ -1318,13 +1613,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateHLSLVectorType(llvm::DI
   }
 
   const DWORD dwParentID = HlslProgramId;
-  IFR(AddType(dwParentID, T, pNewTypeID, [T, dwParentID, dwElemTyID, ElemCnt](Session *pSession, DWORD ID, Symbol **ppSym) -> HRESULT {
-    IMalloc *pMalloc = pSession->GetMallocNoRef();
-    IFR(VectorTypeSymbol::Create(pMalloc, pSession, dwParentID, ID, T, dwElemTyID, ElemCnt->getLimitedValue(), ppSym));
-    (*ppSym)->SetLexicalParent(dwParentID);
-    (*ppSym)->SetName(CA2W(T->getName().str().c_str()));
-    return S_OK;
-  }));
+  IFR(AddType<symbol_factory::VectorType>(dwParentID, T, pNewTypeID, T, dwElemTyID, ElemCnt->getLimitedValue()));
 
   TypeInfo *vecTI;
   IFR(GetTypeInfo(T, &vecTI));
@@ -1364,7 +1653,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::HandleDerivedType(DWORD dwPar
     if (!name) {
       OS << "???";
     } else {
-      OS << CW2A((BSTR)name);
+      OS << CW2A((BSTR)name, CP_UTF8);
     }
     OS << Qualifier;
     return S_OK;
@@ -1388,13 +1677,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::HandleDerivedType(DWORD dwPar
       return E_FAIL;
     }
 
-    IFR(AddType(dwParentID, DT, pNewTypeID, [dwParentID, DT, dwBaseTypeID](Session *pSession, DWORD ID, Symbol **ppSym) -> HRESULT {
-      IMalloc *pMalloc = pSession->GetMallocNoRef();
-      IFR(TypedefTypeSymbol::Create(pMalloc, pSession, dwParentID, ID, DT, dwBaseTypeID, ppSym));
-      (*ppSym)->SetLexicalParent(dwParentID);
-      (*ppSym)->SetName(CA2W(DT->getName().str().c_str()));
-      return S_OK;
-    }));
+    IFR(AddType<symbol_factory::TypedefType>(dwParentID, DT, pNewTypeID, DT, dwBaseTypeID));
 
     TypeInfo *dtTI;
     IFR(GetTypeInfo(DT, &dtTI));
@@ -1433,12 +1716,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::HandleDerivedType(DWORD dwPar
   }
   }
 
-  IFR(AddType(dwParentID, DT, pNewTypeID, [DT, dwParentID, st, LazyName](Session *pSession, DWORD ID, Symbol **ppSym) -> HRESULT {
-    IMalloc *pMalloc = pSession->GetMallocNoRef();
-    IFR(TypeSymbol::Create(pMalloc, pSession, dwParentID, ID, st, DT, LazyName, ppSym));
-    (*ppSym)->SetLexicalParent(dwParentID);
-    return S_OK;
-  }));
+  IFR(AddType<symbol_factory::Type>(dwParentID, DT, pNewTypeID, st, DT, LazyName));
 
   if (DT->getTag() == llvm::dwarf::DW_TAG_const_type) {
     TypeInfo *dtTI;
@@ -1474,16 +1752,9 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateLocalVariable(DWORD dwP
     IFR(GetTypeInfo(Ty, &TI));
     const DWORD dwTypeID = TI->GetTypeID();
     DWORD dwNewLVID;
-    newVars.emplace_back(std::make_shared<VarInfo>());
-    std::shared_ptr<VarInfo> VI = newVars.back();
-    IFR(AddSymbol(dwParentID, &dwNewLVID, [dwParentID, LV, dwTypeID, dwLVTypeID, LVTy, VI](Session *pSession, DWORD ID, Symbol **ppSym) -> HRESULT {
-      IMalloc *pMalloc = pSession->GetMallocNoRef();
-      IFR(LocalVariableSymbol::Create(pMalloc, pSession, ID, LV, dwLVTypeID, LVTy, VI->GetOffsetInUDT(), VI->GetDxilRegister(), ppSym));
-      (*ppSym)->SetLexicalParent(dwParentID);
-      (*ppSym)->SetName(CA2W(LV->getName().str().c_str()));
-      (*ppSym)->SetDataKind(LV->getTag() == llvm::dwarf::DW_TAG_arg_variable ? DataIsParam : DataIsLocal);
-      return S_OK;
-    }));
+    newVars.emplace_back(std::make_shared<symbol_factory::LocalVarInfo>());
+    std::shared_ptr<symbol_factory::LocalVarInfo> VI = newVars.back();
+    IFR(AddSymbol<symbol_factory::LocalVariable>(dwParentID, &dwNewLVID, LV, dwLVTypeID, LVTy, VI));
     VI->SetVarID(dwNewLVID);
     VI->SetOffsetInUDT(dwOffsetInUDT);
 
@@ -1530,14 +1801,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateUDTField(DWORD dwParent
   }
 
   DWORD dwNewLVID;
-  IFR(AddSymbol(dwParentID, &dwNewLVID, [dwParentID, Field, dwLVTypeID, FieldTy](Session *pSession, DWORD ID, Symbol **ppSym) -> HRESULT {
-    IMalloc *pMalloc = pSession->GetMallocNoRef();
-    IFR(UDTFieldSymbol::Create(pMalloc, pSession, ID, Field, dwLVTypeID, FieldTy, ppSym));
-    (*ppSym)->SetLexicalParent(dwParentID);
-    (*ppSym)->SetName(CA2W(Field->getName().str().c_str()));
-    (*ppSym)->SetDataKind(Field->isStaticMember() ? DataIsStaticLocal : DataIsMember);
-    return S_OK;
-  }));
+  IFR(AddSymbol<symbol_factory::UDTField>(dwParentID, &dwNewLVID, Field, dwLVTypeID, FieldTy));
   m_FieldToID.insert(std::make_pair(Field, dwNewLVID));
   return S_OK;
 }
@@ -1548,16 +1812,18 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateLocalVariables() {
   llvm::Function *DbgDeclare = llvm::Intrinsic::getDeclaration(M, llvm::Intrinsic::dbg_declare);
   for (llvm::Value *U : DbgDeclare->users()) {
     auto *CI = llvm::dyn_cast<llvm::CallInst>(U);
-    auto *LS = llvm::dyn_cast_or_null<llvm::DILocalScope>(CI->getDebugLoc()->getScope());
+    auto *LS = llvm::dyn_cast_or_null<llvm::DILocalScope>(CI->getDebugLoc()->getInlinedAtScope());
     auto SymIt = m_ScopeToSym.find(LS);
     if (SymIt == m_ScopeToSym.end()) {
-      continue;
+        continue;
     }
 
     auto *LocalNameMetadata = llvm::dyn_cast<llvm::MetadataAsValue>(CI->getArgOperand(1));
     if (auto *LV = llvm::dyn_cast<llvm::DILocalVariable>(LocalNameMetadata->getMetadata())) {
       const DWORD dwParentID = SymIt->second;
-      IFR(CreateLocalVariable(dwParentID, LV));
+      if (FAILED(CreateLocalVariable(dwParentID, LV))) {
+          continue;
+      }
     }
   }
 
@@ -1573,7 +1839,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateLiveRanges() {
   //     if scope not in end_of_scope:
   //       end_of_scope[scope] = rva(I)
   //     if I is dbg.declare:
-  //       live_range[symbol of I] = SymbolManager.LiveRange[RVA(I), end_of_scope[scope]]
+  //       live_range[symbol of I] = SymbolManager.LiveRange[FirstUseRVA, end_of_scope[scope]]
   llvm::Module *M = &m_Session.ModuleRef();
   m_SymToLR.clear();
   const auto &Instrs = m_Session.InstructionsRef();
@@ -1585,10 +1851,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateLiveRanges() {
     if (!DL) {
       continue;
     }
-    llvm::MDNode *LocalScope = DL.getInlinedAtScope();
-    if (LocalScope == nullptr) {
-      LocalScope = DL.getScope();
-    }
+    llvm::MDNode *LocalScope = DL.getScope();
     if (LocalScope == nullptr) {
       continue;
     }
@@ -1607,11 +1870,15 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateLiveRanges() {
     llvm::DILocalVariable *LV;
     uint64_t StartOffset;
     uint64_t EndOffset;
-    HRESULT hr;
-    IFR(hr = IsDbgDeclareCall(M, I, &Reg, &RegSize, &LV, &StartOffset, &EndOffset));
+    Session::RVA FirstUseRVA;
+    Session::RVA LastUseRVA;
+    HRESULT hr = IsDbgDeclareCall(M, I, &Reg, &RegSize, &LV, &StartOffset,
+                                  &EndOffset, &FirstUseRVA, &LastUseRVA);
     if (hr != S_OK) {
       continue;
     }
+
+    endOfScopeRVA = std::max<Session::RVA>(endOfScopeRVA, LastUseRVA);
 
     auto varIt = m_VarToID.find(LV);
     if (varIt == m_VarToID.end()) {
@@ -1633,16 +1900,19 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateLiveRanges() {
       }
       Var->SetDxilRegister(Reg + dwRegIndex);
       m_SymToLR[Var->GetVarID()] = SymbolManager::LiveRange{
-        static_cast<uint32_t>(RVA),
-        endOfScopeRVA - static_cast<uint32_t>(RVA)
+        static_cast<uint32_t>(FirstUseRVA),
+        endOfScopeRVA - static_cast<uint32_t>(FirstUseRVA)
       };
     }
-
   }
   return S_OK;
 }
 
-HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::IsDbgDeclareCall(llvm::Module *M, const llvm::Instruction *I, DWORD *pReg, DWORD *pRegSize, llvm::DILocalVariable **LV, uint64_t *pStartOffset, uint64_t *pEndOffset) {
+HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::IsDbgDeclareCall(
+    llvm::Module *M, const llvm::Instruction *I, DWORD *pReg, DWORD *pRegSize,
+    llvm::DILocalVariable **LV, uint64_t *pStartOffset, uint64_t *pEndOffset,
+    dxil_dia::Session::RVA *pLowestUserRVA,
+    dxil_dia::Session::RVA *pHighestUserRVA) {
   auto *CI = llvm::dyn_cast<llvm::CallInst>(I);
   if (CI == nullptr) {
     return S_FALSE;
@@ -1656,7 +1926,12 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::IsDbgDeclareCall(llvm::Module
   *LV = nullptr;
   *pReg = *pRegSize = 0;
   *pStartOffset = *pEndOffset = 0;
+  *pLowestUserRVA = 0;
+  *pHighestUserRVA = 0;
 
+  std::vector<dxil_dia::Session::RVA> usesRVAs;
+
+  bool HasRegister = false;
   if (auto *RegMV = llvm::dyn_cast<llvm::MetadataAsValue>(CI->getArgOperand(0))) {
     if (auto *RegVM = llvm::dyn_cast<llvm::ValueAsMetadata>(RegMV->getMetadata())) {
       if (auto *Reg = llvm::dyn_cast<llvm::Instruction>(RegVM->getValue())) {
@@ -1665,13 +1940,30 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::IsDbgDeclareCall(llvm::Module
         if (hr != S_OK) {
           return hr;
         }
+        HasRegister = true;
+        llvm::iterator_range<llvm::Value::user_iterator> users = Reg->users();
+        for (llvm::User *user : users) {
+          auto *inst = llvm::dyn_cast<llvm::Instruction>(user);
+          if (inst != nullptr) {
+            auto rva = m_Session.RvaMapRef().find(inst);
+            usesRVAs.push_back(rva->second);
+          }
+        }
       }
     }
+  }
+  if (!HasRegister) {
+    return E_FAIL;
+  }
+
+  if (!usesRVAs.empty()) {
+    *pLowestUserRVA = *std::min_element(usesRVAs.begin(), usesRVAs.end());
+    *pHighestUserRVA = *std::max_element(usesRVAs.begin(), usesRVAs.end());
   }
 
   if (auto *LVMV = llvm::dyn_cast<llvm::MetadataAsValue>(CI->getArgOperand(1))) {
     *LV = llvm::dyn_cast<llvm::DILocalVariable>(LVMV->getMetadata());
-    if (LV == nullptr) {
+    if (*LV == nullptr) {
       return E_FAIL;
     }
   }
@@ -1741,7 +2033,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::PopulateParentToChildrenIDMap
 #ifndef NDEBUG
     {
       CComPtr<Symbol> S;
-      IFT(m_SymCtors[i](&m_Session, &S));
+      IFT(m_SymCtors[i]->Create(&m_Session, &S));
       DXASSERT_ARGS(S->GetID() == i + 1,
                     "Invalid symbol index %d for %d",
                     S->GetID(),
@@ -1758,6 +2050,11 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::PopulateParentToChildrenIDMap
 
   return S_OK;
 }
+
+dxil_dia::SymbolManager::SymbolFactory::SymbolFactory(DWORD ID, DWORD ParentID)
+    : m_ID(ID), m_ParentID(ParentID) {}
+
+dxil_dia::SymbolManager::SymbolFactory::~SymbolFactory() = default;
 
 dxil_dia::SymbolManager::SymbolManager() = default;
 
@@ -1780,10 +2077,7 @@ void dxil_dia::SymbolManager::Init(Session *pSes) {
   hlsl_symbols::SymbolManagerInit SMI(pSes, &m_symbolCtors, &m_scopeToID, &m_symbolToLiveRange);
 
   DWORD dwHlslProgramID;
-  IFT(SMI.AddSymbol(kNullSymbolID, &dwHlslProgramID, [](Session *pSession, DWORD, Symbol **ppSym) -> HRESULT {
-    IMalloc *pMalloc = pSession->GetMallocNoRef();
-    return hlsl_symbols::GlobalScopeSymbol::Create(pMalloc, pSession, ppSym);
-  }));
+  IFT(SMI.AddSymbol<hlsl_symbols::symbol_factory::GlobalScope>(kNullSymbolID, &dwHlslProgramID));
   DXASSERT_ARGS(dwHlslProgramID == HlslProgramId,
                 "%d vs %d",
                 dwHlslProgramID,
@@ -1791,12 +2085,7 @@ void dxil_dia::SymbolManager::Init(Session *pSes) {
 
 
   DWORD dwHlslCompilandID;
-  IFT(SMI.AddSymbol(dwHlslProgramID, &dwHlslCompilandID, [dwHlslProgramID, ShaderCU](Session *pSession, DWORD, Symbol **ppSym) ->HRESULT {
-    IMalloc *pMalloc = pSession->GetMallocNoRef();
-    IFR(hlsl_symbols::CompilandSymbol::Create(pMalloc, pSession, ShaderCU, ppSym));
-    (*ppSym)->SetLexicalParent(dwHlslProgramID);
-    return S_OK;
-  }));
+  IFT(SMI.AddSymbol<hlsl_symbols::symbol_factory::Compiland>(dwHlslProgramID, &dwHlslCompilandID, ShaderCU));
   m_scopeToID.insert(std::make_pair(ShaderCU, dwHlslCompilandID));
   DXASSERT_ARGS(dwHlslCompilandID == HlslCompilandId,
                 "%d vs %d",
@@ -1805,12 +2094,7 @@ void dxil_dia::SymbolManager::Init(Session *pSes) {
 
 
   DWORD dwHlslCompilandDetailsId;
-  IFT(SMI.AddSymbol(dwHlslCompilandID, &dwHlslCompilandDetailsId, [dwHlslCompilandID](Session *pSession, DWORD, Symbol **ppSym) ->HRESULT {
-    IMalloc *pMalloc = pSession->GetMallocNoRef();
-    IFR(hlsl_symbols::CompilandDetailsSymbol::Create(pMalloc, pSession, ppSym));
-    (*ppSym)->SetLexicalParent(dwHlslCompilandID);
-    return S_OK;
-  }));
+  IFT(SMI.AddSymbol<hlsl_symbols::symbol_factory::CompilandDetails>(dwHlslCompilandID, &dwHlslCompilandDetailsId));
   DXASSERT_ARGS(dwHlslCompilandDetailsId == HlslCompilandDetailsId,
                 "%d vs %d",
                 dwHlslCompilandDetailsId,
@@ -1818,12 +2102,7 @@ void dxil_dia::SymbolManager::Init(Session *pSes) {
 
 
   DWORD dwHlslCompilandEnvFlagsID;
-  IFT(SMI.AddSymbol(dwHlslCompilandID, &dwHlslCompilandEnvFlagsID,[dwHlslCompilandID](Session *pSession, DWORD, Symbol **ppSym) ->HRESULT {
-    IMalloc *pMalloc = pSession->GetMallocNoRef();
-    IFR(hlsl_symbols::CompilandEnvSymbol::CreateFlags(pMalloc, pSession, ppSym));
-    (*ppSym)->SetLexicalParent(dwHlslCompilandID);
-    return S_OK;
-  }));
+  IFT(SMI.AddSymbol<hlsl_symbols::symbol_factory::CompilandEnv<hlsl_symbols::CompilandEnvSymbol::CreateFlags>>(dwHlslCompilandID, &dwHlslCompilandEnvFlagsID));
   DXASSERT_ARGS(dwHlslCompilandEnvFlagsID == HlslCompilandEnvFlagsId,
                 "%d vs %d",
                 dwHlslCompilandEnvFlagsID,
@@ -1831,12 +2110,7 @@ void dxil_dia::SymbolManager::Init(Session *pSes) {
 
 
   DWORD dwHlslCompilandEnvTargetID;
-  IFT(SMI.AddSymbol(dwHlslCompilandID, &dwHlslCompilandEnvTargetID, [dwHlslCompilandID](Session *pSession, DWORD, Symbol **ppSym) ->HRESULT {
-    IMalloc *pMalloc = pSession->GetMallocNoRef();
-    IFR(hlsl_symbols::CompilandEnvSymbol::CreateTarget(pMalloc, pSession, ppSym));
-    (*ppSym)->SetLexicalParent(dwHlslCompilandID);
-    return S_OK;
-  }));
+  IFT(SMI.AddSymbol<hlsl_symbols::symbol_factory::CompilandEnv<hlsl_symbols::CompilandEnvSymbol::CreateTarget>>(dwHlslCompilandID, &dwHlslCompilandEnvTargetID));
   DXASSERT_ARGS(dwHlslCompilandEnvTargetID == HlslCompilandEnvTargetId,
                 "%d vs %d",
                 dwHlslCompilandEnvTargetID,
@@ -1844,12 +2118,7 @@ void dxil_dia::SymbolManager::Init(Session *pSes) {
 
 
   DWORD dwHlslCompilandEnvEntryID;
-  IFT(SMI.AddSymbol(dwHlslCompilandID, &dwHlslCompilandEnvEntryID, [dwHlslCompilandID](Session *pSession, DWORD, Symbol **ppSym) ->HRESULT {
-    IMalloc *pMalloc = pSession->GetMallocNoRef();
-    IFR(hlsl_symbols::CompilandEnvSymbol::CreateEntry(pMalloc, pSession, ppSym));
-    (*ppSym)->SetLexicalParent(dwHlslCompilandID);
-    return S_OK;
-  }));
+  IFT(SMI.AddSymbol<hlsl_symbols::symbol_factory::CompilandEnv<hlsl_symbols::CompilandEnvSymbol::CreateEntry>>(dwHlslCompilandID, &dwHlslCompilandEnvEntryID));
   DXASSERT_ARGS(dwHlslCompilandEnvEntryID == HlslCompilandEnvEntryId,
                 "%d vs %d",
                 dwHlslCompilandEnvEntryID,
@@ -1857,12 +2126,7 @@ void dxil_dia::SymbolManager::Init(Session *pSes) {
 
 
   DWORD dwHlslCompilandEnvDefinesID;
-  IFT(SMI.AddSymbol(dwHlslCompilandID, &dwHlslCompilandEnvDefinesID, [dwHlslCompilandID](Session *pSession, DWORD, Symbol **ppSym) ->HRESULT {
-    IMalloc *pMalloc = pSession->GetMallocNoRef();
-    IFR(hlsl_symbols::CompilandEnvSymbol::CreateDefines(pMalloc, pSession, ppSym));
-    (*ppSym)->SetLexicalParent(dwHlslCompilandID);
-    return S_OK;
-  }));
+  IFT(SMI.AddSymbol<hlsl_symbols::symbol_factory::CompilandEnv<hlsl_symbols::CompilandEnvSymbol::CreateDefines>>(dwHlslCompilandID, &dwHlslCompilandEnvDefinesID));
   DXASSERT_ARGS(dwHlslCompilandEnvDefinesID == HlslCompilandEnvDefinesId,
                 "%d vs %d",
                 dwHlslCompilandEnvDefinesID,
@@ -1870,12 +2134,7 @@ void dxil_dia::SymbolManager::Init(Session *pSes) {
 
 
   DWORD dwHlslCompilandEnvArgumentsID;
-  IFT(SMI.AddSymbol(dwHlslCompilandID, &dwHlslCompilandEnvArgumentsID, [dwHlslCompilandID](Session *pSession, DWORD, Symbol **ppSym) ->HRESULT {
-    IMalloc *pMalloc = pSession->GetMallocNoRef();
-    IFT(hlsl_symbols::CompilandEnvSymbol::CreateArguments(pMalloc, pSession, ppSym));
-    (*ppSym)->SetLexicalParent(dwHlslCompilandID);
-    return S_OK;
-  }));
+  IFT(SMI.AddSymbol<hlsl_symbols::symbol_factory::CompilandEnv<hlsl_symbols::CompilandEnvSymbol::CreateArguments>>(dwHlslCompilandID, &dwHlslCompilandEnvArgumentsID));
   DXASSERT_ARGS(dwHlslCompilandEnvArgumentsID == HlslCompilandEnvArgumentsId,
                 "%d vs %d",
                 dwHlslCompilandEnvArgumentsID,
@@ -1907,7 +2166,7 @@ HRESULT dxil_dia::SymbolManager::GetSymbolByID(size_t id, Symbol **ppSym) const 
   }
 
   DxcThreadMalloc TM(m_pSession->GetMallocNoRef());
-  IFR(m_symbolCtors[id - 1](m_pSession, ppSym));
+  IFR(m_symbolCtors[id - 1]->Create(m_pSession, ppSym));
   return S_OK;
 }
 

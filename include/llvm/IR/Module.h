@@ -515,6 +515,7 @@ public:
   std::error_code materializeAllPermanently();
 
   std::error_code materializeMetadata();
+  std::error_code materializeSelectNamedMetadata(ArrayRef<StringRef> NamedMetadata); // HLSL Change
 
 /// @}
 /// @name Direct access to the globals list, functions list, and symbol table
@@ -698,7 +699,7 @@ public:
   }
   bool HasHLModule() const { return TheHLModule != nullptr; }
   void SetHLModule(hlsl::HLModule *pValue) { TheHLModule = pValue; }
-  hlsl::HLModule &GetHLModule() { return *TheHLModule; }
+  hlsl::HLModule &GetHLModule() const { return *TheHLModule; }
   hlsl::HLModule &GetOrCreateHLModule(bool skipInit = false);
   ResetModuleCallback pfnResetHLModule = nullptr;
   void ResetHLModule() { if (pfnResetHLModule) (*pfnResetHLModule)(this); }

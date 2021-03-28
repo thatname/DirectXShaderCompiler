@@ -143,6 +143,9 @@ std::pair<uint32_t, uint32_t> AlignmentSizeCalculator::getAlignmentAndSize(
     return result;
   }
 
+  if (isEnumType(type))
+    type = astContext.IntTy;
+
   { // Rule 1
     QualType ty = {};
     if (isScalarType(type, &ty))
@@ -241,13 +244,40 @@ std::pair<uint32_t, uint32_t> AlignmentSizeCalculator::getAlignmentAndSize(
 
   // Rule 9
   if (const auto *structType = type->getAs<RecordType>()) {
+    bool hasBaseStructs = type->getAsCXXRecordDecl() &&
+                          type->getAsCXXRecordDecl()->getNumBases() > 0;
+
     // Special case for handling empty structs, whose size is 0 and has no
     // requirement over alignment (thus 1).
-    if (structType->getDecl()->field_empty())
+    if (structType->getDecl()->field_empty() && !hasBaseStructs)
       return {1, 0};
 
     uint32_t maxAlignment = 0;
     uint32_t structSize = 0;
+
+    // If this struct is derived from some other structs, place an implicit
+    // field at the very beginning for the base struct.
+    if (const auto *cxxDecl = dyn_cast<CXXRecordDecl>(structType->getDecl())) {
+      for (const auto base : cxxDecl->bases()) {
+        uint32_t memberAlignment = 0, memberSize = 0;
+        std::tie(memberAlignment, memberSize) =
+            getAlignmentAndSize(base.getType(), rule, isRowMajor, stride);
+
+        if (rule == SpirvLayoutRule::RelaxedGLSLStd140 ||
+            rule == SpirvLayoutRule::RelaxedGLSLStd430 ||
+            rule == SpirvLayoutRule::FxcCTBuffer) {
+          alignUsingHLSLRelaxedLayout(base.getType(), memberSize,
+                                      memberAlignment, &structSize);
+        } else {
+          structSize = roundToPow2(structSize, memberAlignment);
+        }
+
+        // The base alignment of the structure is N, where N is the largest
+        // base alignment value of any of its members...
+        maxAlignment = std::max(maxAlignment, memberAlignment);
+        structSize += memberSize;
+      }
+    }
 
     for (const auto *field : structType->getDecl()->fields()) {
       uint32_t memberAlignment = 0, memberSize = 0;

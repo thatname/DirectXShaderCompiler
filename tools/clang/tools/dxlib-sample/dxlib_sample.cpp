@@ -42,10 +42,8 @@ void  __CRTDECL operator delete (void* ptr, const std::nothrow_t& nothrow_consta
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD Reason, LPVOID) {
   BOOL result = TRUE;
   if (Reason == DLL_PROCESS_ATTACH) {
-    DisableThreadLibraryCalls(hinstDLL);
-
     DxcInitThreadMalloc();
-    DxcSetThreadMallocOrDefault(nullptr);
+    DxcSetThreadMallocToDefault();
 
     if (hlsl::options::initHlslOptTable()) {
     DxcClearThreadMalloc();
@@ -55,7 +53,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD Reason, LPVOID) {
       return TRUE;
     }
   } else if (Reason == DLL_PROCESS_DETACH) {
-    DxcSetThreadMallocOrDefault(nullptr);
+    DxcSetThreadMallocToDefault();
     libshare::LibCacheManager::ReleaseLibCacheManager();
     ::hlsl::options::cleanupHlslOptTable();
     DxcClearThreadMalloc();

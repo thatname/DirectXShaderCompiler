@@ -12,6 +12,7 @@
 #include "dxc/DXIL/DxilOperations.h"
 #include "dxc/Support/Global.h"
 #include "dxc/DXIL/DxilModule.h"
+#include "dxc/DXIL/DxilInstructions.h"
 
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -169,17 +170,23 @@ const OP::OpCodeProperty OP::m_OpCodeProps[(unsigned)OP::OpCode::NumOpCodes] = {
   {  OC::RenderTargetGetSampleCount, "RenderTargetGetSampleCount", OCC::RenderTargetGetSampleCount, "renderTargetGetSampleCount", {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::ReadOnly, },
 
   // Synchronization                                                                                                         void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
-  {  OC::AtomicBinOp,             "AtomicBinOp",              OCC::AtomicBinOp,              "atomicBinOp",               { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::None,     },
-  {  OC::AtomicCompareExchange,   "AtomicCompareExchange",    OCC::AtomicCompareExchange,    "atomicCompareExchange",     { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::None,     },
+  {  OC::AtomicBinOp,             "AtomicBinOp",              OCC::AtomicBinOp,              "atomicBinOp",               { false, false, false, false, false, false, false,  true,  true, false, false}, Attribute::None,     },
+  {  OC::AtomicCompareExchange,   "AtomicCompareExchange",    OCC::AtomicCompareExchange,    "atomicCompareExchange",     { false, false, false, false, false, false, false,  true,  true, false, false}, Attribute::None,     },
   {  OC::Barrier,                 "Barrier",                  OCC::Barrier,                  "barrier",                   {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::NoDuplicate, },
 
-  // Pixel shader                                                                                                            void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
+  // Derivatives                                                                                                             void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
   {  OC::CalculateLOD,            "CalculateLOD",             OCC::CalculateLOD,             "calculateLOD",              { false, false,  true, false, false, false, false, false, false, false, false}, Attribute::ReadOnly, },
+
+  // Pixel shader                                                                                                            void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
   {  OC::Discard,                 "Discard",                  OCC::Discard,                  "discard",                   {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::None,     },
+
+  // Derivatives                                                                                                             void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
   {  OC::DerivCoarseX,            "DerivCoarseX",             OCC::Unary,                    "unary",                     { false,  true,  true, false, false, false, false, false, false, false, false}, Attribute::ReadNone, },
   {  OC::DerivCoarseY,            "DerivCoarseY",             OCC::Unary,                    "unary",                     { false,  true,  true, false, false, false, false, false, false, false, false}, Attribute::ReadNone, },
   {  OC::DerivFineX,              "DerivFineX",               OCC::Unary,                    "unary",                     { false,  true,  true, false, false, false, false, false, false, false, false}, Attribute::ReadNone, },
   {  OC::DerivFineY,              "DerivFineY",               OCC::Unary,                    "unary",                     { false,  true,  true, false, false, false, false, false, false, false, false}, Attribute::ReadNone, },
+
+  // Pixel shader                                                                                                            void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
   {  OC::EvalSnapped,             "EvalSnapped",              OCC::EvalSnapped,              "evalSnapped",               { false,  true,  true, false, false, false, false, false, false, false, false}, Attribute::ReadNone, },
   {  OC::EvalSampleIndex,         "EvalSampleIndex",          OCC::EvalSampleIndex,          "evalSampleIndex",           { false,  true,  true, false, false, false, false, false, false, false, false}, Attribute::ReadNone, },
   {  OC::EvalCentroid,            "EvalCentroid",             OCC::EvalCentroid,             "evalCentroid",              { false,  true,  true, false, false, false, false, false, false, false, false}, Attribute::ReadNone, },
@@ -187,7 +194,7 @@ const OP::OpCodeProperty OP::m_OpCodeProps[(unsigned)OP::OpCode::NumOpCodes] = {
   {  OC::Coverage,                "Coverage",                 OCC::Coverage,                 "coverage",                  { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadNone, },
   {  OC::InnerCoverage,           "InnerCoverage",            OCC::InnerCoverage,            "innerCoverage",             { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadNone, },
 
-  // Compute shader                                                                                                          void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
+  // Compute/Mesh/Amplification shader                                                                                       void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
   {  OC::ThreadId,                "ThreadId",                 OCC::ThreadId,                 "threadId",                  { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadNone, },
   {  OC::GroupId,                 "GroupId",                  OCC::GroupId,                  "groupId",                   { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadNone, },
   {  OC::ThreadIdInGroup,         "ThreadIdInGroup",          OCC::ThreadIdInGroup,          "threadIdInGroup",           { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadNone, },
@@ -229,10 +236,12 @@ const OP::OpCodeProperty OP::m_OpCodeProps[(unsigned)OP::OpCode::NumOpCodes] = {
   {  OC::WaveActiveAllEqual,      "WaveActiveAllEqual",       OCC::WaveActiveAllEqual,       "waveActiveAllEqual",        { false,  true,  true,  true,  true,  true,  true,  true,  true, false, false}, Attribute::None,     },
   {  OC::WaveActiveBallot,        "WaveActiveBallot",         OCC::WaveActiveBallot,         "waveActiveBallot",          {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::None,     },
   {  OC::WaveReadLaneAt,          "WaveReadLaneAt",           OCC::WaveReadLaneAt,           "waveReadLaneAt",            { false,  true,  true,  true,  true,  true,  true,  true,  true, false, false}, Attribute::None,     },
-  {  OC::WaveReadLaneFirst,       "WaveReadLaneFirst",        OCC::WaveReadLaneFirst,        "waveReadLaneFirst",         { false,  true,  true, false,  true,  true,  true,  true,  true, false, false}, Attribute::None,     },
+  {  OC::WaveReadLaneFirst,       "WaveReadLaneFirst",        OCC::WaveReadLaneFirst,        "waveReadLaneFirst",         { false,  true,  true,  true,  true,  true,  true,  true,  true, false, false}, Attribute::None,     },
   {  OC::WaveActiveOp,            "WaveActiveOp",             OCC::WaveActiveOp,             "waveActiveOp",              { false,  true,  true,  true,  true,  true,  true,  true,  true, false, false}, Attribute::None,     },
   {  OC::WaveActiveBit,           "WaveActiveBit",            OCC::WaveActiveBit,            "waveActiveBit",             { false, false, false, false, false,  true,  true,  true,  true, false, false}, Attribute::None,     },
   {  OC::WavePrefixOp,            "WavePrefixOp",             OCC::WavePrefixOp,             "wavePrefixOp",              { false,  true,  true,  true, false,  true,  true,  true,  true, false, false}, Attribute::None,     },
+
+  // Quad Wave Ops                                                                                                           void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
   {  OC::QuadReadLaneAt,          "QuadReadLaneAt",           OCC::QuadReadLaneAt,           "quadReadLaneAt",            { false,  true,  true,  true,  true,  true,  true,  true,  true, false, false}, Attribute::None,     },
   {  OC::QuadOp,                  "QuadOp",                   OCC::QuadOp,                   "quadOp",                    { false,  true,  true,  true, false,  true,  true,  true,  true, false, false}, Attribute::None,     },
 
@@ -258,7 +267,7 @@ const OP::OpCodeProperty OP::m_OpCodeProps[(unsigned)OP::OpCode::NumOpCodes] = {
   {  OC::WavePrefixBitCount,      "WavePrefixBitCount",       OCC::WavePrefixOp,             "wavePrefixOp",              {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::None,     },
 
   // Pixel shader                                                                                                            void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
-  {  OC::AttributeAtVertex,       "AttributeAtVertex",        OCC::AttributeAtVertex,        "attributeAtVertex",         { false,  true,  true, false, false, false, false, false, false, false, false}, Attribute::ReadNone, },
+  {  OC::AttributeAtVertex,       "AttributeAtVertex",        OCC::AttributeAtVertex,        "attributeAtVertex",         { false,  true,  true, false, false, false,  true,  true, false, false, false}, Attribute::ReadNone, },
 
   // Graphics shader                                                                                                         void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
   {  OC::ViewID,                  "ViewID",                   OCC::ViewID,                   "viewID",                    { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadNone, },
@@ -316,6 +325,89 @@ const OP::OpCodeProperty OP::m_OpCodeProps[(unsigned)OP::OpCode::NumOpCodes] = {
   {  OC::Dot2AddHalf,             "Dot2AddHalf",              OCC::Dot2AddHalf,              "dot2AddHalf",               { false, false,  true, false, false, false, false, false, false, false, false}, Attribute::ReadNone, },
   {  OC::Dot4AddI8Packed,         "Dot4AddI8Packed",          OCC::Dot4AddPacked,            "dot4AddPacked",             { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadNone, },
   {  OC::Dot4AddU8Packed,         "Dot4AddU8Packed",          OCC::Dot4AddPacked,            "dot4AddPacked",             { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadNone, },
+
+  // Wave                                                                                                                    void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
+  {  OC::WaveMatch,               "WaveMatch",                OCC::WaveMatch,                "waveMatch",                 { false,  true,  true,  true, false,  true,  true,  true,  true, false, false}, Attribute::None,     },
+  {  OC::WaveMultiPrefixOp,       "WaveMultiPrefixOp",        OCC::WaveMultiPrefixOp,        "waveMultiPrefixOp",         { false,  true,  true,  true, false,  true,  true,  true,  true, false, false}, Attribute::None,     },
+  {  OC::WaveMultiPrefixBitCount, "WaveMultiPrefixBitCount",  OCC::WaveMultiPrefixBitCount,  "waveMultiPrefixBitCount",   {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::None,     },
+
+  // Mesh shader instructions                                                                                                void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
+  {  OC::SetMeshOutputCounts,     "SetMeshOutputCounts",      OCC::SetMeshOutputCounts,      "setMeshOutputCounts",       {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::None,     },
+  {  OC::EmitIndices,             "EmitIndices",              OCC::EmitIndices,              "emitIndices",               {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::None,     },
+  {  OC::GetMeshPayload,          "GetMeshPayload",           OCC::GetMeshPayload,           "getMeshPayload",            { false, false, false, false, false, false, false, false, false,  true, false}, Attribute::ReadOnly, },
+  {  OC::StoreVertexOutput,       "StoreVertexOutput",        OCC::StoreVertexOutput,        "storeVertexOutput",         { false,  true,  true, false, false, false,  true,  true, false, false, false}, Attribute::None,     },
+  {  OC::StorePrimitiveOutput,    "StorePrimitiveOutput",     OCC::StorePrimitiveOutput,     "storePrimitiveOutput",      { false,  true,  true, false, false, false,  true,  true, false, false, false}, Attribute::None,     },
+
+  // Amplification shader instructions                                                                                       void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
+  {  OC::DispatchMesh,            "DispatchMesh",             OCC::DispatchMesh,             "dispatchMesh",              { false, false, false, false, false, false, false, false, false,  true, false}, Attribute::None,     },
+
+  // Sampler Feedback                                                                                                        void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
+  {  OC::WriteSamplerFeedback,    "WriteSamplerFeedback",     OCC::WriteSamplerFeedback,     "writeSamplerFeedback",      {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::None,     },
+  {  OC::WriteSamplerFeedbackBias, "WriteSamplerFeedbackBias", OCC::WriteSamplerFeedbackBias, "writeSamplerFeedbackBias",  {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::None,     },
+  {  OC::WriteSamplerFeedbackLevel, "WriteSamplerFeedbackLevel", OCC::WriteSamplerFeedbackLevel, "writeSamplerFeedbackLevel", {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::None,     },
+  {  OC::WriteSamplerFeedbackGrad, "WriteSamplerFeedbackGrad", OCC::WriteSamplerFeedbackGrad, "writeSamplerFeedbackGrad",  {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::None,     },
+
+  // Inline Ray Query                                                                                                        void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
+  {  OC::AllocateRayQuery,        "AllocateRayQuery",         OCC::AllocateRayQuery,         "allocateRayQuery",          {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::None,     },
+  {  OC::RayQuery_TraceRayInline, "RayQuery_TraceRayInline",  OCC::RayQuery_TraceRayInline,  "rayQuery_TraceRayInline",   {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::None,     },
+  {  OC::RayQuery_Proceed,        "RayQuery_Proceed",         OCC::RayQuery_Proceed,         "rayQuery_Proceed",          { false, false, false, false,  true, false, false, false, false, false, false}, Attribute::None,     },
+  {  OC::RayQuery_Abort,          "RayQuery_Abort",           OCC::RayQuery_Abort,           "rayQuery_Abort",            {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::None,     },
+  {  OC::RayQuery_CommitNonOpaqueTriangleHit, "RayQuery_CommitNonOpaqueTriangleHit", OCC::RayQuery_CommitNonOpaqueTriangleHit, "rayQuery_CommitNonOpaqueTriangleHit", {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::None,     },
+  {  OC::RayQuery_CommitProceduralPrimitiveHit, "RayQuery_CommitProceduralPrimitiveHit", OCC::RayQuery_CommitProceduralPrimitiveHit, "rayQuery_CommitProceduralPrimitiveHit", {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::None,     },
+  {  OC::RayQuery_CommittedStatus, "RayQuery_CommittedStatus", OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CandidateType,  "RayQuery_CandidateType",   OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CandidateObjectToWorld3x4, "RayQuery_CandidateObjectToWorld3x4", OCC::RayQuery_StateMatrix,     "rayQuery_StateMatrix",      { false, false,  true, false, false, false, false, false, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CandidateWorldToObject3x4, "RayQuery_CandidateWorldToObject3x4", OCC::RayQuery_StateMatrix,     "rayQuery_StateMatrix",      { false, false,  true, false, false, false, false, false, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CommittedObjectToWorld3x4, "RayQuery_CommittedObjectToWorld3x4", OCC::RayQuery_StateMatrix,     "rayQuery_StateMatrix",      { false, false,  true, false, false, false, false, false, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CommittedWorldToObject3x4, "RayQuery_CommittedWorldToObject3x4", OCC::RayQuery_StateMatrix,     "rayQuery_StateMatrix",      { false, false,  true, false, false, false, false, false, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CandidateProceduralPrimitiveNonOpaque, "RayQuery_CandidateProceduralPrimitiveNonOpaque", OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false, false, false,  true, false, false, false, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CandidateTriangleFrontFace, "RayQuery_CandidateTriangleFrontFace", OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false, false, false,  true, false, false, false, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CommittedTriangleFrontFace, "RayQuery_CommittedTriangleFrontFace", OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false, false, false,  true, false, false, false, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CandidateTriangleBarycentrics, "RayQuery_CandidateTriangleBarycentrics", OCC::RayQuery_StateVector,     "rayQuery_StateVector",      { false, false,  true, false, false, false, false, false, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CommittedTriangleBarycentrics, "RayQuery_CommittedTriangleBarycentrics", OCC::RayQuery_StateVector,     "rayQuery_StateVector",      { false, false,  true, false, false, false, false, false, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_RayFlags,       "RayQuery_RayFlags",        OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_WorldRayOrigin, "RayQuery_WorldRayOrigin",  OCC::RayQuery_StateVector,     "rayQuery_StateVector",      { false, false,  true, false, false, false, false, false, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_WorldRayDirection, "RayQuery_WorldRayDirection", OCC::RayQuery_StateVector,     "rayQuery_StateVector",      { false, false,  true, false, false, false, false, false, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_RayTMin,        "RayQuery_RayTMin",         OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false,  true, false, false, false, false, false, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CandidateTriangleRayT, "RayQuery_CandidateTriangleRayT", OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false,  true, false, false, false, false, false, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CommittedRayT,  "RayQuery_CommittedRayT",   OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false,  true, false, false, false, false, false, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CandidateInstanceIndex, "RayQuery_CandidateInstanceIndex", OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CandidateInstanceID, "RayQuery_CandidateInstanceID", OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CandidateGeometryIndex, "RayQuery_CandidateGeometryIndex", OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CandidatePrimitiveIndex, "RayQuery_CandidatePrimitiveIndex", OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CandidateObjectRayOrigin, "RayQuery_CandidateObjectRayOrigin", OCC::RayQuery_StateVector,     "rayQuery_StateVector",      { false, false,  true, false, false, false, false, false, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CandidateObjectRayDirection, "RayQuery_CandidateObjectRayDirection", OCC::RayQuery_StateVector,     "rayQuery_StateVector",      { false, false,  true, false, false, false, false, false, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CommittedInstanceIndex, "RayQuery_CommittedInstanceIndex", OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CommittedInstanceID, "RayQuery_CommittedInstanceID", OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CommittedGeometryIndex, "RayQuery_CommittedGeometryIndex", OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CommittedPrimitiveIndex, "RayQuery_CommittedPrimitiveIndex", OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CommittedObjectRayOrigin, "RayQuery_CommittedObjectRayOrigin", OCC::RayQuery_StateVector,     "rayQuery_StateVector",      { false, false,  true, false, false, false, false, false, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CommittedObjectRayDirection, "RayQuery_CommittedObjectRayDirection", OCC::RayQuery_StateVector,     "rayQuery_StateVector",      { false, false,  true, false, false, false, false, false, false, false, false}, Attribute::ReadOnly, },
+
+  // Raytracing object space uint System Values, raytracing tier 1.1                                                         void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
+  {  OC::GeometryIndex,           "GeometryIndex",            OCC::GeometryIndex,            "geometryIndex",             { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadNone, },
+
+  // Inline Ray Query                                                                                                        void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
+  {  OC::RayQuery_CandidateInstanceContributionToHitGroupIndex, "RayQuery_CandidateInstanceContributionToHitGroupIndex", OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadOnly, },
+  {  OC::RayQuery_CommittedInstanceContributionToHitGroupIndex, "RayQuery_CommittedInstanceContributionToHitGroupIndex", OCC::RayQuery_StateScalar,     "rayQuery_StateScalar",      { false, false, false, false, false, false, false,  true, false, false, false}, Attribute::ReadOnly, },
+
+  // Get handle from heap                                                                                                    void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
+  {  OC::AnnotateHandle,          "AnnotateHandle",           OCC::AnnotateHandle,           "annotateHandle",            {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::ReadNone, },
+  {  OC::CreateHandleFromBinding, "CreateHandleFromBinding",  OCC::CreateHandleFromBinding,  "createHandleFromBinding",   {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::ReadNone, },
+  {  OC::CreateHandleFromHeap,    "CreateHandleFromHeap",     OCC::CreateHandleFromHeap,     "createHandleFromHeap",      {  true, false, false, false, false, false, false, false, false, false, false}, Attribute::ReadNone, },
+
+  // Unpacking intrinsics                                                                                                    void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
+  {  OC::Unpack4x8,               "Unpack4x8",                OCC::Unpack4x8,                "unpack4x8",                 { false, false, false, false, false, false,  true,  true, false, false, false}, Attribute::ReadNone, },
+
+  // Packing intrinsics                                                                                                      void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
+  {  OC::Pack4x8,                 "Pack4x8",                  OCC::Pack4x8,                  "pack4x8",                   { false, false, false, false, false, false,  true,  true, false, false, false}, Attribute::ReadNone, },
+
+  // Helper Lanes                                                                                                            void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
+  {  OC::IsHelperLane,            "IsHelperLane",             OCC::IsHelperLane,             "isHelperLane",              { false, false, false, false,  true, false, false, false, false, false, false}, Attribute::ReadOnly, },
+
+  // Resources - gather                                                                                                      void,     h,     f,     d,    i1,    i8,   i16,   i32,   i64,   udt,   obj ,  function attribute
+  {  OC::TextureGatherImm,        "TextureGatherImm",         OCC::TextureGatherImm,         "textureGatherImm",          { false,  true,  true, false, false, false,  true,  true, false, false, false}, Attribute::ReadOnly, },
+  {  OC::TextureGatherCmpImm,     "TextureGatherCmpImm",      OCC::TextureGatherCmpImm,      "textureGatherCmpImm",       { false,  true,  true, false, false, false,  true,  true, false, false, false}, Attribute::ReadOnly, },
 };
 // OPCODE-OLOADS:END
 
@@ -392,6 +484,17 @@ llvm::StringRef OP::GetTypeName(Type *Ty, std::string &str) {
   }
 }
 
+llvm::StringRef OP::ConstructOverloadName(Type *Ty, DXIL::OpCode opCode,
+                                          std::string &funcNameStorage) {
+  if (Ty == Type::getVoidTy(Ty->getContext())) {
+    funcNameStorage = (Twine(OP::m_NamePrefix) + Twine(GetOpCodeClassName(opCode))).str();
+  } else {
+    funcNameStorage = (Twine(OP::m_NamePrefix) + Twine(GetOpCodeClassName(opCode)) +
+                       "." + GetTypeName(Ty, funcNameStorage)).str();
+  }
+  return funcNameStorage;
+}
+
 const char *OP::GetOpCodeName(OpCode opCode) {
   DXASSERT(0 <= (unsigned)opCode && opCode < OpCode::NumOpCodes, "otherwise caller passed OOB index");
   return m_OpCodeProps[(unsigned)opCode].pOpCodeName;
@@ -411,6 +514,11 @@ OP::OpCodeClass OP::GetOpCodeClass(OpCode opCode) {
 const char *OP::GetOpCodeClassName(OpCode opCode) {
   DXASSERT(0 <= (unsigned)opCode && opCode < OpCode::NumOpCodes, "otherwise caller passed OOB index");
   return m_OpCodeProps[(unsigned)opCode].pOpCodeClassName;
+}
+
+llvm::Attribute::AttrKind OP::GetMemAccessAttr(OpCode opCode) {
+  DXASSERT(0 <= (unsigned)opCode && opCode < OpCode::NumOpCodes, "otherwise caller passed OOB index");
+  return m_OpCodeProps[(unsigned)opCode].FuncAttr;
 }
 
 bool OP::IsOverloadLegal(OpCode opCode, Type *pType) {
@@ -433,7 +541,8 @@ bool OP::IsDxilOpFuncName(StringRef name) {
 }
 
 bool OP::IsDxilOpFunc(const llvm::Function *F) {
-  if (!F->hasName())
+  // Test for null to allow IsDxilOpFunc(Call.getCalledFunc()) to be resilient to indirect calls
+  if (F == nullptr || !F->hasName())
     return false;
   return IsDxilOpFuncName(F->getName());
 }
@@ -498,8 +607,9 @@ bool OP::IsDxilOpWave(OpCode C) {
   // WaveActiveAllEqual=115, WaveActiveBallot=116, WaveReadLaneAt=117,
   // WaveReadLaneFirst=118, WaveActiveOp=119, WaveActiveBit=120,
   // WavePrefixOp=121, QuadReadLaneAt=122, QuadOp=123, WaveAllBitCount=135,
-  // WavePrefixBitCount=136
-  return (110 <= op && op <= 123) || (135 <= op && op <= 136);
+  // WavePrefixBitCount=136, WaveMatch=165, WaveMultiPrefixOp=166,
+  // WaveMultiPrefixBitCount=167
+  return (110 <= op && op <= 123) || (135 <= op && op <= 136) || (165 <= op && op <= 167);
   // OPCODE-WAVE:END
 }
 
@@ -507,13 +617,24 @@ bool OP::IsDxilOpGradient(OpCode C) {
   unsigned op = (unsigned)C;
   /* <py::lines('OPCODE-GRADIENT')>hctdb_instrhelp.get_instrs_pred("op", "is_gradient")</py>*/
   // OPCODE-GRADIENT:BEGIN
-  // Instructions: Sample=60, SampleBias=61, SampleCmp=64, TextureGather=73,
-  // TextureGatherCmp=74, CalculateLOD=81, DerivCoarseX=83, DerivCoarseY=84,
-  // DerivFineX=85, DerivFineY=86
-  return (60 <= op && op <= 61) || op == 64 || (73 <= op && op <= 74) || op == 81 || (83 <= op && op <= 86);
+  // Instructions: Sample=60, SampleBias=61, SampleCmp=64, CalculateLOD=81,
+  // DerivCoarseX=83, DerivCoarseY=84, DerivFineX=85, DerivFineY=86,
+  // WriteSamplerFeedback=174, WriteSamplerFeedbackBias=175
+  return (60 <= op && op <= 61) || op == 64 || op == 81 || (83 <= op && op <= 86) || (174 <= op && op <= 175);
   // OPCODE-GRADIENT:END
 }
 
+bool OP::IsDxilOpFeedback(OpCode C) {
+  unsigned op = (unsigned)C;
+  /* <py::lines('OPCODE-FEEDBACK')>hctdb_instrhelp.get_instrs_pred("op", "is_feedback")</py>*/
+  // OPCODE-FEEDBACK:BEGIN
+  // Instructions: WriteSamplerFeedback=174, WriteSamplerFeedbackBias=175,
+  // WriteSamplerFeedbackLevel=176, WriteSamplerFeedbackGrad=177
+  return (174 <= op && op <= 177);
+  // OPCODE-FEEDBACK:END
+}
+
+#define SFLAG(stage) ((unsigned)1 << (unsigned)DXIL::ShaderKind::stage)
 void OP::GetMinShaderModelAndMask(OpCode C, bool bWithTranslation,
                                   unsigned &major, unsigned &minor,
                                   unsigned &mask) {
@@ -521,13 +642,12 @@ void OP::GetMinShaderModelAndMask(OpCode C, bool bWithTranslation,
   // Default is 6.0, all stages
   major = 6;  minor = 0;
   mask = ((unsigned)1 << (unsigned)DXIL::ShaderKind::Invalid) - 1;
-#define SFLAG(stage) ((unsigned)1 << (unsigned)DXIL::ShaderKind::stage)
   /* <py::lines('OPCODE-SMMASK')>hctdb_instrhelp.get_min_sm_and_mask_text()</py>*/
   // OPCODE-SMMASK:BEGIN
   // Instructions: ThreadId=93, GroupId=94, ThreadIdInGroup=95,
   // FlattenedThreadIdInGroup=96
   if ((93 <= op && op <= 96)) {
-    mask = SFLAG(Compute);
+    mask = SFLAG(Compute) | SFLAG(Mesh) | SFLAG(Amplification);
     return;
   }
   // Instructions: DomainLocation=105
@@ -556,10 +676,24 @@ void OP::GetMinShaderModelAndMask(OpCode C, bool bWithTranslation,
     mask = SFLAG(Hull);
     return;
   }
+  // Instructions: QuadReadLaneAt=122, QuadOp=123
+  if ((122 <= op && op <= 123)) {
+    mask = SFLAG(Library) | SFLAG(Compute) | SFLAG(Amplification) | SFLAG(Mesh) | SFLAG(Pixel);
+    return;
+  }
+  // Instructions: WaveIsFirstLane=110, WaveGetLaneIndex=111,
+  // WaveGetLaneCount=112, WaveAnyTrue=113, WaveAllTrue=114,
+  // WaveActiveAllEqual=115, WaveActiveBallot=116, WaveReadLaneAt=117,
+  // WaveReadLaneFirst=118, WaveActiveOp=119, WaveActiveBit=120,
+  // WavePrefixOp=121, WaveAllBitCount=135, WavePrefixBitCount=136
+  if ((110 <= op && op <= 121) || (135 <= op && op <= 136)) {
+    mask = SFLAG(Library) | SFLAG(Compute) | SFLAG(Amplification) | SFLAG(Mesh) | SFLAG(Pixel) | SFLAG(Vertex) | SFLAG(Hull) | SFLAG(Domain) | SFLAG(Geometry) | SFLAG(RayGeneration) | SFLAG(Intersection) | SFLAG(AnyHit) | SFLAG(ClosestHit) | SFLAG(Miss) | SFLAG(Callable);
+    return;
+  }
   // Instructions: Sample=60, SampleBias=61, SampleCmp=64, CalculateLOD=81,
   // DerivCoarseX=83, DerivCoarseY=84, DerivFineX=85, DerivFineY=86
   if ((60 <= op && op <= 61) || op == 64 || op == 81 || (83 <= op && op <= 86)) {
-    mask = SFLAG(Library) | SFLAG(Pixel);
+    mask = SFLAG(Library) | SFLAG(Pixel) | SFLAG(Compute) | SFLAG(Amplification) | SFLAG(Mesh);
     return;
   }
   // Instructions: RenderTargetGetSamplePosition=76,
@@ -579,7 +713,7 @@ void OP::GetMinShaderModelAndMask(OpCode C, bool bWithTranslation,
   // Instructions: ViewID=138
   if (op == 138) {
     major = 6;  minor = 1;
-    mask = SFLAG(Vertex) | SFLAG(Hull) | SFLAG(Domain) | SFLAG(Geometry) | SFLAG(Pixel);
+    mask = SFLAG(Vertex) | SFLAG(Hull) | SFLAG(Domain) | SFLAG(Geometry) | SFLAG(Pixel) | SFLAG(Mesh);
     return;
   }
   // Instructions: RawBufferLoad=139, RawBufferStore=140
@@ -650,9 +784,138 @@ void OP::GetMinShaderModelAndMask(OpCode C, bool bWithTranslation,
     major = 6;  minor = 4;
     return;
   }
+  // Instructions: WriteSamplerFeedbackLevel=176, WriteSamplerFeedbackGrad=177,
+  // AllocateRayQuery=178, RayQuery_TraceRayInline=179, RayQuery_Proceed=180,
+  // RayQuery_Abort=181, RayQuery_CommitNonOpaqueTriangleHit=182,
+  // RayQuery_CommitProceduralPrimitiveHit=183, RayQuery_CommittedStatus=184,
+  // RayQuery_CandidateType=185, RayQuery_CandidateObjectToWorld3x4=186,
+  // RayQuery_CandidateWorldToObject3x4=187,
+  // RayQuery_CommittedObjectToWorld3x4=188,
+  // RayQuery_CommittedWorldToObject3x4=189,
+  // RayQuery_CandidateProceduralPrimitiveNonOpaque=190,
+  // RayQuery_CandidateTriangleFrontFace=191,
+  // RayQuery_CommittedTriangleFrontFace=192,
+  // RayQuery_CandidateTriangleBarycentrics=193,
+  // RayQuery_CommittedTriangleBarycentrics=194, RayQuery_RayFlags=195,
+  // RayQuery_WorldRayOrigin=196, RayQuery_WorldRayDirection=197,
+  // RayQuery_RayTMin=198, RayQuery_CandidateTriangleRayT=199,
+  // RayQuery_CommittedRayT=200, RayQuery_CandidateInstanceIndex=201,
+  // RayQuery_CandidateInstanceID=202, RayQuery_CandidateGeometryIndex=203,
+  // RayQuery_CandidatePrimitiveIndex=204, RayQuery_CandidateObjectRayOrigin=205,
+  // RayQuery_CandidateObjectRayDirection=206,
+  // RayQuery_CommittedInstanceIndex=207, RayQuery_CommittedInstanceID=208,
+  // RayQuery_CommittedGeometryIndex=209, RayQuery_CommittedPrimitiveIndex=210,
+  // RayQuery_CommittedObjectRayOrigin=211,
+  // RayQuery_CommittedObjectRayDirection=212,
+  // RayQuery_CandidateInstanceContributionToHitGroupIndex=214,
+  // RayQuery_CommittedInstanceContributionToHitGroupIndex=215
+  if ((176 <= op && op <= 212) || (214 <= op && op <= 215)) {
+    major = 6;  minor = 5;
+    return;
+  }
+  // Instructions: DispatchMesh=173
+  if (op == 173) {
+    major = 6;  minor = 5;
+    mask = SFLAG(Amplification);
+    return;
+  }
+  // Instructions: WaveMatch=165, WaveMultiPrefixOp=166,
+  // WaveMultiPrefixBitCount=167
+  if ((165 <= op && op <= 167)) {
+    major = 6;  minor = 5;
+    mask = SFLAG(Library) | SFLAG(Compute) | SFLAG(Amplification) | SFLAG(Mesh) | SFLAG(Pixel) | SFLAG(Vertex) | SFLAG(Hull) | SFLAG(Domain) | SFLAG(Geometry) | SFLAG(RayGeneration) | SFLAG(Intersection) | SFLAG(AnyHit) | SFLAG(ClosestHit) | SFLAG(Miss) | SFLAG(Callable);
+    return;
+  }
+  // Instructions: GeometryIndex=213
+  if (op == 213) {
+    major = 6;  minor = 5;
+    mask = SFLAG(Library) | SFLAG(Intersection) | SFLAG(AnyHit) | SFLAG(ClosestHit);
+    return;
+  }
+  // Instructions: WriteSamplerFeedback=174, WriteSamplerFeedbackBias=175
+  if ((174 <= op && op <= 175)) {
+    major = 6;  minor = 5;
+    mask = SFLAG(Library) | SFLAG(Pixel);
+    return;
+  }
+  // Instructions: SetMeshOutputCounts=168, EmitIndices=169, GetMeshPayload=170,
+  // StoreVertexOutput=171, StorePrimitiveOutput=172
+  if ((168 <= op && op <= 172)) {
+    major = 6;  minor = 5;
+    mask = SFLAG(Mesh);
+    return;
+  }
+  // Instructions: AnnotateHandle=216, CreateHandleFromBinding=217,
+  // CreateHandleFromHeap=218, Unpack4x8=219, Pack4x8=220, IsHelperLane=221
+  if ((216 <= op && op <= 221)) {
+    major = 6;  minor = 6;
+    return;
+  }
+  // Instructions: TextureGatherImm=222, TextureGatherCmpImm=223
+  if ((222 <= op && op <= 223)) {
+    major = 6;  minor = 15;
+    return;
+  }
   // OPCODE-SMMASK:END
-#undef SFLAG
 }
+
+void OP::GetMinShaderModelAndMask(const llvm::CallInst *CI, bool bWithTranslation,
+                                  unsigned valMajor, unsigned valMinor,
+                                  unsigned &major, unsigned &minor,
+                                  unsigned &mask) {
+  OpCode opcode = OP::GetDxilOpFuncCallInst(CI);
+  GetMinShaderModelAndMask(opcode, bWithTranslation, major, minor, mask);
+
+  unsigned op = (unsigned)opcode;
+  // These ops cannot indicate support for CS, AS, or MS,
+  // otherwise, it's saying these are guaranteed to be supported
+  // on the lowest shader model returned by this function
+  // for these shader stages.  For CS, SM 6.6 is required,
+  // and for AS/MS, an optional feature is required.
+  // This also breaks compatibility for existing validators.
+  // We need a different mechanism to be supported in functions
+  // for runtime linking.
+  // Instructions: Sample=60, SampleBias=61, SampleCmp=64, CalculateLOD=81,
+  // DerivCoarseX=83, DerivCoarseY=84, DerivFineX=85, DerivFineY=86
+  if ((60 <= op && op <= 61) || op == 64 || op == 81 || (83 <= op && op <= 86)) {
+    mask &= ~(SFLAG(Compute) | SFLAG(Amplification) | SFLAG(Mesh));
+    return;
+  }
+
+  if (DXIL::CompareVersions(valMajor, valMinor, 1, 5) < 0) {
+    // validator 1.4 didn't exclude wave ops in mask
+    if (IsDxilOpWave(opcode))
+      mask = ((unsigned)1 << (unsigned)DXIL::ShaderKind::Invalid) - 1;
+    // These shader models don't exist before 1.5
+    mask &= ~(SFLAG(Amplification) | SFLAG(Mesh));
+    // validator 1.4 didn't have any additional rules applied:
+    return;
+  }
+
+  // Additional rules are applied manually here.
+
+  // Barrier with mode != UAVFenceGlobal requires compute, amplification, or mesh
+  // Instructions: Barrier=80
+  if (opcode == DXIL::OpCode::Barrier) {
+    DxilInst_Barrier barrier(const_cast<CallInst*>(CI));
+    unsigned mode = barrier.get_barrierMode_val();
+    if (mode != (unsigned)DXIL::BarrierMode::UAVFenceGlobal) {
+      mask = SFLAG(Library) | SFLAG(Compute) | SFLAG(Amplification) | SFLAG(Mesh);
+    }
+    return;
+  }
+
+  // 64-bit integer atomic ops require 6.6
+  else if (opcode == DXIL::OpCode::AtomicBinOp || opcode == DXIL::OpCode::AtomicCompareExchange) {
+    Type *pOverloadType = GetOverloadType(opcode, CI->getCalledFunction());
+    if (pOverloadType->isIntegerTy(64)) {
+      major = 6;
+      minor = 6;
+    }
+  }
+}
+#undef SFLAG
+
 
 static Type *GetOrCreateStructType(LLVMContext &Ctx, ArrayRef<Type*> types, StringRef Name, Module *pModule) {
   if (StructType *ST = pModule->getTypeByName(Name)) {
@@ -676,7 +939,17 @@ OP::OP(LLVMContext &Ctx, Module *pModule)
   memset(m_OpCodeClassCache, 0, sizeof(m_OpCodeClassCache));
   static_assert(_countof(OP::m_OpCodeProps) == (size_t)OP::OpCode::NumOpCodes, "forgot to update OP::m_OpCodeProps");
 
-  m_pHandleType = GetOrCreateStructType(m_Ctx, Type::getInt8PtrTy(m_Ctx), "dx.types.Handle", pModule);
+  m_pHandleType = GetOrCreateStructType(m_Ctx, Type::getInt8PtrTy(m_Ctx),
+                                        "dx.types.Handle", pModule);
+  m_pResourcePropertiesType = GetOrCreateStructType(
+      m_Ctx, {Type::getInt32Ty(m_Ctx), Type::getInt32Ty(m_Ctx)},
+      "dx.types.ResourceProperties", pModule);
+
+  m_pResourceBindingType =
+      GetOrCreateStructType(m_Ctx,
+                            {Type::getInt32Ty(m_Ctx), Type::getInt32Ty(m_Ctx),
+                             Type::getInt32Ty(m_Ctx), Type::getInt8Ty(m_Ctx)},
+                            "dx.types.ResBind", pModule);
 
   Type *DimsType[4] = { Type::getInt32Ty(m_Ctx), Type::getInt32Ty(m_Ctx), Type::getInt32Ty(m_Ctx), Type::getInt32Ty(m_Ctx) };
   m_pDimensionsType = GetOrCreateStructType(m_Ctx, DimsType, "dx.types.Dimensions", pModule);
@@ -693,8 +966,20 @@ OP::OP(LLVMContext &Ctx, Module *pModule)
   Type *SplitDoubleTypes[2] = { Type::getInt32Ty(m_Ctx), Type::getInt32Ty(m_Ctx) }; // Lo, Hi.
   m_pSplitDoubleType = GetOrCreateStructType(m_Ctx, SplitDoubleTypes, "dx.types.splitdouble", pModule);
 
-  Type *Int4Types[4] = { Type::getInt32Ty(m_Ctx), Type::getInt32Ty(m_Ctx), Type::getInt32Ty(m_Ctx), Type::getInt32Ty(m_Ctx) }; // HiHi, HiLo, LoHi, LoLo
-  m_pInt4Type = GetOrCreateStructType(m_Ctx, Int4Types, "dx.types.fouri32", pModule);
+  Type *FourI32Types[4] = { Type::getInt32Ty(m_Ctx), Type::getInt32Ty(m_Ctx), Type::getInt32Ty(m_Ctx), Type::getInt32Ty(m_Ctx) }; // HiHi, HiLo, LoHi, LoLo
+  m_pFourI32Type = GetOrCreateStructType(m_Ctx, FourI32Types, "dx.types.fouri32", pModule);
+
+  Type *FourI16Types[4] = { Type::getInt16Ty(m_Ctx), Type::getInt16Ty(m_Ctx), Type::getInt16Ty(m_Ctx), Type::getInt16Ty(m_Ctx) }; // HiHi, HiLo, LoHi, LoLo
+  m_pFourI16Type = GetOrCreateStructType(m_Ctx, FourI16Types, "dx.types.fouri16", pModule);
+
+  // When loading a module into an existing context where types are merged,
+  // type names may change.  When this happens, any intrinsics overloaded on
+  // UDT types will no longer have matching overload names.
+  // This causes RefreshCache() to assert.
+  // This fixes the function names to they match the expected types,
+  // preventing RefreshCache() from failing due to this issue.
+  FixOverloadNames();
+
   // Try to find existing intrinsic function.
   RefreshCache();
 }
@@ -708,6 +993,30 @@ void OP::RefreshCache() {
       Function *OpFunc = GetOpFunc(OpCode, pOverloadType);
       (void)(OpFunc);
       DXASSERT_NOMSG(OpFunc == &F);
+    }
+  }
+}
+
+void OP::FixOverloadNames() {
+  // When merging code from multiple sources, such as with linking,
+  // type names that collide, but don't have the same type will be
+  // automically renamed with .0+ name disambiguation.  However,
+  // DXIL intrinsic overloads will not be renamed to disambiguate them,
+  // since they exist in separate modules at the time.
+  // This leads to name collisions between different types when linking.
+  // Do this after loading into a shared context, and before copying
+  // code into a common module, to prevent this problem.
+  for (Function &F : m_pModule->functions()) {
+    if (F.isDeclaration() && OP::IsDxilOpFunc(&F) && !F.user_empty()) {
+      CallInst *CI = cast<CallInst>(*F.user_begin());
+      DXIL::OpCode opCode = OP::GetDxilOpFuncCallInst(CI);
+      llvm::Type *Ty = OP::GetOverloadType(opCode, &F);
+      if (isa<StructType>(Ty)) {
+        std::string funcName;
+        if (OP::ConstructOverloadName(Ty, opCode, funcName).compare(F.getName()) != 0) {
+          F.setName(funcName);
+        }
+      }
     }
   }
 }
@@ -747,16 +1056,16 @@ Function *OP::GetOpFunc(OpCode opCode, Type *pOverloadType) {
   Type *p2I32 = GetBinaryWithTwoOutputsType();
   Type *pF64 = Type::getDoubleTy(m_Ctx);
   Type *pSDT = GetSplitDoubleType();  // Split double type.
-  Type *pI4S = GetInt4Type(); // 4 i32s in a struct.
+  Type *p4I32 = GetFourI32Type(); // 4 i32s in a struct.
+  
   Type *udt = pOverloadType;
   Type *obj = pOverloadType;
+  Type *resProperty = GetResourcePropertiesType();
+  Type *resBind = GetResourceBindingType();
 
-  std::string funcName = (Twine(OP::m_NamePrefix) + Twine(GetOpCodeClassName(opCode))).str();
-  // Add ret type to the name.
-  if (pOverloadType != pV) {
-    std::string typeName;
-    funcName = Twine(funcName).concat(".").concat(GetTypeName(pOverloadType, typeName)).str();
-  } 
+  std::string funcName;
+  ConstructOverloadName(pOverloadType, opCode, funcName);
+
   // Try to find exist function with the same name in the module.
   if (Function *existF = m_pModule->getFunction(funcName)) {
     F = existF;
@@ -767,6 +1076,7 @@ Function *OP::GetOpFunc(OpCode opCode, Type *pOverloadType) {
 #define A(_x) ArgTypes.emplace_back(_x)
 #define RRT(_y) A(GetResRetType(_y))
 #define CBRT(_y) A(GetCBufferRetType(_y))
+#define VEC4(_y) A(GetVectorType(4,_y))
 
 /* <py::lines('OPCODE-OLOAD-FUNCS')>hctdb_instrhelp.get_oloads_funcs()</py>*/
   switch (opCode) {            // return     opCode
@@ -898,17 +1208,23 @@ Function *OP::GetOpFunc(OpCode opCode, Type *pOverloadType) {
   case OpCode::RenderTargetGetSampleCount:A(pI32);     A(pI32); break;
 
     // Synchronization
-  case OpCode::AtomicBinOp:            A(pI32);     A(pI32); A(pRes); A(pI32); A(pI32); A(pI32); A(pI32); A(pI32); break;
-  case OpCode::AtomicCompareExchange:  A(pI32);     A(pI32); A(pRes); A(pI32); A(pI32); A(pI32); A(pI32); A(pI32); break;
+  case OpCode::AtomicBinOp:            A(pETy);     A(pI32); A(pRes); A(pI32); A(pI32); A(pI32); A(pI32); A(pETy); break;
+  case OpCode::AtomicCompareExchange:  A(pETy);     A(pI32); A(pRes); A(pI32); A(pI32); A(pI32); A(pETy); A(pETy); break;
   case OpCode::Barrier:                A(pV);       A(pI32); A(pI32); break;
 
-    // Pixel shader
+    // Derivatives
   case OpCode::CalculateLOD:           A(pF32);     A(pI32); A(pRes); A(pRes); A(pF32); A(pF32); A(pF32); A(pI1);  break;
+
+    // Pixel shader
   case OpCode::Discard:                A(pV);       A(pI32); A(pI1);  break;
+
+    // Derivatives
   case OpCode::DerivCoarseX:           A(pETy);     A(pI32); A(pETy); break;
   case OpCode::DerivCoarseY:           A(pETy);     A(pI32); A(pETy); break;
   case OpCode::DerivFineX:             A(pETy);     A(pI32); A(pETy); break;
   case OpCode::DerivFineY:             A(pETy);     A(pI32); A(pETy); break;
+
+    // Pixel shader
   case OpCode::EvalSnapped:            A(pETy);     A(pI32); A(pI32); A(pI32); A(pI8);  A(pI32); A(pI32); break;
   case OpCode::EvalSampleIndex:        A(pETy);     A(pI32); A(pI32); A(pI32); A(pI8);  A(pI32); break;
   case OpCode::EvalCentroid:           A(pETy);     A(pI32); A(pI32); A(pI32); A(pI8);  break;
@@ -916,7 +1232,7 @@ Function *OP::GetOpFunc(OpCode opCode, Type *pOverloadType) {
   case OpCode::Coverage:               A(pI32);     A(pI32); break;
   case OpCode::InnerCoverage:          A(pI32);     A(pI32); break;
 
-    // Compute shader
+    // Compute/Mesh/Amplification shader
   case OpCode::ThreadId:               A(pI32);     A(pI32); A(pI32); break;
   case OpCode::GroupId:                A(pI32);     A(pI32); A(pI32); break;
   case OpCode::ThreadIdInGroup:        A(pI32);     A(pI32); A(pI32); break;
@@ -956,12 +1272,14 @@ Function *OP::GetOpFunc(OpCode opCode, Type *pOverloadType) {
   case OpCode::WaveAnyTrue:            A(pI1);      A(pI32); A(pI1);  break;
   case OpCode::WaveAllTrue:            A(pI1);      A(pI32); A(pI1);  break;
   case OpCode::WaveActiveAllEqual:     A(pI1);      A(pI32); A(pETy); break;
-  case OpCode::WaveActiveBallot:       A(pI4S);     A(pI32); A(pI1);  break;
+  case OpCode::WaveActiveBallot:       A(p4I32);    A(pI32); A(pI1);  break;
   case OpCode::WaveReadLaneAt:         A(pETy);     A(pI32); A(pETy); A(pI32); break;
   case OpCode::WaveReadLaneFirst:      A(pETy);     A(pI32); A(pETy); break;
   case OpCode::WaveActiveOp:           A(pETy);     A(pI32); A(pETy); A(pI8);  A(pI8);  break;
   case OpCode::WaveActiveBit:          A(pETy);     A(pI32); A(pETy); A(pI8);  break;
   case OpCode::WavePrefixOp:           A(pETy);     A(pI32); A(pETy); A(pI8);  A(pI8);  break;
+
+    // Quad Wave Ops
   case OpCode::QuadReadLaneAt:         A(pETy);     A(pI32); A(pETy); A(pI32); break;
   case OpCode::QuadOp:                 A(pETy);     A(pI32); A(pETy); A(pI8);  break;
 
@@ -1045,6 +1363,89 @@ Function *OP::GetOpFunc(OpCode opCode, Type *pOverloadType) {
   case OpCode::Dot2AddHalf:            A(pETy);     A(pI32); A(pETy); A(pF16); A(pF16); A(pF16); A(pF16); break;
   case OpCode::Dot4AddI8Packed:        A(pI32);     A(pI32); A(pI32); A(pI32); A(pI32); break;
   case OpCode::Dot4AddU8Packed:        A(pI32);     A(pI32); A(pI32); A(pI32); A(pI32); break;
+
+    // Wave
+  case OpCode::WaveMatch:              A(p4I32);    A(pI32); A(pETy); break;
+  case OpCode::WaveMultiPrefixOp:      A(pETy);     A(pI32); A(pETy); A(pI32); A(pI32); A(pI32); A(pI32); A(pI8);  A(pI8);  break;
+  case OpCode::WaveMultiPrefixBitCount:A(pI32);     A(pI32); A(pI1);  A(pI32); A(pI32); A(pI32); A(pI32); break;
+
+    // Mesh shader instructions
+  case OpCode::SetMeshOutputCounts:    A(pV);       A(pI32); A(pI32); A(pI32); break;
+  case OpCode::EmitIndices:            A(pV);       A(pI32); A(pI32); A(pI32); A(pI32); A(pI32); break;
+  case OpCode::GetMeshPayload:         A(pETy);     A(pI32); break;
+  case OpCode::StoreVertexOutput:      A(pV);       A(pI32); A(pI32); A(pI32); A(pI8);  A(pETy); A(pI32); break;
+  case OpCode::StorePrimitiveOutput:   A(pV);       A(pI32); A(pI32); A(pI32); A(pI8);  A(pETy); A(pI32); break;
+
+    // Amplification shader instructions
+  case OpCode::DispatchMesh:           A(pV);       A(pI32); A(pI32); A(pI32); A(pI32); A(pETy); break;
+
+    // Sampler Feedback
+  case OpCode::WriteSamplerFeedback:   A(pV);       A(pI32); A(pRes); A(pRes); A(pRes); A(pF32); A(pF32); A(pF32); A(pF32); A(pF32); break;
+  case OpCode::WriteSamplerFeedbackBias:A(pV);       A(pI32); A(pRes); A(pRes); A(pRes); A(pF32); A(pF32); A(pF32); A(pF32); A(pF32); A(pF32); break;
+  case OpCode::WriteSamplerFeedbackLevel:A(pV);       A(pI32); A(pRes); A(pRes); A(pRes); A(pF32); A(pF32); A(pF32); A(pF32); A(pF32); break;
+  case OpCode::WriteSamplerFeedbackGrad:A(pV);       A(pI32); A(pRes); A(pRes); A(pRes); A(pF32); A(pF32); A(pF32); A(pF32); A(pF32); A(pF32); A(pF32); A(pF32); A(pF32); A(pF32); A(pF32); break;
+
+    // Inline Ray Query
+  case OpCode::AllocateRayQuery:       A(pI32);     A(pI32); A(pI32); break;
+  case OpCode::RayQuery_TraceRayInline:A(pV);       A(pI32); A(pI32); A(pRes); A(pI32); A(pI32); A(pF32); A(pF32); A(pF32); A(pF32); A(pF32); A(pF32); A(pF32); A(pF32); break;
+  case OpCode::RayQuery_Proceed:       A(pI1);      A(pI32); A(pI32); break;
+  case OpCode::RayQuery_Abort:         A(pV);       A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CommitNonOpaqueTriangleHit:A(pV);       A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CommitProceduralPrimitiveHit:A(pV);       A(pI32); A(pI32); A(pF32); break;
+  case OpCode::RayQuery_CommittedStatus:A(pI32);     A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CandidateType: A(pI32);     A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CandidateObjectToWorld3x4:A(pF32);     A(pI32); A(pI32); A(pI32); A(pI8);  break;
+  case OpCode::RayQuery_CandidateWorldToObject3x4:A(pF32);     A(pI32); A(pI32); A(pI32); A(pI8);  break;
+  case OpCode::RayQuery_CommittedObjectToWorld3x4:A(pF32);     A(pI32); A(pI32); A(pI32); A(pI8);  break;
+  case OpCode::RayQuery_CommittedWorldToObject3x4:A(pF32);     A(pI32); A(pI32); A(pI32); A(pI8);  break;
+  case OpCode::RayQuery_CandidateProceduralPrimitiveNonOpaque:A(pI1);      A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CandidateTriangleFrontFace:A(pI1);      A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CommittedTriangleFrontFace:A(pI1);      A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CandidateTriangleBarycentrics:A(pF32);     A(pI32); A(pI32); A(pI8);  break;
+  case OpCode::RayQuery_CommittedTriangleBarycentrics:A(pF32);     A(pI32); A(pI32); A(pI8);  break;
+  case OpCode::RayQuery_RayFlags:      A(pI32);     A(pI32); A(pI32); break;
+  case OpCode::RayQuery_WorldRayOrigin:A(pF32);     A(pI32); A(pI32); A(pI8);  break;
+  case OpCode::RayQuery_WorldRayDirection:A(pF32);     A(pI32); A(pI32); A(pI8);  break;
+  case OpCode::RayQuery_RayTMin:       A(pF32);     A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CandidateTriangleRayT:A(pF32);     A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CommittedRayT: A(pF32);     A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CandidateInstanceIndex:A(pI32);     A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CandidateInstanceID:A(pI32);     A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CandidateGeometryIndex:A(pI32);     A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CandidatePrimitiveIndex:A(pI32);     A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CandidateObjectRayOrigin:A(pF32);     A(pI32); A(pI32); A(pI8);  break;
+  case OpCode::RayQuery_CandidateObjectRayDirection:A(pF32);     A(pI32); A(pI32); A(pI8);  break;
+  case OpCode::RayQuery_CommittedInstanceIndex:A(pI32);     A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CommittedInstanceID:A(pI32);     A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CommittedGeometryIndex:A(pI32);     A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CommittedPrimitiveIndex:A(pI32);     A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CommittedObjectRayOrigin:A(pF32);     A(pI32); A(pI32); A(pI8);  break;
+  case OpCode::RayQuery_CommittedObjectRayDirection:A(pF32);     A(pI32); A(pI32); A(pI8);  break;
+
+    // Raytracing object space uint System Values, raytracing tier 1.1
+  case OpCode::GeometryIndex:          A(pI32);     A(pI32); break;
+
+    // Inline Ray Query
+  case OpCode::RayQuery_CandidateInstanceContributionToHitGroupIndex:A(pI32);     A(pI32); A(pI32); break;
+  case OpCode::RayQuery_CommittedInstanceContributionToHitGroupIndex:A(pI32);     A(pI32); A(pI32); break;
+
+    // Get handle from heap
+  case OpCode::AnnotateHandle:         A(pRes);     A(pI32); A(pRes); A(resProperty);break;
+  case OpCode::CreateHandleFromBinding:A(pRes);     A(pI32); A(resBind);A(pI32); A(pI1);  break;
+  case OpCode::CreateHandleFromHeap:   A(pRes);     A(pI32); A(pI32); A(pI1);  A(pI1);  break;
+
+    // Unpacking intrinsics
+  case OpCode::Unpack4x8:              VEC4(pETy);  A(pI32); A(pI8);  A(pI32); break;
+
+    // Packing intrinsics
+  case OpCode::Pack4x8:                A(pI32);     A(pI32); A(pI8);  A(pETy); A(pETy); A(pETy); A(pETy); break;
+
+    // Helper Lanes
+  case OpCode::IsHelperLane:           A(pI1);      A(pI32); break;
+
+    // Resources - gather
+  case OpCode::TextureGatherImm:       RRT(pETy);   A(pI32); A(pRes); A(pRes); A(pF32); A(pF32); A(pF32); A(pF32); A(pI32); A(pI32); A(pI32); break;
+  case OpCode::TextureGatherCmpImm:    RRT(pETy);   A(pI32); A(pRes); A(pRes); A(pF32); A(pF32); A(pF32); A(pF32); A(pI32); A(pI32); A(pI32); A(pF32); break;
   // OPCODE-OLOAD-FUNCS:END
   default: DXASSERT(false, "otherwise unhandled case"); break;
   }
@@ -1066,7 +1467,7 @@ Function *OP::GetOpFunc(OpCode opCode, Type *pOverloadType) {
   return F;
 }
 
-const SmallDenseMap<llvm::Type *, llvm::Function *, 8> &
+const SmallMapVector<llvm::Type *, llvm::Function *, 8> &
 OP::GetOpFuncList(OpCode opCode) const {
   DXASSERT(0 <= (unsigned)opCode && opCode < OpCode::NumOpCodes,
            "otherwise caller passed OOB OpCode");
@@ -1074,6 +1475,20 @@ OP::GetOpFuncList(OpCode opCode) const {
   return m_OpCodeClassCache[(unsigned)m_OpCodeProps[(unsigned)opCode]
                                 .opCodeClass]
       .pOverloads;
+}
+
+bool OP::IsDxilOpUsed(OpCode opcode) const {
+  auto &FnList = GetOpFuncList(opcode);
+  for (auto &it : FnList) {
+    llvm::Function *F = it.second;
+    if (!F) {
+      continue;
+    }
+    if (!F->user_empty()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void OP::RemoveFunction(Function *F) {
@@ -1094,6 +1509,7 @@ bool OP::GetOpCodeClass(const Function *F, OP::OpCodeClass &opClass) {
   if (iter == m_FunctionToOpClass.end()) {
     // When no user, cannot get opcode.
     DXASSERT(F->user_empty() || !IsDxilOpFunc(F), "dxil function without an opcode class mapping?");
+    opClass = OP::OpCodeClass::NumOpClasses;
     return false;
   }
   opClass = iter->second;
@@ -1123,11 +1539,13 @@ llvm::Type *OP::GetOverloadType(OpCode opCode, llvm::Function *F) {
   DXASSERT(F, "not work on nullptr");
   Type *Ty = F->getReturnType();
   FunctionType *FT = F->getFunctionType();
+  LLVMContext &Ctx = F->getContext();
 /* <py::lines('OPCODE-OLOAD-TYPES')>hctdb_instrhelp.get_funcs_oload_type()</py>*/
   switch (opCode) {            // return     OpCode
   // OPCODE-OLOAD-TYPES:BEGIN
   case OpCode::TempRegStore:
   case OpCode::CallShader:
+  case OpCode::Pack4x8:
     DXASSERT_NOMSG(FT->getNumParams() > 2);
     return FT->getParamType(2);
   case OpCode::MinPrecXRegStore:
@@ -1135,6 +1553,9 @@ llvm::Type *OP::GetOverloadType(OpCode opCode, llvm::Function *F) {
   case OpCode::BufferStore:
   case OpCode::StorePatchConstant:
   case OpCode::RawBufferStore:
+  case OpCode::StoreVertexOutput:
+  case OpCode::StorePrimitiveOutput:
+  case OpCode::DispatchMesh:
     DXASSERT_NOMSG(FT->getNumParams() > 4);
     return FT->getParamType(4);
   case OpCode::IsNaN:
@@ -1152,6 +1573,7 @@ llvm::Type *OP::GetOverloadType(OpCode opCode, llvm::Function *F) {
   case OpCode::USubb:
   case OpCode::WaveActiveAllEqual:
   case OpCode::CreateHandleForLib:
+  case OpCode::WaveMatch:
     DXASSERT_NOMSG(FT->getNumParams() > 1);
     return FT->getParamType(1);
   case OpCode::TextureStore:
@@ -1196,10 +1618,23 @@ llvm::Type *OP::GetOverloadType(OpCode opCode, llvm::Function *F) {
   case OpCode::WavePrefixBitCount:
   case OpCode::IgnoreHit:
   case OpCode::AcceptHitAndEndSearch:
-    return Type::getVoidTy(m_Ctx);
+  case OpCode::WaveMultiPrefixBitCount:
+  case OpCode::SetMeshOutputCounts:
+  case OpCode::EmitIndices:
+  case OpCode::WriteSamplerFeedback:
+  case OpCode::WriteSamplerFeedbackBias:
+  case OpCode::WriteSamplerFeedbackLevel:
+  case OpCode::WriteSamplerFeedbackGrad:
+  case OpCode::AllocateRayQuery:
+  case OpCode::RayQuery_TraceRayInline:
+  case OpCode::RayQuery_Abort:
+  case OpCode::RayQuery_CommitNonOpaqueTriangleHit:
+  case OpCode::RayQuery_CommitProceduralPrimitiveHit:
+  case OpCode::AnnotateHandle:
+  case OpCode::CreateHandleFromBinding:
+  case OpCode::CreateHandleFromHeap:
+    return Type::getVoidTy(Ctx);
   case OpCode::CheckAccessFullyMapped:
-  case OpCode::AtomicBinOp:
-  case OpCode::AtomicCompareExchange:
   case OpCode::SampleIndex:
   case OpCode::Coverage:
   case OpCode::InnerCoverage:
@@ -1220,7 +1655,21 @@ llvm::Type *OP::GetOverloadType(OpCode opCode, llvm::Function *F) {
   case OpCode::PrimitiveIndex:
   case OpCode::Dot4AddI8Packed:
   case OpCode::Dot4AddU8Packed:
-    return IntegerType::get(m_Ctx, 32);
+  case OpCode::RayQuery_CommittedStatus:
+  case OpCode::RayQuery_CandidateType:
+  case OpCode::RayQuery_RayFlags:
+  case OpCode::RayQuery_CandidateInstanceIndex:
+  case OpCode::RayQuery_CandidateInstanceID:
+  case OpCode::RayQuery_CandidateGeometryIndex:
+  case OpCode::RayQuery_CandidatePrimitiveIndex:
+  case OpCode::RayQuery_CommittedInstanceIndex:
+  case OpCode::RayQuery_CommittedInstanceID:
+  case OpCode::RayQuery_CommittedGeometryIndex:
+  case OpCode::RayQuery_CommittedPrimitiveIndex:
+  case OpCode::GeometryIndex:
+  case OpCode::RayQuery_CandidateInstanceContributionToHitGroupIndex:
+  case OpCode::RayQuery_CommittedInstanceContributionToHitGroupIndex:
+    return IntegerType::get(Ctx, 32);
   case OpCode::CalculateLOD:
   case OpCode::DomainLocation:
   case OpCode::WorldRayOrigin:
@@ -1231,10 +1680,31 @@ llvm::Type *OP::GetOverloadType(OpCode opCode, llvm::Function *F) {
   case OpCode::WorldToObject:
   case OpCode::RayTMin:
   case OpCode::RayTCurrent:
-    return Type::getFloatTy(m_Ctx);
+  case OpCode::RayQuery_CandidateObjectToWorld3x4:
+  case OpCode::RayQuery_CandidateWorldToObject3x4:
+  case OpCode::RayQuery_CommittedObjectToWorld3x4:
+  case OpCode::RayQuery_CommittedWorldToObject3x4:
+  case OpCode::RayQuery_CandidateTriangleBarycentrics:
+  case OpCode::RayQuery_CommittedTriangleBarycentrics:
+  case OpCode::RayQuery_WorldRayOrigin:
+  case OpCode::RayQuery_WorldRayDirection:
+  case OpCode::RayQuery_RayTMin:
+  case OpCode::RayQuery_CandidateTriangleRayT:
+  case OpCode::RayQuery_CommittedRayT:
+  case OpCode::RayQuery_CandidateObjectRayOrigin:
+  case OpCode::RayQuery_CandidateObjectRayDirection:
+  case OpCode::RayQuery_CommittedObjectRayOrigin:
+  case OpCode::RayQuery_CommittedObjectRayDirection:
+    return Type::getFloatTy(Ctx);
   case OpCode::MakeDouble:
   case OpCode::SplitDouble:
-    return Type::getDoubleTy(m_Ctx);
+    return Type::getDoubleTy(Ctx);
+  case OpCode::RayQuery_Proceed:
+  case OpCode::RayQuery_CandidateProceduralPrimitiveNonOpaque:
+  case OpCode::RayQuery_CandidateTriangleFrontFace:
+  case OpCode::RayQuery_CommittedTriangleFrontFace:
+  case OpCode::IsHelperLane:
+    return IntegerType::get(Ctx, 1);
   case OpCode::CBufferLoadLegacy:
   case OpCode::Sample:
   case OpCode::SampleBias:
@@ -1247,6 +1717,9 @@ llvm::Type *OP::GetOverloadType(OpCode opCode, llvm::Function *F) {
   case OpCode::TextureGather:
   case OpCode::TextureGatherCmp:
   case OpCode::RawBufferLoad:
+  case OpCode::Unpack4x8:
+  case OpCode::TextureGatherImm:
+  case OpCode::TextureGatherCmpImm:
   {
     StructType *ST = cast<StructType>(Ty);
     return ST->getElementType(0);
@@ -1258,6 +1731,14 @@ llvm::Type *OP::GetOverloadType(OpCode opCode, llvm::Function *F) {
 
 Type *OP::GetHandleType() const {
   return m_pHandleType;
+}
+
+Type *OP::GetResourcePropertiesType() const {
+  return m_pResourcePropertiesType;
+}
+
+Type *OP::GetResourceBindingType() const {
+  return m_pResourceBindingType;
 }
 
 Type *OP::GetDimensionsType() const
@@ -1282,8 +1763,12 @@ Type *OP::GetSplitDoubleType() const {
   return m_pSplitDoubleType;
 }
 
-Type *OP::GetInt4Type() const {
-  return m_pInt4Type;
+Type *OP::GetFourI32Type() const {
+  return m_pFourI32Type;
+}
+
+Type *OP::GetFourI16Type() const {
+  return m_pFourI16Type;
 }
 
 bool OP::IsResRetType(llvm::Type *Ty) {
@@ -1335,6 +1820,18 @@ Type *OP::GetCBufferRetType(Type *pOverloadType) {
   return m_pCBufferRetType[TypeSlot];
 }
 
+Type *OP::GetVectorType(unsigned numElements, Type *pOverloadType) {
+  if (numElements == 4) {
+    if (pOverloadType == Type::getInt32Ty(pOverloadType->getContext())) {
+      return m_pFourI32Type;
+    }
+    else if (pOverloadType == Type::getInt16Ty(pOverloadType->getContext())) {
+      return m_pFourI16Type;
+    }
+  }
+  DXASSERT(false, "unexpected overload type");
+  return nullptr;
+}
 
 //------------------------------------------------------------------------------
 //

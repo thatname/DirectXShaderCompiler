@@ -64,6 +64,8 @@ public:
   void SetValidatorVersion(unsigned ValMajor, unsigned ValMinor);
   bool UpgradeValidatorVersion(unsigned ValMajor, unsigned ValMinor);
   void GetValidatorVersion(unsigned &ValMajor, unsigned &ValMinor) const;
+  void SetForceZeroStoreLifetimes(bool ForceZeroStoreLifetimes);
+  bool GetForceZeroStoreLifetimes() const;
 
   // Return true on success, requires valid shader model and CollectShaderFlags to have been set
   bool GetMinValidatorVersion(unsigned &ValMajor, unsigned &ValMinor) const;
@@ -79,6 +81,7 @@ public:
   llvm::Function *GetPatchConstantFunction();
   const llvm::Function *GetPatchConstantFunction() const;
   void SetPatchConstantFunction(llvm::Function *pFunc);
+  bool IsEntryOrPatchConstantFunction(const llvm::Function* pFunc) const;
 
   // Flags.
   unsigned GetGlobalFlags() const;
@@ -113,14 +116,18 @@ public:
   void RemoveResourcesWithUnusedSymbols();
   void RemoveFunction(llvm::Function *F);
 
+  bool RenameResourcesWithPrefix(const std::string &prefix);
+  bool RenameResourceGlobalsWithBinding(bool bKeepName = true);
+
   // Signatures.
   DxilSignature &GetInputSignature();
   const DxilSignature &GetInputSignature() const;
   DxilSignature &GetOutputSignature();
   const DxilSignature &GetOutputSignature() const;
-  DxilSignature &GetPatchConstantSignature();
-  const DxilSignature &GetPatchConstantSignature() const;
+  DxilSignature &GetPatchConstOrPrimSignature();
+  const DxilSignature &GetPatchConstOrPrimSignature() const;
   const std::vector<uint8_t> &GetSerializedRootSignature() const;
+  std::vector<uint8_t> &GetSerializedRootSignature();
 
   bool HasDxilEntrySignature(const llvm::Function *F) const;
   DxilEntrySignature &GetDxilEntrySignature(const llvm::Function *F);
@@ -146,6 +153,9 @@ public:
   // Is an entry function that uses input/output signature conventions?
   // Includes: vs/hs/ds/gs/ps/cs as well as the patch constant function.
   bool IsEntryThatUsesSignatures(const llvm::Function *F) const ;
+  // Is F an entry?
+  // Includes: IsEntryThatUsesSignatures and all ray tracing shaders.
+  bool IsEntry(const llvm::Function *F) const;
 
   // Remove Root Signature from module metadata, return true if changed
   bool StripRootSignatureFromMetadata();
@@ -156,6 +166,7 @@ public:
 
   // DXIL type system.
   DxilTypeSystem &GetTypeSystem();
+  const DxilTypeSystem &GetTypeSystem() const;
 
   /// Emit llvm.used array to make sure that optimizations do not remove unreferenced globals.
   void EmitLLVMUsed();
@@ -176,6 +187,11 @@ public:
   void ReEmitDxilResources();
   /// Deserialize DXIL metadata form into in-memory form.
   void LoadDxilMetadata();
+  /// Return true if non-fatal metadata error was detected.
+  bool HasMetadataErrors();
+
+  void EmitDxilCounters();
+  void LoadDxilCounters(DxilCounters &counters) const;
 
   /// Check if a Named meta data node is known by dxil module.
   static bool IsKnownNamedMetaData(llvm::NamedMDNode &Node);
@@ -187,8 +203,13 @@ public:
   void ResetOP(hlsl::OP *hlslOP);
   void ResetEntryPropsMap(DxilEntryPropsMap &&PropMap);
 
-  void StripReflection();
+  bool StripReflection();
   void StripDebugRelatedCode();
+
+  // Helper to remove dx.* metadata with source and compile options.
+  // If the parameter `bReplaceWithDummyData` is true, the named metadata
+  // are replaced with valid empty data that satisfy tools.
+  void StripShaderSourcesAndCompileOptions(bool bReplaceWithDummyData=false);
   llvm::DebugInfoFinder &GetOrCreateDebugInfoFinder();
 
   static DxilModule *TryGetDxilModule(llvm::Module *pModule);
@@ -223,9 +244,13 @@ public:
   // This funciton must be called after unused resources are removed from DxilModule
   bool ModuleHasMulticomponentUAVLoads();
 
-  // Compute shader.
+  // Compute/Mesh/Amplification shader.
   void SetNumThreads(unsigned x, unsigned y, unsigned z);
   unsigned GetNumThreads(unsigned idx) const;
+
+  // Compute shader
+  void SetWaveSize(unsigned size);
+  unsigned GetWaveSize() const;
 
   // Geometry shader.
   DXIL::InputPrimitive GetInputPrimitive() const;
@@ -272,6 +297,16 @@ public:
   float GetMaxTessellationFactor() const;
   void SetMaxTessellationFactor(float MaxTessellationFactor);
 
+  // Mesh shader
+  unsigned GetMaxOutputVertices() const;
+  void SetMaxOutputVertices(unsigned NumOVs);
+  unsigned GetMaxOutputPrimitives() const;
+  void SetMaxOutputPrimitives(unsigned NumOPs);
+  DXIL::MeshOutputTopology GetMeshOutputTopology() const;
+  void SetMeshOutputTopology(DXIL::MeshOutputTopology MeshOutputTopology);
+  unsigned GetPayloadSizeInBytes() const;
+  void SetPayloadSizeInBytes(unsigned Size);
+
   // AutoBindingSpace also enables automatic binding for libraries if set.
   // UINT_MAX == unset
   void SetAutoBindingSpace(uint32_t Space);
@@ -315,6 +350,7 @@ private:
   unsigned m_DxilMinor;
   unsigned m_ValMajor;
   unsigned m_ValMinor;
+  bool m_ForceZeroStoreLifetimes;
 
   std::unique_ptr<OP> m_pOP;
   size_t m_pUnused;
@@ -351,7 +387,14 @@ private:
   uint32_t m_IntermediateFlags;
   uint32_t m_AutoBindingSpace;
 
+  // porperties infered from the DXILTypeSystem
+  bool m_bHasPayloadQualifiers;
+
   std::unique_ptr<DxilSubobjects> m_pSubobjects;
+
+  // m_bMetadataErrors is true if non-fatal metadata errors were encountered.
+  // Validator will fail in this case, but should not block module load.
+  bool m_bMetadataErrors;
 };
 
 } // namespace hlsl

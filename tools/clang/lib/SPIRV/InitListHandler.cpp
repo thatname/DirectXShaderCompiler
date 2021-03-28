@@ -81,9 +81,16 @@ void InitListHandler::flatten(const InitListExpr *expr) {
   }
 }
 
-void InitListHandler::decompose(SpirvInstruction *inst) {
+// Note that we cannot use inst->getSourceLocation() for OpCompositeExtract.
+// For example, float3(sign(v4f.xyz - 2 * v4f.xyz)) is InitListExpr and the
+// result of "sign(v4f.xyz - 2 * v4f.xyz)" has its location as the start
+// location of "v4f.xyz". When InitListHandler::decompose() handles inst
+// for "sign(v4f.xyz - 2 * v4f.xyz)", inst->getSourceLocation() is the location
+// of "v4f.xyz". However, we must use the start location of "sign(" for
+// OpCompositeExtract.
+void InitListHandler::decompose(SpirvInstruction *inst,
+                                const SourceLocation &loc) {
   const QualType type = inst->getAstResultType();
-
   QualType elemType = {};
   uint32_t elemCount = 0, rowCount = 0, colCount = 0;
 
@@ -94,7 +101,8 @@ void InitListHandler::decompose(SpirvInstruction *inst) {
   // Vector cases, including mat1xN and matNx1 where N > 1.
   else if (isVectorType(type, &elemType, &elemCount)) {
     for (uint32_t i = 0; i < elemCount; ++i) {
-      auto *element = spvBuilder.createCompositeExtract(elemType, inst, {i});
+      auto *element =
+          spvBuilder.createCompositeExtract(elemType, inst, {i}, loc);
       scalars.emplace_back(element, elemType);
     }
   }
@@ -103,7 +111,7 @@ void InitListHandler::decompose(SpirvInstruction *inst) {
     for (uint32_t i = 0; i < rowCount; ++i)
       for (uint32_t j = 0; j < colCount; ++j) {
         auto *element =
-            spvBuilder.createCompositeExtract(elemType, inst, {i, j});
+            spvBuilder.createCompositeExtract(elemType, inst, {i, j}, loc);
         scalars.emplace_back(element, elemType);
       }
   }
@@ -122,11 +130,14 @@ bool InitListHandler::tryToSplitStruct() {
   const QualType initType = init->getAstResultType();
   if (!initType->isStructureType() ||
       // Sampler types will pass the above check but we cannot split it.
-      isSampler(initType))
+      isSampler(initType) ||
+      // Can not split structuredOrByteBuffer
+      isAKindOfStructuredOrByteBuffer(initType))
     return false;
 
   // We are certain the current intializer will be replaced by now.
   initializers.pop_back();
+  const auto &loc = init->getSourceLocation();
 
   const auto *structDecl = initType->getAsStructureType()->getDecl();
 
@@ -135,7 +146,7 @@ bool InitListHandler::tryToSplitStruct() {
   uint32_t i = 0;
   for (auto *field : structDecl->fields()) {
     auto *extract =
-        spvBuilder.createCompositeExtract(field->getType(), init, {i});
+        spvBuilder.createCompositeExtract(field->getType(), init, {i}, loc);
     fields.push_back(extract);
     ++i;
   }
@@ -157,6 +168,7 @@ bool InitListHandler::tryToSplitConstantArray() {
 
   // We are certain the current intializer will be replaced by now.
   initializers.pop_back();
+  const auto &loc = init->getSourceLocation();
 
   const auto &context = theEmitter.getASTContext();
 
@@ -170,7 +182,7 @@ bool InitListHandler::tryToSplitConstantArray() {
   // But do we have a better solution?
   llvm::SmallVector<SpirvInstruction *, 4> elements;
   for (uint32_t i = 0; i < size; ++i) {
-    auto *extract = spvBuilder.createCompositeExtract(elemType, init, {i});
+    auto *extract = spvBuilder.createCompositeExtract(elemType, init, {i}, loc);
     elements.push_back(extract);
   }
 
@@ -204,16 +216,15 @@ SpirvInstruction *InitListHandler::createInitForType(QualType type,
   // Samplers, (RW)Buffers, (RW)Textures
   // It is important that this happens before checking of structure types.
   if (isOpaqueType(type))
-    return createInitForSamplerImageType(type, srcLoc);
+    return createInitForBufferOrImageType(type, srcLoc);
 
   // This should happen before the check for normal struct types
   if (isAKindOfStructuredOrByteBuffer(type)) {
-    emitError("cannot handle structured/byte buffer as initializer", srcLoc);
-    return nullptr;
+    return createInitForBufferOrImageType(type, srcLoc);
   }
 
   if (type->isStructureType())
-    return createInitForStructType(type);
+    return createInitForStructType(type, srcLoc);
 
   if (type->isConstantArrayType())
     return createInitForConstantArrayType(type, srcLoc);
@@ -237,11 +248,11 @@ InitListHandler::createInitForBuiltinType(QualType type,
   while (tryToSplitStruct() || tryToSplitConstantArray())
     ;
 
-  auto *init = initializers.back();
+  auto init = initializers.back();
   initializers.pop_back();
 
   if (!init->getAstResultType()->isBuiltinType()) {
-    decompose(init);
+    decompose(init, srcLoc);
     return createInitForBuiltinType(type, srcLoc);
   }
 
@@ -260,7 +271,7 @@ InitListHandler::createInitForVectorType(QualType elemType, uint32_t count,
     while (tryToSplitStruct() || tryToSplitConstantArray())
       ;
 
-    auto *init = initializers.back();
+    auto init = initializers.back();
     const auto initType = init->getAstResultType();
 
     uint32_t elemCount = 0;
@@ -289,7 +300,7 @@ InitListHandler::createInitForVectorType(QualType elemType, uint32_t count,
   const QualType vecType = astContext.getExtVectorType(elemType, count);
 
   // TODO: use OpConstantComposite when all components are constants
-  return spvBuilder.createCompositeConstruct(vecType, elements);
+  return spvBuilder.createCompositeConstruct(vecType, elements, srcLoc);
 }
 
 SpirvInstruction *
@@ -306,7 +317,7 @@ InitListHandler::createInitForMatrixType(QualType matrixType,
     while (tryToSplitStruct() || tryToSplitConstantArray())
       ;
 
-    auto *init = initializers.back();
+    auto init = initializers.back();
 
     if (hlsl::IsHLSLMatType(init->getAstResultType())) {
       uint32_t initRowCount = 0, initColCount = 0;
@@ -333,10 +344,11 @@ InitListHandler::createInitForMatrixType(QualType matrixType,
   }
 
   // TODO: use OpConstantComposite when all components are constants
-  return spvBuilder.createCompositeConstruct(matrixType, vectors);
+  return spvBuilder.createCompositeConstruct(matrixType, vectors, srcLoc);
 }
 
-SpirvInstruction *InitListHandler::createInitForStructType(QualType type) {
+SpirvInstruction *
+InitListHandler::createInitForStructType(QualType type, SourceLocation srcLoc) {
   assert(type->isStructureType() && !isSampler(type));
 
   // Same as the vector case, first try to see if we already have a struct at
@@ -346,7 +358,7 @@ SpirvInstruction *InitListHandler::createInitForStructType(QualType type) {
     while (tryToSplitConstantArray())
       ;
 
-    auto *init = initializers.back();
+    auto init = initializers.back();
     // We can only avoid decomposing and reconstructing when the type is
     // exactly the same.
     if (type.getCanonicalType() ==
@@ -371,7 +383,7 @@ SpirvInstruction *InitListHandler::createInitForStructType(QualType type) {
   }
 
   // TODO: use OpConstantComposite when all components are constants
-  return spvBuilder.createCompositeConstruct(type, fields);
+  return spvBuilder.createCompositeConstruct(type, fields, srcLoc);
 }
 
 SpirvInstruction *
@@ -386,7 +398,7 @@ InitListHandler::createInitForConstantArrayType(QualType type,
     while (tryToSplitStruct())
       ;
 
-    auto *init = initializers.back();
+    auto init = initializers.back();
     // We can only avoid decomposing and reconstructing when the type is
     // exactly the same.
     if (type.getCanonicalType() ==
@@ -412,13 +424,13 @@ InitListHandler::createInitForConstantArrayType(QualType type,
     elements.push_back(createInitForType(elemType, srcLoc));
 
   // TODO: use OpConstantComposite when all components are constants
-  return spvBuilder.createCompositeConstruct(type, elements);
+  return spvBuilder.createCompositeConstruct(type, elements, srcLoc);
 }
 
 SpirvInstruction *
-InitListHandler::createInitForSamplerImageType(QualType type,
-                                               SourceLocation srcLoc) {
-  assert(isOpaqueType(type));
+InitListHandler::createInitForBufferOrImageType(QualType type,
+                                                SourceLocation srcLoc) {
+  assert(isOpaqueType(type) || isAKindOfStructuredOrByteBuffer(type));
 
   // Samplers, (RW)Buffers, and (RW)Textures are translated into OpTypeSampler
   // and OpTypeImage. They should be treated similar as builtin types.
@@ -439,7 +451,7 @@ InitListHandler::createInitForSamplerImageType(QualType type,
   while (tryToSplitStruct() || tryToSplitConstantArray())
     ;
 
-  auto *init = initializers.back();
+  auto init = initializers.back();
   initializers.pop_back();
 
   if (init->getAstResultType().getCanonicalType() != type.getCanonicalType()) {

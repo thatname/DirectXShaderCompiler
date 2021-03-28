@@ -3,15 +3,17 @@
 add_llvm_library(LLVMDxilPIXPasses
   DxilAddPixelHitInstrumentation.cpp
   DxilAnnotateWithVirtualRegister.cpp
+  DxilDbgValueToDbgDeclare.cpp
   DxilDebugInstrumentation.cpp
   DxilForceEarlyZ.cpp
   DxilOutputColorBecomesConstant.cpp
+  DxilPIXMeshShaderOutputInstrumentation.cpp
   DxilRemoveDiscards.cpp
   DxilReduceMSAAToSingleSample.cpp
   DxilShaderAccessTracking.cpp
   DxilPIXPasses.cpp
   DxilPIXVirtualRegisters.cpp
-
+  PixPassHelpers.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/IR

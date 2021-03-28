@@ -129,6 +129,22 @@ void replaceInputOutputWithIntrinsic(DXIL::SemanticKind semKind, Value *GV,
   case Semantic::Kind::ViewID:
     opcode = OP::OpCode::ViewID;
     break;
+  case Semantic::Kind::GroupThreadID:
+    opcode = OP::OpCode::ThreadIdInGroup;
+    break;
+  case Semantic::Kind::GroupID:
+    opcode = OP::OpCode::GroupId;
+    break;
+  case Semantic::Kind::DispatchThreadID:
+    opcode = OP::OpCode::ThreadId;
+    break;
+  case Semantic::Kind::GroupIndex:
+    opcode = OP::OpCode::FlattenedThreadIdInGroup;
+    break;
+  case Semantic::Kind::CullPrimitive: {
+    GV->replaceAllUsesWith(ConstantInt::get(Ty, (uint64_t)0));
+    return;
+  } break;
   default:
     DXASSERT(0, "invalid semantic");
     return;
@@ -138,19 +154,25 @@ void replaceInputOutputWithIntrinsic(DXIL::SemanticKind semKind, Value *GV,
   Constant *OpArg = hlslOP->GetU32Const((unsigned)opcode);
 
   Value *newArg = nullptr;
-  if (semKind == Semantic::Kind::DomainLocation) {
+  if (semKind == Semantic::Kind::DomainLocation ||
+      semKind == Semantic::Kind::GroupThreadID ||
+      semKind == Semantic::Kind::GroupID ||
+      semKind == Semantic::Kind::DispatchThreadID) {
     unsigned vecSize = 1;
     if (Ty->isVectorTy())
       vecSize = Ty->getVectorNumElements();
 
-    newArg = Builder.CreateCall(dxilFunc, {OpArg, hlslOP->GetU8Const(0)});
+    newArg = Builder.CreateCall(dxilFunc, { OpArg,
+      semKind == Semantic::Kind::DomainLocation ? hlslOP->GetU8Const(0) : hlslOP->GetU32Const(0) });
     if (vecSize > 1) {
       Value *result = UndefValue::get(Ty);
       result = Builder.CreateInsertElement(result, newArg, (uint64_t)0);
 
       for (unsigned i = 1; i < vecSize; i++) {
         Value *newElt =
-            Builder.CreateCall(dxilFunc, {OpArg, hlslOP->GetU8Const(i)});
+            Builder.CreateCall(dxilFunc, { OpArg,
+              semKind == Semantic::Kind::DomainLocation ? hlslOP->GetU8Const(i)
+                                                        : hlslOP->GetU32Const(i) });
         result = Builder.CreateInsertElement(result, newElt, i);
       }
       newArg = result;
@@ -223,7 +245,15 @@ void HLSignatureLower::ProcessArgument(Function *func,
       paramAnnotation.GetInterpolationMode().GetKind();
 
   // Set undefined interpMode.
-  if (!sigPoint->NeedsInterpMode())
+  if (sigPoint->GetKind() == DXIL::SigPointKind::MSPOut) {
+    if (interpMode != InterpolationMode::Kind::Undefined &&
+        interpMode != InterpolationMode::Kind::Constant) {
+      dxilutil::EmitErrorOnFunction(HLM.GetModule()->getContext(), func,
+        "Mesh shader's primitive outputs' interpolation mode must be constant or undefined.");
+    }
+    interpMode = InterpolationMode::Kind::Constant;
+  }
+  else if (!sigPoint->NeedsInterpMode())
     interpMode = InterpolationMode::Kind::Undefined;
   else if (interpMode == InterpolationMode::Kind::Undefined) {
     // Type-based default: linear for floats, constant for others.
@@ -240,7 +270,7 @@ void HLSignatureLower::ProcessArgument(Function *func,
 
   llvm::StringRef semanticStr = paramAnnotation.GetSemanticString();
   if (semanticStr.empty()) {
-    func->getContext().emitError(
+    dxilutil::EmitErrorOnFunction(HLM.GetModule()->getContext(), func,
         "Semantic must be defined for all parameters of an entry function or "
         "patch constant function");
     return;
@@ -266,15 +296,14 @@ void HLSignatureLower::ProcessArgument(Function *func,
             ? m_InputSemanticsUsed
             : (sigPoint->IsOutput()
                    ? m_OutputSemanticsUsed[streamIdx]
-                   : (sigPoint->IsPatchConstant() ? m_PatchConstantSemanticsUsed
+                   : (sigPoint->IsPatchConstOrPrim() ? m_PatchConstantSemanticsUsed
                                                   : m_OtherSemanticsUsed));
     if (SemanticUseMap.count((unsigned)pSemantic->GetKind()) > 0) {
       auto &SemanticIndexSet = SemanticUseMap[(unsigned)pSemantic->GetKind()];
       for (unsigned idx : paramAnnotation.GetSemanticIndexVec()) {
         if (SemanticIndexSet.count(idx) > 0) {
-          func->getContext().emitError(
-              Twine("Parameter with semantic ") + semanticStr +
-              Twine(" has overlapping semantic index at ") + Twine(idx));
+          dxilutil::EmitErrorOnFunction(HLM.GetModule()->getContext(), func, "Parameter with semantic " + semanticStr +
+            " has overlapping semantic index at " + std::to_string(idx) + ".");
           return;
         }
       }
@@ -290,9 +319,9 @@ void HLSignatureLower::ProcessArgument(Function *func,
                0) ||
           (pSemantic->GetKind() == DXIL::SemanticKind::InnerCoverage &&
            SemanticUseMap.count((unsigned)DXIL::SemanticKind::Coverage) > 0)) {
-        func->getContext().emitError(
+        dxilutil::EmitErrorOnFunction(HLM.GetModule()->getContext(), func,
             "Pixel shader inputs SV_Coverage and SV_InnerCoverage are mutually "
-            "exclusive");
+            "exclusive.");
         return;
       }
     }
@@ -302,12 +331,13 @@ void HLSignatureLower::ProcessArgument(Function *func,
   // intrinsics
   {
     switch (interpretation) {
-    case DXIL::SemanticInterpretationKind::NA:
-      func->getContext().emitError(Twine("Semantic ") + semanticStr +
-                                   Twine(" is invalid for shader model: ") +
-                                   ShaderModel::GetKindName(props.shaderKind));
+    case DXIL::SemanticInterpretationKind::NA: {
+      dxilutil::EmitErrorOnFunction(HLM.GetModule()->getContext(), func, Twine("Semantic ") + semanticStr +
+                                    Twine(" is invalid for shader model: ") +
+                                    ShaderModel::GetKindName(props.shaderKind));
 
       return;
+    }
     case DXIL::SemanticInterpretationKind::NotInSig:
     case DXIL::SemanticInterpretationKind::Shadow: {
       IRBuilder<> funcBuilder(func->getEntryBlock().getFirstInsertionPt());
@@ -346,8 +376,8 @@ void HLSignatureLower::ProcessArgument(Function *func,
   case DXIL::SignatureKind::Output:
     pSig = &EntrySig.OutputSignature;
     break;
-  case DXIL::SignatureKind::PatchConstant:
-    pSig = &EntrySig.PatchConstantSignature;
+  case DXIL::SignatureKind::PatchConstOrPrim:
+    pSig = &EntrySig.PatchConstOrPrimSignature;
     break;
   default:
     DXASSERT(false, "Expected real signature kind at this point");
@@ -359,15 +389,14 @@ void HLSignatureLower::ProcessArgument(Function *func,
   {
     // Add signature element to appropriate maps
     if (isPatchConstantFunction &&
-        sigKind != DXIL::SignatureKind::PatchConstant) {
+        sigKind != DXIL::SignatureKind::PatchConstOrPrim) {
       pSE = FindArgInSignature(arg, paramAnnotation.GetSemanticString(),
                                interpMode, sigPoint->GetKind(), *pSig);
       if (!pSE) {
-        func->getContext().emitError(
-            Twine("Signature element ") + semanticStr +
-            Twine(", referred to by patch constant function, is not found in "
-                  "corresponding hull shader ") +
-            (sigKind == DXIL::SignatureKind::Input ? "input." : "output."));
+        dxilutil::EmitErrorOnFunction(HLM.GetModule()->getContext(), func, Twine("Signature element ") + semanticStr +
+                                      Twine(", referred to by patch constant function, is not found in "
+                                            "corresponding hull shader ") +
+                                      (sigKind == DXIL::SignatureKind::Input ? "input." : "output."));
         return;
       }
       m_patchConstantInputsSigMap[arg.getArgNo()] = pSE;
@@ -415,12 +444,20 @@ void HLSignatureLower::CreateDxilSignatures() {
     if (HLModule::IsStreamOutputPtrType(Ty))
       continue;
 
+    // Skip OutIndices and InPayload
+    DxilParameterAnnotation &paramAnnotation =
+      EntryAnnotation->GetParameterAnnotation(arg.getArgNo());
+    hlsl::DxilParamInputQual qual = paramAnnotation.GetParamInputQual();
+    if (qual == hlsl::DxilParamInputQual::OutIndices ||
+        qual == hlsl::DxilParamInputQual::InPayload)
+      continue;
+
     ProcessArgument(Entry, EntryAnnotation, arg, props, pSM,
                     isPatchConstantFunctionFalse, bForOutFasle, bHasClipPlane);
   }
 
   if (bHasClipPlane) {
-    Entry->getContext().emitError("Cannot use clipplanes attribute without "
+    dxilutil::EmitErrorOnFunction(HLM.GetModule()->getContext(), Entry, "Cannot use clipplanes attribute without "
                                   "specifying a 4-component SV_Position "
                                   "output");
   }
@@ -430,7 +467,7 @@ void HLSignatureLower::CreateDxilSignatures() {
   if (props.shaderKind == DXIL::ShaderKind::Hull) {
     Function *patchConstantFunc = props.ShaderProps.HS.patchConstantFunc;
     if (patchConstantFunc == nullptr) {
-      Entry->getContext().emitError(
+      dxilutil::EmitErrorOnFunction(HLM.GetModule()->getContext(), Entry,
           "Patch constant function is not specified.");
     }
 
@@ -459,21 +496,25 @@ void HLSignatureLower::AllocateDxilInputOutputs() {
 
   hlsl::PackDxilSignature(EntrySig.InputSignature, packing);
   if (!EntrySig.InputSignature.IsFullyAllocated()) {
-    HLM.GetCtx().emitError(
+    dxilutil::EmitErrorOnFunction(HLM.GetModule()->getContext(), Entry,
         "Failed to allocate all input signature elements in available space.");
   }
 
-  hlsl::PackDxilSignature(EntrySig.OutputSignature, packing);
-  if (!EntrySig.OutputSignature.IsFullyAllocated()) {
-    HLM.GetCtx().emitError(
-        "Failed to allocate all output signature elements in available space.");
+  if (props.shaderKind != DXIL::ShaderKind::Amplification) {
+    hlsl::PackDxilSignature(EntrySig.OutputSignature, packing);
+    if (!EntrySig.OutputSignature.IsFullyAllocated()) {
+      dxilutil::EmitErrorOnFunction(HLM.GetModule()->getContext(), Entry,
+          "Failed to allocate all output signature elements in available space.");
+    }
   }
 
   if (props.shaderKind == DXIL::ShaderKind::Hull ||
-      props.shaderKind == DXIL::ShaderKind::Domain) {
-    hlsl::PackDxilSignature(EntrySig.PatchConstantSignature, packing);
-    if (!EntrySig.PatchConstantSignature.IsFullyAllocated()) {
-      HLM.GetCtx().emitError("Failed to allocate all patch constant signature "
+      props.shaderKind == DXIL::ShaderKind::Domain ||
+      props.shaderKind == DXIL::ShaderKind::Mesh) {
+    hlsl::PackDxilSignature(EntrySig.PatchConstOrPrimSignature, packing);
+    if (!EntrySig.PatchConstOrPrimSignature.IsFullyAllocated()) {
+      dxilutil::EmitErrorOnFunction(HLM.GetModule()->getContext(), Entry,
+                             "Failed to allocate all patch constant signature "
                              "elements in available space.");
     }
   }
@@ -494,7 +535,7 @@ void GenerateStOutput(Function *stOutput, MutableArrayRef<Value *> args,
 
 void replaceStWithStOutput(Function *stOutput, StoreInst *stInst,
                            Constant *OpArg, Constant *outputID, Value *idx,
-                           unsigned cols, bool bI1Cast) {
+                           unsigned cols, Value *vertexOrPrimID, bool bI1Cast) {
   IRBuilder<> Builder(stInst);
   Value *val = stInst->getValueOperand();
 
@@ -503,7 +544,9 @@ void replaceStWithStOutput(Function *stOutput, StoreInst *stInst,
     for (unsigned col = 0; col < cols; col++) {
       Value *subVal = Builder.CreateExtractElement(val, col);
       Value *colIdx = Builder.getInt8(col);
-      Value *args[] = {OpArg, outputID, idx, colIdx, subVal};
+      SmallVector<Value *, 4> args = {OpArg, outputID, idx, colIdx, subVal};
+      if (vertexOrPrimID)
+        args.emplace_back(vertexOrPrimID);
       GenerateStOutput(stOutput, args, Builder, bI1Cast);
     }
     // remove stInst
@@ -512,7 +555,9 @@ void replaceStWithStOutput(Function *stOutput, StoreInst *stInst,
     // TODO: support case cols not 1
     DXASSERT(cols == 1, "only support scalar here");
     Value *colIdx = Builder.getInt8(0);
-    Value *args[] = {OpArg, outputID, idx, colIdx, val};
+    SmallVector<Value *, 4> args = {OpArg, outputID, idx, colIdx, val};
+    if (vertexOrPrimID)
+      args.emplace_back(vertexOrPrimID);
     GenerateStOutput(stOutput, args, Builder, bI1Cast);
     // remove stInst
     stInst->eraseFromParent();
@@ -542,6 +587,7 @@ Value *GenerateLdInput(Function *loadInput, ArrayRef<Value *> args,
       return Builder.CreateZExt(bVal, Ty);
   }
 }
+
 
 Value *replaceLdWithLdInput(Function *loadInput, LoadInst *ldInst,
                             unsigned cols, MutableArrayRef<Value *> args,
@@ -608,6 +654,102 @@ Value *replaceLdWithLdInput(Function *loadInput, LoadInst *ldInst,
     }
   }
 }
+
+
+void replaceMatStWithStOutputs(CallInst *CI, HLMatLoadStoreOpcode matOp,
+                               Function *ldStFunc, Constant *OpArg, Constant *ID,
+                               Constant *columnConsts[],Value *vertexOrPrimID,
+                               Value *idxVal) {
+  IRBuilder<> LocalBuilder(CI);
+  Value *Val = CI->getArgOperand(HLOperandIndex::kMatStoreValOpIdx);
+  HLMatrixType MatTy = HLMatrixType::cast(
+                                          CI->getArgOperand(HLOperandIndex::kMatStoreDstPtrOpIdx)
+                                          ->getType()->getPointerElementType());
+
+  Val = MatTy.emitLoweredRegToMem(Val, LocalBuilder);
+
+  if (matOp == HLMatLoadStoreOpcode::ColMatStore) {
+    for (unsigned c = 0; c < MatTy.getNumColumns(); c++) {
+      Constant *constColIdx = LocalBuilder.getInt32(c);
+      Value *colIdx = LocalBuilder.CreateAdd(idxVal, constColIdx);
+
+      for (unsigned r = 0; r < MatTy.getNumRows(); r++) {
+        unsigned matIdx = MatTy.getColumnMajorIndex(r, c);
+        Value *Elt = LocalBuilder.CreateExtractElement(Val, matIdx);
+
+        SmallVector<Value*, 6> argList = {OpArg, ID, colIdx, columnConsts[r], Elt};
+        if (vertexOrPrimID)
+          argList.emplace_back(vertexOrPrimID);
+        LocalBuilder.CreateCall(ldStFunc, argList);
+      }
+    }
+  } else {
+    for (unsigned r = 0; r < MatTy.getNumRows(); r++) {
+      Constant *constRowIdx = LocalBuilder.getInt32(r);
+      Value *rowIdx = LocalBuilder.CreateAdd(idxVal, constRowIdx);
+      for (unsigned c = 0; c < MatTy.getNumColumns(); c++) {
+        unsigned matIdx = MatTy.getRowMajorIndex(r, c);
+        Value *Elt = LocalBuilder.CreateExtractElement(Val, matIdx);
+
+        SmallVector<Value*, 6> argList = {OpArg, ID, rowIdx, columnConsts[c], Elt};
+        if (vertexOrPrimID)
+          argList.emplace_back(vertexOrPrimID);
+        LocalBuilder.CreateCall(ldStFunc, argList);
+      }
+    }
+  }
+  CI->eraseFromParent();
+}
+
+
+void replaceMatLdWithLdInputs(CallInst *CI, HLMatLoadStoreOpcode matOp,
+                              Function *ldStFunc, Constant *OpArg, Constant *ID,
+                              Constant *columnConsts[],Value *vertexOrPrimID,
+                              Value *idxVal) {
+  IRBuilder<> LocalBuilder(CI);
+  HLMatrixType MatTy = HLMatrixType::cast(
+                                          CI->getArgOperand(HLOperandIndex::kMatLoadPtrOpIdx)
+                                          ->getType()->getPointerElementType());
+  std::vector<Value *> matElts(MatTy.getNumElements());
+
+  if (matOp == HLMatLoadStoreOpcode::ColMatLoad) {
+    for (unsigned c = 0; c < MatTy.getNumColumns(); c++) {
+      Constant *constRowIdx = LocalBuilder.getInt32(c);
+      Value *rowIdx = LocalBuilder.CreateAdd(idxVal, constRowIdx);
+      for (unsigned r = 0; r < MatTy.getNumRows(); r++) {
+        SmallVector<Value *, 4> args = { OpArg, ID, rowIdx, columnConsts[r] };
+        if (vertexOrPrimID)
+          args.emplace_back(vertexOrPrimID);
+
+        Value *input = LocalBuilder.CreateCall(ldStFunc, args);
+        unsigned matIdx = MatTy.getColumnMajorIndex(r, c);
+        matElts[matIdx] = input;
+      }
+    }
+  } else {
+    for (unsigned r = 0; r < MatTy.getNumRows(); r++) {
+      Constant *constRowIdx = LocalBuilder.getInt32(r);
+      Value *rowIdx = LocalBuilder.CreateAdd(idxVal, constRowIdx);
+      for (unsigned c = 0; c < MatTy.getNumColumns(); c++) {
+        SmallVector<Value *, 4> args = { OpArg, ID, rowIdx, columnConsts[c] };
+        if (vertexOrPrimID)
+          args.emplace_back(vertexOrPrimID);
+
+        Value *input = LocalBuilder.CreateCall(ldStFunc, args);
+        unsigned matIdx = MatTy.getRowMajorIndex(r, c);
+        matElts[matIdx] = input;
+      }
+    }
+  }
+
+  Value *newVec =
+    HLMatrixLower::BuildVector(matElts[0]->getType(), matElts, LocalBuilder);
+  newVec = MatTy.emitLoweredMemToReg(newVec, LocalBuilder);
+
+  CI->replaceAllUsesWith(newVec);
+  CI->eraseFromParent();
+}
+
 
 void replaceDirectInputParameter(Value *param, Function *loadInput,
                                  unsigned cols, MutableArrayRef<Value *> args,
@@ -706,22 +848,22 @@ void replaceDirectInputParameter(Value *param, Function *loadInput,
 struct InputOutputAccessInfo {
   // For input output which has only 1 row, idx is 0.
   Value *idx;
-  // VertexID for HS/DS/GS input.
-  Value *vertexID;
+  // VertexID for HS/DS/GS input, MS vertex output. PrimitiveID for MS primitive output
+  Value *vertexOrPrimID;
   // Vector index.
   Value *vectorIdx;
   // Load/Store/LoadMat/StoreMat on input/output.
   Instruction *user;
   InputOutputAccessInfo(Value *index, Instruction *I)
-      : idx(index), vertexID(nullptr), vectorIdx(nullptr), user(I) {}
+      : idx(index), vertexOrPrimID(nullptr), vectorIdx(nullptr), user(I) {}
   InputOutputAccessInfo(Value *index, Instruction *I, Value *ID, Value *vecIdx)
-      : idx(index), vertexID(ID), vectorIdx(vecIdx), user(I) {}
+      : idx(index), vertexOrPrimID(ID), vectorIdx(vecIdx), user(I) {}
 };
 
 void collectInputOutputAccessInfo(
     Value *GV, Constant *constZero,
-    std::vector<InputOutputAccessInfo> &accessInfoList, bool hasVertexID,
-    bool bInput, bool bRowMajor) {
+    std::vector<InputOutputAccessInfo> &accessInfoList, bool hasVertexOrPrimID,
+    bool bInput, bool bRowMajor, bool isMS) {
   // merge GEP use for input output.
   HLModule::MergeGepUse(GV);
   for (auto User = GV->user_begin(); User != GV->user_end();) {
@@ -743,15 +885,15 @@ void collectInputOutputAccessInfo(
       DXASSERT_LOCALVAR(idx, idx->get() == constZero,
                         "only support 0 offset for input pointer");
 
-      Value *vertexID = nullptr;
+      Value *vertexOrPrimID = nullptr;
       Value *vectorIdx = nullptr;
       gep_type_iterator GEPIt = gep_type_begin(GEP), E = gep_type_end(GEP);
 
       // Skip first pointer idx which must be 0.
       GEPIt++;
-      if (hasVertexID) {
-        // Save vertexID.
-        vertexID = GEPIt.getOperand();
+      if (hasVertexOrPrimID) {
+        // Save vertexOrPrimID.
+        vertexOrPrimID = GEPIt.getOperand();
         GEPIt++;
       }
       // Start from first index.
@@ -806,12 +948,12 @@ void collectInputOutputAccessInfo(
         auto GepUserIt = GepUser++;
         if (LoadInst *ldInst = dyn_cast<LoadInst>(*GepUserIt)) {
           if (bInput) {
-            InputOutputAccessInfo info = {idxVal, ldInst, vertexID, vectorIdx};
+            InputOutputAccessInfo info = {idxVal, ldInst, vertexOrPrimID, vectorIdx};
             accessInfoList.push_back(info);
           }
         } else if (StoreInst *stInst = dyn_cast<StoreInst>(*GepUserIt)) {
           if (!bInput) {
-            InputOutputAccessInfo info = {idxVal, stInst, vertexID, vectorIdx};
+            InputOutputAccessInfo info = {idxVal, stInst, vertexOrPrimID, vectorIdx};
             accessInfoList.push_back(info);
           }
         } else if (CallInst *CI = dyn_cast<CallInst>(*GepUserIt)) {
@@ -823,7 +965,7 @@ void collectInputOutputAccessInfo(
                opcode == HLMatLoadStoreOpcode::RowMatLoad)
                   ? bInput
                   : !bInput) {
-            InputOutputAccessInfo info = {idxVal, CI, vertexID, vectorIdx};
+            InputOutputAccessInfo info = {idxVal, CI, vertexOrPrimID, vectorIdx};
             accessInfoList.push_back(info);
           }
         } else {
@@ -842,17 +984,17 @@ void collectInputOutputAccessInfo(
 void GenerateInputOutputUserCall(InputOutputAccessInfo &info, Value *undefVertexIdx,
     Function *ldStFunc, Constant *OpArg, Constant *ID, unsigned cols, bool bI1Cast,
     Constant *columnConsts[],
-    bool bNeedVertexID, bool isArrayTy, bool bInput, bool bIsInout) {
+    bool bNeedVertexOrPrimID, bool isArrayTy, bool bInput, bool bIsInout) {
   Value *idxVal = info.idx;
-  Value *vertexID = undefVertexIdx;
-  if (bNeedVertexID && isArrayTy) {
-    vertexID = info.vertexID;
+  Value *vertexOrPrimID = undefVertexIdx;
+  if (bNeedVertexOrPrimID && isArrayTy) {
+    vertexOrPrimID = info.vertexOrPrimID;
   }
 
   if (LoadInst *ldInst = dyn_cast<LoadInst>(info.user)) {
     SmallVector<Value *, 4> args = {OpArg, ID, idxVal, info.vectorIdx};
-    if (vertexID)
-      args.emplace_back(vertexID);
+    if (vertexOrPrimID)
+      args.emplace_back(vertexOrPrimID);
 
     replaceLdWithLdInput(ldStFunc, ldInst, cols, args, bI1Cast);
   } else if (StoreInst *stInst = dyn_cast<StoreInst>(info.user)) {
@@ -861,7 +1003,7 @@ void GenerateInputOutputUserCall(InputOutputAccessInfo &info, Value *undefVertex
     } else {
       if (!info.vectorIdx) {
         replaceStWithStOutput(ldStFunc, stInst, OpArg, ID, idxVal, cols,
-                              bI1Cast);
+                              vertexOrPrimID, bI1Cast);
       } else {
         Value *V = stInst->getValueOperand();
         Type *Ty = V->getType();
@@ -873,7 +1015,9 @@ void GenerateInputOutputUserCall(InputOutputAccessInfo &info, Value *undefVertex
           if (ColIdx->getType()->getBitWidth() != 8) {
             ColIdx = Builder.getInt8(ColIdx->getValue().getLimitedValue());
           }
-          Value *args[] = {OpArg, ID, idxVal, ColIdx, V};
+          SmallVector<Value *, 6> args = {OpArg, ID, idxVal, ColIdx, V};
+          if (vertexOrPrimID)
+            args.emplace_back(vertexOrPrimID);
           GenerateStOutput(ldStFunc, args, Builder, bI1Cast);
         } else {
           BasicBlock *BB = stInst->getParent();
@@ -894,7 +1038,9 @@ void GenerateInputOutputUserCall(InputOutputAccessInfo &info, Value *undefVertex
 
             ConstantInt *CaseIdx = SwitchBuilder.getInt8(i);
 
-            Value *args[] = {OpArg, ID, idxVal, CaseIdx, V};
+            SmallVector<Value *, 6> args = {OpArg, ID, idxVal, CaseIdx, V};
+            if (vertexOrPrimID)
+              args.emplace_back(vertexOrPrimID);
             GenerateStOutput(ldStFunc, args, CaseBuilder, bI1Cast);
 
             CaseBuilder.CreateBr(EndBB);
@@ -907,7 +1053,7 @@ void GenerateInputOutputUserCall(InputOutputAccessInfo &info, Value *undefVertex
   } else if (CallInst *CI = dyn_cast<CallInst>(info.user)) {
     HLOpcodeGroup group = GetHLOpcodeGroupByName(CI->getCalledFunction());
     // Intrinsic will be translated later.
-    if (group == HLOpcodeGroup::HLIntrinsic)
+    if (group == HLOpcodeGroup::HLIntrinsic || group == HLOpcodeGroup::NotHL)
       return;
     unsigned opcode = GetHLOpcode(CI);
     DXASSERT_NOMSG(group == HLOpcodeGroup::HLMatLoadStore);
@@ -915,84 +1061,11 @@ void GenerateInputOutputUserCall(InputOutputAccessInfo &info, Value *undefVertex
     switch (matOp) {
     case HLMatLoadStoreOpcode::ColMatLoad:
     case HLMatLoadStoreOpcode::RowMatLoad: {
-      IRBuilder<> LocalBuilder(CI);
-      HLMatrixType MatTy = HLMatrixType::cast(
-        CI->getArgOperand(HLOperandIndex::kMatLoadPtrOpIdx)
-          ->getType()->getPointerElementType());
-      std::vector<Value *> matElts(MatTy.getNumElements());
-
-      if (matOp == HLMatLoadStoreOpcode::ColMatLoad) {
-        for (unsigned c = 0; c < MatTy.getNumColumns(); c++) {
-          Constant *constRowIdx = LocalBuilder.getInt32(c);
-          Value *rowIdx = LocalBuilder.CreateAdd(idxVal, constRowIdx);
-          for (unsigned r = 0; r < MatTy.getNumRows(); r++) {
-            SmallVector<Value *, 4> args = { OpArg, ID, rowIdx, columnConsts[r] };
-            if (vertexID)
-              args.emplace_back(vertexID);
-
-            Value *input = LocalBuilder.CreateCall(ldStFunc, args);
-            unsigned matIdx = MatTy.getColumnMajorIndex(r, c);
-            matElts[matIdx] = input;
-          }
-        }
-      } else {
-        for (unsigned r = 0; r < MatTy.getNumRows(); r++) {
-          Constant *constRowIdx = LocalBuilder.getInt32(r);
-          Value *rowIdx = LocalBuilder.CreateAdd(idxVal, constRowIdx);
-          for (unsigned c = 0; c < MatTy.getNumColumns(); c++) {
-            SmallVector<Value *, 4> args = { OpArg, ID, rowIdx, columnConsts[c] };
-            if (vertexID)
-              args.emplace_back(vertexID);
-
-            Value *input = LocalBuilder.CreateCall(ldStFunc, args);
-            unsigned matIdx = MatTy.getRowMajorIndex(r, c);
-            matElts[matIdx] = input;
-          }
-        }
-      }
-
-      Value *newVec =
-          HLMatrixLower::BuildVector(matElts[0]->getType(), matElts, LocalBuilder);
-      newVec = MatTy.emitLoweredMemToReg(newVec, LocalBuilder);
-
-      CI->replaceAllUsesWith(newVec);
-      CI->eraseFromParent();
+      replaceMatLdWithLdInputs(CI, matOp, ldStFunc, OpArg, ID, columnConsts, vertexOrPrimID, idxVal);
     } break;
     case HLMatLoadStoreOpcode::ColMatStore:
     case HLMatLoadStoreOpcode::RowMatStore: {
-      IRBuilder<> LocalBuilder(CI);
-      Value *Val = CI->getArgOperand(HLOperandIndex::kMatStoreValOpIdx);
-      HLMatrixType MatTy = HLMatrixType::cast(
-        CI->getArgOperand(HLOperandIndex::kMatStoreDstPtrOpIdx)
-          ->getType()->getPointerElementType());
-
-      Val = MatTy.emitLoweredRegToMem(Val, LocalBuilder);
-
-      if (matOp == HLMatLoadStoreOpcode::ColMatStore) {
-        for (unsigned c = 0; c < MatTy.getNumColumns(); c++) {
-          Constant *constColIdx = LocalBuilder.getInt32(c);
-          Value *colIdx = LocalBuilder.CreateAdd(idxVal, constColIdx);
-
-          for (unsigned r = 0; r < MatTy.getNumRows(); r++) {
-            unsigned matIdx = MatTy.getColumnMajorIndex(r, c);
-            Value *Elt = LocalBuilder.CreateExtractElement(Val, matIdx);
-            LocalBuilder.CreateCall(ldStFunc,
-              { OpArg, ID, colIdx, columnConsts[r], Elt });
-          }
-        }
-      } else {
-        for (unsigned r = 0; r < MatTy.getNumRows(); r++) {
-          Constant *constRowIdx = LocalBuilder.getInt32(r);
-          Value *rowIdx = LocalBuilder.CreateAdd(idxVal, constRowIdx);
-          for (unsigned c = 0; c < MatTy.getNumColumns(); c++) {
-            unsigned matIdx = MatTy.getRowMajorIndex(r, c);
-            Value *Elt = LocalBuilder.CreateExtractElement(Val, matIdx);
-            LocalBuilder.CreateCall(ldStFunc,
-              { OpArg, ID, rowIdx, columnConsts[c], Elt });
-          }
-        }
-      }
-      CI->eraseFromParent();
+      replaceMatStWithStOutputs(CI, matOp, ldStFunc, OpArg, ID, columnConsts, vertexOrPrimID, idxVal);
     } break;
     }
   } else {
@@ -1003,20 +1076,39 @@ void GenerateInputOutputUserCall(InputOutputAccessInfo &info, Value *undefVertex
 } // namespace
 
 void HLSignatureLower::GenerateDxilInputs() {
-  GenerateDxilInputsOutputs(/*bInput*/ true);
+  GenerateDxilInputsOutputs(DXIL::SignatureKind::Input);
 }
 
 void HLSignatureLower::GenerateDxilOutputs() {
-  GenerateDxilInputsOutputs(/*bInput*/ false);
+  GenerateDxilInputsOutputs(DXIL::SignatureKind::Output);
 }
 
-void HLSignatureLower::GenerateDxilInputsOutputs(bool bInput) {
+void HLSignatureLower::GenerateDxilPrimOutputs() {
+  GenerateDxilInputsOutputs(DXIL::SignatureKind::PatchConstOrPrim);
+}
+
+void HLSignatureLower::GenerateDxilInputsOutputs(DXIL::SignatureKind SK) {
   OP *hlslOP = HLM.GetOP();
   DxilFunctionProps &props = HLM.GetDxilFunctionProps(Entry);
   Module &M = *(HLM.GetModule());
 
-  OP::OpCode opcode = bInput ? OP::OpCode::LoadInput : OP::OpCode::StoreOutput;
-  bool bNeedVertexID = bInput && (props.IsGS() || props.IsDS() || props.IsHS());
+  OP::OpCode opcode = (OP::OpCode)-1;
+  switch (SK) {
+  case DXIL::SignatureKind::Input:
+    opcode = OP::OpCode::LoadInput;
+    break;
+  case DXIL::SignatureKind::Output:
+    opcode = props.IsMS() ? OP::OpCode::StoreVertexOutput : OP::OpCode::StoreOutput;
+    break;
+  case DXIL::SignatureKind::PatchConstOrPrim:
+    opcode = OP::OpCode::StorePrimitiveOutput;
+    break;
+  default:
+    DXASSERT_NOMSG(0);
+  }
+  bool bInput = SK == DXIL::SignatureKind::Input;
+  bool bNeedVertexOrPrimID = bInput && (props.IsGS() || props.IsDS() || props.IsHS());
+  bNeedVertexOrPrimID |= !bInput && props.IsMS();
 
   Constant *OpArg = hlslOP->GetU32Const((unsigned)opcode);
 
@@ -1030,10 +1122,12 @@ void HLSignatureLower::GenerateDxilInputsOutputs(bool bInput) {
 
   Constant *constZero = hlslOP->GetU32Const(0);
 
-  Value *undefVertexIdx = UndefValue::get(Type::getInt32Ty(HLM.GetCtx()));
+  Value *undefVertexIdx = props.IsMS() || !bInput ? nullptr : UndefValue::get(Type::getInt32Ty(HLM.GetCtx()));
 
   DxilSignature &Sig =
-      bInput ? EntrySig.InputSignature : EntrySig.OutputSignature;
+      bInput ? EntrySig.InputSignature :
+      SK == DXIL::SignatureKind::Output ? EntrySig.OutputSignature :
+      EntrySig.PatchConstOrPrimSignature;
 
   DxilTypeSystem &typeSys = HLM.GetTypeSystem();
   DxilFunctionAnnotation *pFuncAnnot = typeSys.GetFunctionAnnotation(Entry);
@@ -1058,7 +1152,7 @@ void HLSignatureLower::GenerateDxilInputsOutputs(bool bInput) {
       OSS << "(type for " << SE->GetName() << ")";
       OSS << " cannot be used as shader inputs or outputs.";
       OSS.flush();
-      HLM.GetCtx().emitError(O);
+      dxilutil::EmitErrorOnFunction(M.getContext(), Entry, O);
       continue;
     }
     Function *dxilFunc = hlslOP->GetOpFunc(opcode, Ty);
@@ -1083,9 +1177,9 @@ void HLSignatureLower::GenerateDxilInputsOutputs(bool bInput) {
 
     if (!GV->getType()->isPointerTy()) {
       DXASSERT(bInput, "direct parameter must be input");
-      Value *vertexID = undefVertexIdx;
+      Value *vertexOrPrimID = undefVertexIdx;
       Value *args[] = {OpArg, ID, /*rowIdx*/ constZero, /*colIdx*/ nullptr,
-                       vertexID};
+                       vertexOrPrimID};
       replaceDirectInputParameter(GV, dxilFunc, cols, args, bI1Cast, hlslOP,
                                   EntryBuilder);
       continue;
@@ -1106,11 +1200,11 @@ void HLSignatureLower::GenerateDxilInputsOutputs(bool bInput) {
     }
     std::vector<InputOutputAccessInfo> accessInfoList;
     collectInputOutputAccessInfo(GV, constZero, accessInfoList,
-                                 bNeedVertexID && bIsArrayTy, bInput, bRowMajor);
+                                 bNeedVertexOrPrimID && bIsArrayTy, bInput, bRowMajor, props.IsMS());
 
     for (InputOutputAccessInfo &info : accessInfoList) {
       GenerateInputOutputUserCall(info, undefVertexIdx, dxilFunc, OpArg, ID,
-                                  cols, bI1Cast, columnConsts, bNeedVertexID,
+                                  cols, bI1Cast, columnConsts, bNeedVertexOrPrimID,
                                   bIsArrayTy, bInput, bIsInout);
     }
   }
@@ -1129,9 +1223,9 @@ void HLSignatureLower::GenerateDxilCSInputs() {
 
     llvm::StringRef semanticStr = paramAnnotation.GetSemanticString();
     if (semanticStr.empty()) {
-      Entry->getContext().emitError("Semantic must be defined for all "
+      dxilutil::EmitErrorOnFunction(HLM.GetModule()->getContext(), Entry, "Semantic must be defined for all "
                                     "parameters of an entry function or patch "
-                                    "constant function");
+                                    "constant function.");
       return;
     }
 
@@ -1154,26 +1248,28 @@ void HLSignatureLower::GenerateDxilCSInputs() {
     default:
       DXASSERT(semantic->IsInvalid(),
                "else compute shader semantics out-of-date");
-      Entry->getContext().emitError("invalid semantic found in CS");
+      dxilutil::EmitErrorOnFunction(HLM.GetModule()->getContext(), Entry, "invalid semantic found in CS");
       return;
     }
 
     Constant *OpArg = hlslOP->GetU32Const((unsigned)opcode);
-    Type *Ty = arg.getType();
-    if (Ty->isPointerTy())
-      Ty = Ty->getPointerElementType();
-    Function *dxilFunc = hlslOP->GetOpFunc(opcode, Ty->getScalarType());
+    Type *NumTy = arg.getType();
+    DXASSERT(!NumTy->isPointerTy(), "Unexpected byref value for CS SV_***ID semantic.");
+    DXASSERT(NumTy->getScalarType()->isIntegerTy(), "Unexpected non-integer value for CS SV_***ID semantic.");
+
+    // Always use the i32 overload of those intrinsics, and then cast as needed
+    Function *dxilFunc = hlslOP->GetOpFunc(opcode, Builder.getInt32Ty());
     Value *newArg = nullptr;
     if (opcode == OP::OpCode::FlattenedThreadIdInGroup) {
       newArg = Builder.CreateCall(dxilFunc, {OpArg});
     } else {
       unsigned vecSize = 1;
-      if (Ty->isVectorTy())
-        vecSize = Ty->getVectorNumElements();
+      if (NumTy->isVectorTy())
+        vecSize = NumTy->getVectorNumElements();
 
       newArg = Builder.CreateCall(dxilFunc, {OpArg, hlslOP->GetU32Const(0)});
       if (vecSize > 1) {
-        Value *result = UndefValue::get(Ty);
+        Value *result = UndefValue::get(VectorType::get(Builder.getInt32Ty(), vecSize));
         result = Builder.CreateInsertElement(result, newArg, (uint64_t)0);
 
         for (unsigned i = 1; i < vecSize; i++) {
@@ -1184,6 +1280,11 @@ void HLSignatureLower::GenerateDxilCSInputs() {
         newArg = result;
       }
     }
+
+    // If the argument is of non-i32 type, convert here
+    if (newArg->getType() != NumTy)
+      newArg = Builder.CreateZExtOrTrunc(newArg, NumTy);
+
     if (newArg->getType() != arg.getType()) {
       DXASSERT_NOMSG(arg.getType()->isPointerTy());
       for (User *U : arg.users()) {
@@ -1201,14 +1302,14 @@ void HLSignatureLower::GenerateDxilPatchConstantLdSt() {
   DxilFunctionProps &props = HLM.GetDxilFunctionProps(Entry);
   Module &M = *(HLM.GetModule());
   Constant *constZero = hlslOP->GetU32Const(0);
-  DxilSignature &Sig = EntrySig.PatchConstantSignature;
+  DxilSignature &Sig = EntrySig.PatchConstOrPrimSignature;
   DxilTypeSystem &typeSys = HLM.GetTypeSystem();
   DxilFunctionAnnotation *pFuncAnnot = typeSys.GetFunctionAnnotation(Entry);
   auto InsertPt = Entry->getEntryBlock().getFirstInsertionPt();
   const bool bIsHs = props.IsHS();
   const bool bIsInput = !bIsHs;
   const bool bIsInout = false;
-  const bool bNeedVertexID = false;
+  const bool bNeedVertexOrPrimID = false;
   if (bIsHs) {
     DxilFunctionProps &EntryQual = HLM.GetDxilFunctionProps(Entry);
     Function *patchConstantFunc = EntryQual.ShaderProps.HS.patchConstantFunc;
@@ -1277,8 +1378,8 @@ void HLSignatureLower::GenerateDxilPatchConstantLdSt() {
       }
     }
     std::vector<InputOutputAccessInfo> accessInfoList;
-    collectInputOutputAccessInfo(GV, constZero, accessInfoList, bNeedVertexID,
-                                 bIsInput, bRowMajor);
+    collectInputOutputAccessInfo(GV, constZero, accessInfoList, bNeedVertexOrPrimID,
+                                 bIsInput, bRowMajor, false);
 
     bool bIsArrayTy = GV->getType()->getPointerElementType()->isArrayTy();
     bool isPrecise = m_preciseSigSet.count(SE);
@@ -1287,7 +1388,7 @@ void HLSignatureLower::GenerateDxilPatchConstantLdSt() {
 
     for (InputOutputAccessInfo &info : accessInfoList) {
       GenerateInputOutputUserCall(info, undefVertexIdx, dxilFunc, OpArg, ID,
-                                  cols, bI1Cast, columnConsts, bNeedVertexID,
+                                  cols, bI1Cast, columnConsts, bNeedVertexOrPrimID,
                                   bIsArrayTy, bIsInput, bIsInout);
     }
   }
@@ -1308,6 +1409,14 @@ void HLSignatureLower::GenerateDxilPatchConstantFunctionInputs() {
            "must find annotation for patch constant function");
   Type *i1Ty = Type::getInt1Ty(constZero->getContext());
   Type *i32Ty = constZero->getType();
+
+  Constant *columnConsts[] = {
+      hlslOP->GetU8Const(0),  hlslOP->GetU8Const(1),  hlslOP->GetU8Const(2),
+      hlslOP->GetU8Const(3),  hlslOP->GetU8Const(4),  hlslOP->GetU8Const(5),
+      hlslOP->GetU8Const(6),  hlslOP->GetU8Const(7),  hlslOP->GetU8Const(8),
+      hlslOP->GetU8Const(9),  hlslOP->GetU8Const(10), hlslOP->GetU8Const(11),
+      hlslOP->GetU8Const(12), hlslOP->GetU8Const(13), hlslOP->GetU8Const(14),
+      hlslOP->GetU8Const(15)};
 
   for (Argument &arg : patchConstantFunc->args()) {
     DxilParameterAnnotation &paramAnnotation =
@@ -1343,13 +1452,23 @@ void HLSignatureLower::GenerateDxilPatchConstantFunctionInputs() {
       }
       std::vector<InputOutputAccessInfo> accessInfoList;
       collectInputOutputAccessInfo(&arg, constZero, accessInfoList,
-                                   /*hasVertexID*/ true, true, bRowMajor);
+                                   /*hasVertexOrPrimID*/ true, true, bRowMajor, false);
       for (InputOutputAccessInfo &info : accessInfoList) {
+        Constant *OpArg = hlslOP->GetU32Const((unsigned)opcode);
         if (LoadInst *ldInst = dyn_cast<LoadInst>(info.user)) {
-          Constant *OpArg = hlslOP->GetU32Const((unsigned)opcode);
           Value *args[] = {OpArg, inputID, info.idx, info.vectorIdx,
-                           info.vertexID};
+                           info.vertexOrPrimID};
           replaceLdWithLdInput(dxilLdFunc, ldInst, cols, args, bI1Cast);
+        } else if (CallInst *CI = dyn_cast<CallInst>(info.user)) {
+          HLOpcodeGroup group = GetHLOpcodeGroupByName(CI->getCalledFunction());
+          // Intrinsic will be translated later.
+          if (group == HLOpcodeGroup::HLIntrinsic || group == HLOpcodeGroup::NotHL)
+            return;
+          unsigned opcode = GetHLOpcode(CI);
+          DXASSERT_NOMSG(group == HLOpcodeGroup::HLMatLoadStore);
+          HLMatLoadStoreOpcode matOp = static_cast<HLMatLoadStoreOpcode>(opcode);
+          if (matOp == HLMatLoadStoreOpcode::ColMatLoad || matOp == HLMatLoadStoreOpcode::RowMatLoad)
+            replaceMatLdWithLdInputs(CI, matOp, dxilLdFunc, OpArg, inputID, columnConsts, info.vertexOrPrimID, info.idx);
         } else {
           DXASSERT(0, "input should only be ld");
         }
@@ -1476,6 +1595,9 @@ void HLSignatureLower::GenerateStreamOutputOperation(Value *streamVal, unsigned 
     // Should only used by append, restartStrip .
     CallInst *CI = cast<CallInst>(user);
     HLOpcodeGroup group = GetHLOpcodeGroupByName(CI->getCalledFunction());
+    // Ignore user functions.
+    if (group == HLOpcodeGroup::NotHL)
+      continue;
     unsigned opcode = GetHLOpcode(CI);
     DXASSERT_LOCALVAR(group, group == HLOpcodeGroup::HLIntrinsic, "Must be HLIntrinsic here");
     IntrinsicOp IOP = static_cast<IntrinsicOp>(opcode);
@@ -1524,10 +1646,87 @@ void HLSignatureLower::GenerateStreamOutputOperations() {
     }
   }
 }
+// Generate DXIL EmitIndices operation.
+void HLSignatureLower::GenerateEmitIndicesOperation(Value *indicesOutput) {
+  OP * hlslOP = HLM.GetOP();
+  Function *DxilFunc = hlslOP->GetOpFunc(OP::OpCode::EmitIndices, Type::getVoidTy(indicesOutput->getContext()));
+  Constant *opArg = hlslOP->GetU32Const((unsigned)OP::OpCode::EmitIndices);
+
+  for (auto U = indicesOutput->user_begin(); U != indicesOutput->user_end();) {
+    Value *user = *(U++);
+    GetElementPtrInst *GEP = cast<GetElementPtrInst>(user);
+    auto idx = GEP->idx_begin();
+    DXASSERT_LOCALVAR(idx, idx->get() == hlslOP->GetU32Const(0),
+                      "only support 0 offset for input pointer");
+    gep_type_iterator GEPIt = gep_type_begin(GEP), E = gep_type_end(GEP);
+
+    // Skip first pointer idx which must be 0.
+    GEPIt++;
+    Value *primIdx = GEPIt.getOperand();
+    DXASSERT(++GEPIt == E, "invalid GEP here"); (void)E;
+
+    auto GepUser = GEP->user_begin();
+    auto GepUserE = GEP->user_end();
+    for (; GepUser != GepUserE;) {
+      auto GepUserIt = GepUser++;
+      StoreInst *stInst = cast<StoreInst>(*GepUserIt);
+      Value *stVal = stInst->getValueOperand();
+      VectorType *VT = cast<VectorType>(stVal->getType());
+      unsigned eleCount = VT->getNumElements();
+      IRBuilder<> Builder(stInst);
+      Value *subVal0 = Builder.CreateExtractElement(stVal, hlslOP->GetU32Const(0));
+      Value *subVal1 = Builder.CreateExtractElement(stVal, hlslOP->GetU32Const(1));
+      Value *subVal2 = eleCount == 3 ?
+        Builder.CreateExtractElement(stVal, hlslOP->GetU32Const(2)) : hlslOP->GetU32Const(0);
+      Value *args[] = { opArg, primIdx, subVal0, subVal1, subVal2 };
+      Builder.CreateCall(DxilFunc, args);
+      stInst->eraseFromParent();
+    }
+    GEP->eraseFromParent();
+  }
+}
+// Generate DXIL EmitIndices operations.
+void HLSignatureLower::GenerateEmitIndicesOperations() {
+  DxilFunctionAnnotation *EntryAnnotation = HLM.GetFunctionAnnotation(Entry);
+  DXASSERT(EntryAnnotation, "must find annotation for entry function");
+
+  for (Argument &arg : Entry->getArgumentList()) {
+    DxilParameterAnnotation &paramAnnotation =
+      EntryAnnotation->GetParameterAnnotation(arg.getArgNo());
+    DxilParamInputQual inputQual = paramAnnotation.GetParamInputQual();
+    if (inputQual == DxilParamInputQual::OutIndices) {
+      GenerateEmitIndicesOperation(&arg);
+    }
+  }
+}
+// Generate DXIL GetMeshPayload operation.
+void HLSignatureLower::GenerateGetMeshPayloadOperation() {
+  DxilFunctionAnnotation *EntryAnnotation = HLM.GetFunctionAnnotation(Entry);
+  DXASSERT(EntryAnnotation, "must find annotation for entry function");
+
+  for (Argument &arg : Entry->getArgumentList()) {
+    DxilParameterAnnotation &paramAnnotation =
+      EntryAnnotation->GetParameterAnnotation(arg.getArgNo());
+    DxilParamInputQual inputQual = paramAnnotation.GetParamInputQual();
+    if (inputQual == DxilParamInputQual::InPayload) {
+      OP * hlslOP = HLM.GetOP();
+      Function *DxilFunc = hlslOP->GetOpFunc(OP::OpCode::GetMeshPayload, arg.getType());
+      Constant *opArg = hlslOP->GetU32Const((unsigned)OP::OpCode::GetMeshPayload);
+      IRBuilder<> Builder(arg.getParent()->getEntryBlock().getFirstInsertionPt());
+      Value *args[] = { opArg };
+      Value *payload = Builder.CreateCall(DxilFunc, args);
+      arg.replaceAllUsesWith(payload);
+    }
+  }
+}
 // Lower signatures.
 void HLSignatureLower::Run() {
   DxilFunctionProps &props = HLM.GetDxilFunctionProps(Entry);
   if (props.IsGraphics()) {
+    if (props.IsMS()) {
+      GenerateEmitIndicesOperations();
+      GenerateGetMeshPayloadOperation();
+    }
     CreateDxilSignatures();
 
     // Allocate input output.
@@ -1535,6 +1734,9 @@ void HLSignatureLower::Run() {
 
     GenerateDxilInputs();
     GenerateDxilOutputs();
+    if (props.IsMS()) {
+      GenerateDxilPrimOutputs();
+    }
   } else if (props.IsCS()) {
     GenerateDxilCSInputs();
   }

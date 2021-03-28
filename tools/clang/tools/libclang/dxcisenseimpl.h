@@ -37,13 +37,12 @@ private:
   CXCursor m_cursor;
 public:
   DXC_MICROCOM_TM_ADDREF_RELEASE_IMPL()
+  DXC_MICROCOM_TM_CTOR(DxcCursor)
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** ppvObject) override
   {
     return DoBasicQueryInterface<IDxcCursor>(this, iid, ppvObject);
   }
 
-  DxcCursor();
-  ~DxcCursor();
   void Initialize(const CXCursor& cursor);
   static HRESULT Create(const CXCursor& cursor, _Outptr_result_nullonfailure_ IDxcCursor** pObject);
 
@@ -86,12 +85,13 @@ private:
   CXDiagnostic m_diagnostic;
 public:
   DXC_MICROCOM_TM_ADDREF_RELEASE_IMPL()
+  DXC_MICROCOM_TM_ALLOC(DxcDiagnostic)
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** ppvObject) override
   {
     return DoBasicQueryInterface<IDxcDiagnostic>(this, iid, ppvObject);
   }
 
-  DxcDiagnostic();
+  DxcDiagnostic(IMalloc *pMalloc);
   ~DxcDiagnostic();
   void Initialize(const CXDiagnostic& diagnostic);
   static HRESULT Create(const CXDiagnostic& diagnostic, _Outptr_result_nullonfailure_ IDxcDiagnostic** pObject);
@@ -117,13 +117,12 @@ private:
   CXFile m_file;
 public:
   DXC_MICROCOM_TM_ADDREF_RELEASE_IMPL()
+  DXC_MICROCOM_TM_CTOR(DxcFile)
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** ppvObject) override
   {
     return DoBasicQueryInterface<IDxcFile>(this, iid, ppvObject);
   }
 
-  DxcFile();
-  ~DxcFile();
   void Initialize(const CXFile& file);
   static HRESULT Create(const CXFile& file, _Outptr_result_nullonfailure_ IDxcFile** pObject);
 
@@ -142,12 +141,13 @@ private:
   unsigned m_locationLength;
 public:
   DXC_MICROCOM_TM_ADDREF_RELEASE_IMPL()
+  DXC_MICROCOM_TM_ALLOC(DxcInclusion)
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** ppvObject) override
   {
     return DoBasicQueryInterface<IDxcInclusion>(this, iid, ppvObject);
   }
 
-  DxcInclusion();
+  DxcInclusion(IMalloc *pMalloc);
   ~DxcInclusion();
   HRESULT Initialize(CXFile file, unsigned locations, _In_count_(locations) CXSourceLocation *pLocation);
   static HRESULT Create(CXFile file, unsigned locations, _In_count_(locations) CXSourceLocation *pLocation, _COM_Outptr_ IDxcInclusion **pResult);
@@ -166,12 +166,13 @@ private:
     hlsl::DxcLangExtensionsHelper m_langHelper;
 public:
     DXC_MICROCOM_TM_ADDREF_RELEASE_IMPL()
+    DXC_MICROCOM_TM_ALLOC(DxcIndex)
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** ppvObject) override
     {
       return DoBasicQueryInterface<IDxcIndex>(this, iid, ppvObject);
     }
 
-    DxcIndex();
+    DxcIndex(IMalloc *pMalloc);
     ~DxcIndex();
     HRESULT Initialize(hlsl::DxcLangExtensionsHelper& langHelper);
     static HRESULT Create(hlsl::DxcLangExtensionsHelper& langHelper, _Outptr_result_nullonfailure_ DxcIndex** index);
@@ -188,35 +189,35 @@ public:
       _Outptr_result_nullonfailure_ IDxcTranslationUnit** pTranslationUnit) override;
 };
 
-class DxcIntelliSense : public IDxcIntelliSense, public IDxcLangExtensions {
+class DxcIntelliSense : public IDxcIntelliSense, public IDxcLangExtensions2 {
 private:
   DXC_MICROCOM_TM_REF_FIELDS()
   hlsl::DxcLangExtensionsHelper m_langHelper;
 
 public:
   DXC_MICROCOM_TM_ADDREF_RELEASE_IMPL();
+  DXC_MICROCOM_TM_CTOR(DxcIntelliSense)
   DXC_LANGEXTENSIONS_HELPER_IMPL(m_langHelper);
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **ppvObject) override {
-    return DoBasicQueryInterface<IDxcIntelliSense, IDxcLangExtensions>(
+    return DoBasicQueryInterface<IDxcIntelliSense, IDxcLangExtensions,
+                                 IDxcLangExtensions2>(
         this, iid, ppvObject);
   }
 
-  DxcIntelliSense(IMalloc *pMalloc);
-
-    HRESULT STDMETHODCALLTYPE CreateIndex(_Outptr_result_nullonfailure_ IDxcIndex** index) override;
-    HRESULT STDMETHODCALLTYPE GetNullLocation(_Outptr_result_nullonfailure_ IDxcSourceLocation** location) override;
-    HRESULT STDMETHODCALLTYPE GetNullRange(_Outptr_result_nullonfailure_ IDxcSourceRange** location) override;
-    HRESULT STDMETHODCALLTYPE GetRange(
-      _In_ IDxcSourceLocation* start,
-      _In_ IDxcSourceLocation* end,
-      _Outptr_result_nullonfailure_ IDxcSourceRange** location) override;
-    HRESULT STDMETHODCALLTYPE GetDefaultDiagnosticDisplayOptions(
-      _Out_ DxcDiagnosticDisplayOptions* pValue) override;
-    HRESULT STDMETHODCALLTYPE GetDefaultEditingTUOptions(_Out_ DxcTranslationUnitFlags* pValue) override;
-    HRESULT STDMETHODCALLTYPE CreateUnsavedFile(
-      _In_ LPCSTR fileName, _In_ LPCSTR contents, unsigned contentLength,
-      _Outptr_result_nullonfailure_ IDxcUnsavedFile** pResult) override;
+  HRESULT STDMETHODCALLTYPE CreateIndex(_Outptr_result_nullonfailure_ IDxcIndex** index) override;
+  HRESULT STDMETHODCALLTYPE GetNullLocation(_Outptr_result_nullonfailure_ IDxcSourceLocation** location) override;
+  HRESULT STDMETHODCALLTYPE GetNullRange(_Outptr_result_nullonfailure_ IDxcSourceRange** location) override;
+  HRESULT STDMETHODCALLTYPE GetRange(
+    _In_ IDxcSourceLocation* start,
+    _In_ IDxcSourceLocation* end,
+    _Outptr_result_nullonfailure_ IDxcSourceRange** location) override;
+  HRESULT STDMETHODCALLTYPE GetDefaultDiagnosticDisplayOptions(
+    _Out_ DxcDiagnosticDisplayOptions* pValue) override;
+  HRESULT STDMETHODCALLTYPE GetDefaultEditingTUOptions(_Out_ DxcTranslationUnitFlags* pValue) override;
+  HRESULT STDMETHODCALLTYPE CreateUnsavedFile(
+    _In_ LPCSTR fileName, _In_ LPCSTR contents, unsigned contentLength,
+    _Outptr_result_nullonfailure_ IDxcUnsavedFile** pResult) override;
 };
 
 class DxcSourceLocation : public IDxcSourceLocation
@@ -226,13 +227,12 @@ private:
   CXSourceLocation m_location;
 public:
   DXC_MICROCOM_TM_ADDREF_RELEASE_IMPL()
+  DXC_MICROCOM_TM_CTOR(DxcSourceLocation)
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** ppvObject) override
   {
     return DoBasicQueryInterface<IDxcSourceLocation>(this, iid, ppvObject);
   }
 
-  DxcSourceLocation();
-  ~DxcSourceLocation();
   void Initialize(const CXSourceLocation& location);
   static HRESULT Create(const CXSourceLocation& location, _Outptr_result_nullonfailure_ IDxcSourceLocation** pObject);
 
@@ -244,6 +244,10 @@ public:
     _Out_opt_ unsigned* pCol,
     _Out_opt_ unsigned* pOffset) override;
   HRESULT STDMETHODCALLTYPE IsNull(_Out_ BOOL* pResult) override;
+  HRESULT STDMETHODCALLTYPE GetPresumedLocation(
+    _Outptr_opt_ LPSTR* pFilename,
+    _Out_opt_ unsigned* pLine,
+    _Out_opt_ unsigned* pCol) override;
 };
 
 class DxcSourceRange : public IDxcSourceRange
@@ -253,13 +257,12 @@ private:
   CXSourceRange m_range;
 public:
   DXC_MICROCOM_TM_ADDREF_RELEASE_IMPL()
+  DXC_MICROCOM_TM_CTOR(DxcSourceRange)
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** ppvObject) override
   {
     return DoBasicQueryInterface<IDxcSourceRange>(this, iid, ppvObject);
   }
 
-  DxcSourceRange();
-  ~DxcSourceRange();
   void Initialize(const CXSourceRange& range);
   static HRESULT Create(const CXSourceRange& range, _Outptr_result_nullonfailure_ IDxcSourceRange** pObject);
 
@@ -278,13 +281,12 @@ private:
   CXTranslationUnit m_tu;
 public:
   DXC_MICROCOM_TM_ADDREF_RELEASE_IMPL()
+  DXC_MICROCOM_TM_CTOR(DxcToken)
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** ppvObject) override
   {
     return DoBasicQueryInterface<IDxcToken>(this, iid, ppvObject);
   }
 
-  DxcToken();
-  ~DxcToken();
   void Initialize(const CXTranslationUnit& tu, const CXToken& token);
   static HRESULT Create(const CXTranslationUnit& tu, const CXToken& token, _Outptr_result_nullonfailure_ IDxcToken** pObject);
 
@@ -301,12 +303,13 @@ private:
     CXTranslationUnit m_tu;
 public:
     DXC_MICROCOM_TM_ADDREF_RELEASE_IMPL()
+    DXC_MICROCOM_TM_ALLOC(DxcTranslationUnit)
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** ppvObject) override
     {
       return DoBasicQueryInterface<IDxcTranslationUnit>(this, iid, ppvObject);
     }
 
-    DxcTranslationUnit();
+    DxcTranslationUnit(IMalloc *pMalloc);
     ~DxcTranslationUnit();
     void Initialize(CXTranslationUnit tu);
 
@@ -338,6 +341,12 @@ public:
       _Out_ unsigned* errorLength,
       _Out_ BSTR* errorMessage) override;
     HRESULT STDMETHODCALLTYPE GetInclusionList(_Out_ unsigned* pResultCount, _Outptr_result_buffer_(*pResultCount) IDxcInclusion*** pResult) override;
+    HRESULT STDMETHODCALLTYPE CodeCompleteAt(
+      _In_ const char *fileName, unsigned line, unsigned column,
+      _In_ IDxcUnsavedFile** pUnsavedFiles, unsigned numUnsavedFiles,
+      _In_ DxcCodeCompleteFlags options,
+      _Outptr_result_nullonfailure_ IDxcCodeCompleteResults **pResult)
+      override;
 };
 
 class DxcType : public IDxcType
@@ -347,19 +356,77 @@ private:
   CXType m_type;
 public:
   DXC_MICROCOM_TM_ADDREF_RELEASE_IMPL()
+  DXC_MICROCOM_TM_CTOR(DxcType)
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** ppvObject) override
   {
     return DoBasicQueryInterface<IDxcType>(this, iid, ppvObject);
   }
 
-  DxcType();
-  ~DxcType();
   void Initialize(const CXType& type);
   static HRESULT Create(const CXType& type, _Outptr_result_nullonfailure_ IDxcType** pObject);
 
   HRESULT STDMETHODCALLTYPE GetSpelling(_Outptr_result_maybenull_ LPSTR* pResult) override;
   HRESULT STDMETHODCALLTYPE IsEqualTo(_In_ IDxcType* other, _Out_ BOOL* pResult) override;
   HRESULT STDMETHODCALLTYPE GetKind(_Out_ DxcTypeKind* pResult) override;
+};
+
+class DxcCodeCompleteResults : public IDxcCodeCompleteResults
+{
+private:
+  DXC_MICROCOM_TM_REF_FIELDS()
+  CXCodeCompleteResults* m_ccr;
+public:
+  DXC_MICROCOM_TM_ADDREF_RELEASE_IMPL()
+  DXC_MICROCOM_TM_CTOR(DxcCodeCompleteResults)
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,
+                                           void **ppvObject) override {
+    return DoBasicQueryInterface<IDxcCodeCompleteResults>(this, iid, ppvObject);
+  }
+
+  ~DxcCodeCompleteResults();
+  void Initialize(CXCodeCompleteResults* ccr);
+
+  HRESULT STDMETHODCALLTYPE GetNumResults(_Out_ unsigned *pResult) override;
+  HRESULT STDMETHODCALLTYPE GetResultAt(unsigned index, _Outptr_result_nullonfailure_ IDxcCompletionResult **pResult) override;
+};
+
+class DxcCompletionResult : public IDxcCompletionResult
+{
+private:
+  DXC_MICROCOM_TM_REF_FIELDS()
+  CXCompletionResult m_cr;
+public:
+  DXC_MICROCOM_TM_ADDREF_RELEASE_IMPL()
+  DXC_MICROCOM_TM_CTOR(DxcCompletionResult)
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,
+                                           void **ppvObject) override {
+    return DoBasicQueryInterface<IDxcCompletionResult>(this, iid, ppvObject);
+  }
+
+  void Initialize(const CXCompletionResult& cr);
+
+  HRESULT STDMETHODCALLTYPE GetCursorKind(_Out_ DxcCursorKind *pResult) override;
+  HRESULT STDMETHODCALLTYPE GetCompletionString(_Outptr_result_nullonfailure_ IDxcCompletionString **pResult) override;
+};
+
+class DxcCompletionString : public IDxcCompletionString
+{
+private:
+  DXC_MICROCOM_TM_REF_FIELDS()
+  CXCompletionString m_cs;
+public:
+  DXC_MICROCOM_TM_ADDREF_RELEASE_IMPL()
+  DXC_MICROCOM_TM_CTOR(DxcCompletionString)
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,
+                                           void **ppvObject) override {
+    return DoBasicQueryInterface<IDxcCompletionString>(this, iid, ppvObject);
+  }
+
+  void Initialize(const CXCompletionString& cs);
+
+  HRESULT STDMETHODCALLTYPE GetNumCompletionChunks(_Out_ unsigned *pResult) override;
+  HRESULT STDMETHODCALLTYPE GetCompletionChunkKind(unsigned chunkNumber, _Out_ DxcCompletionChunkKind *pResult) override;
+  HRESULT STDMETHODCALLTYPE GetCompletionChunkText(unsigned chunkNumber, _Out_ LPSTR* pResult) override;
 };
 
 HRESULT CreateDxcIntelliSense(_In_ REFIID riid, _Out_ LPVOID* ppv) throw();

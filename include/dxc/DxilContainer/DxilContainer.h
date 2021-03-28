@@ -40,6 +40,17 @@ struct DxilContainerHash {
   uint8_t Digest[DxilContainerHashSize];
 };
 
+enum class DxilShaderHashFlags : uint32_t {
+  None = 0,           // No flags defined.
+  IncludesSource = 1, // This flag indicates that the shader hash was computed
+                      // taking into account source information (-Zss)
+};
+
+typedef struct DxilShaderHash {
+  uint32_t Flags; // DxilShaderHashFlags
+  uint8_t Digest[DxilContainerHashSize];
+} DxilShaderHash;
+
 struct DxilContainerVersion {
   uint16_t Major;
   uint16_t Minor;
@@ -83,6 +94,9 @@ enum DxilFourCC {
   DFCC_DXIL                     = DXIL_FOURCC('D', 'X', 'I', 'L'),
   DFCC_PipelineStateValidation  = DXIL_FOURCC('P', 'S', 'V', '0'),
   DFCC_RuntimeData              = DXIL_FOURCC('R', 'D', 'A', 'T'),
+  DFCC_ShaderHash               = DXIL_FOURCC('H', 'A', 'S', 'H'),
+  DFCC_ShaderSourceInfo         = DXIL_FOURCC('S', 'R', 'C', 'I'),
+  DFCC_CompilerVersion          = DXIL_FOURCC('V', 'E', 'R', 'S'),
 };
 
 #undef DXIL_FOURCC
@@ -144,6 +158,7 @@ enum class DxilProgramSigSemantic : uint32_t {
   FinalLineDensityTessfactor = 16,
   Barycentrics = 23,
   ShadingRate = 24,
+  CullPrimitive = 25,
   Target = 64,
   Depth = 65,
   Coverage = 66,
@@ -197,6 +212,172 @@ struct DxilShaderDebugName {
 };
 static const size_t MinDxilShaderDebugNameSize = sizeof(DxilShaderDebugName) + 4;
 
+struct DxilCompilerVersion {
+  uint16_t Major;
+  uint16_t Minor;
+  uint32_t VersionFlags;
+  uint32_t CommitCount;
+  uint32_t VersionStringListSizeInBytes;
+  // Followed by VersionStringListSizeInBytes bytes, containing up to two null-terminated strings, sequentially:
+  //  1. CommitSha
+  //  1. CustomVersionString
+  // Followed by [0-3] zero bytes to align to a 4-byte boundary.
+};
+
+// Source Info part has the following top level structure:
+//
+//   DxilSourceInfo
+//
+//      DxilSourceInfoSection
+//         char Data[]
+//         (0-3 zero bytes to align to a 4-byte boundary)
+//
+//      DxilSourceInfoSection
+//         char Data[]
+//         (0-3 zero bytes to align to a 4-byte boundary)
+//
+//      ...
+//
+//      DxilSourceInfoSection
+//         char Data[]
+//         (0-3 zero bytes to align to a 4-byte boundary)
+//
+// Each DxilSourceInfoSection is followed by a blob of Data.
+// The each type of data has its own internal structure:
+//
+// ================ 1. Source Names ==================================
+//
+//  DxilSourceInfo_SourceNames
+//
+//     DxilSourceInfo_SourceNamesEntry
+//        char Name[ NameSizeInBytes ]
+//        (0-3 zero bytes to align to a 4-byte boundary)
+//
+//     DxilSourceInfo_SourceNamesEntry
+//        char Name[ NameSizeInBytes ]
+//        (0-3 zero bytes to align to a 4-byte boundary)
+//
+//      ...
+//
+//     DxilSourceInfo_SourceNamesEntry
+//        char Name[ NameSizeInBytes ]
+//        (0-3 zero bytes to align to a 4-byte boundary)
+//
+// ================ 2. Source Contents ==================================
+// 
+//  DxilSourceInfo_SourceContents
+//    char Entries[CompressedEntriesSizeInBytes]
+//   
+// `Entries` may be compressed. Here is the uncompressed structure:
+//
+//     DxilSourceInfo_SourcesContentsEntry
+//        char Content[ ContentSizeInBytes ]
+//        (0-3 zero bytes to align to a 4-byte boundary)
+//
+//     DxilSourceInfo_SourcesContentsEntry
+//        char Content[ ContentSizeInBytes ]
+//        (0-3 zero bytes to align to a 4-byte boundary)
+//
+//     ...
+//
+//     DxilSourceInfo_SourcesContentsEntry
+//        char Content[ ContentSizeInBytes ]
+//        (0-3 zero bytes to align to a 4-byte boundary)
+//
+// ================ 3. Args ==================================
+//
+//   DxilSourceInfo_Args
+//
+//      char ArgName[]; char NullTerm;
+//      char ArgValue[]; char NullTerm;
+//
+//      char ArgName[]; char NullTerm;
+//      char ArgValue[]; char NullTerm;
+//
+//      ...
+//
+//      char ArgName[]; char NullTerm;
+//      char ArgValue[]; char NullTerm;
+//
+
+struct DxilSourceInfo {
+  uint32_t AlignedSizeInBytes;  // Total size of the contents including this header
+  uint16_t Flags;               // Reserved, must be set to zero.
+  uint16_t SectionCount;        // The number of sections in the source info.
+};
+
+enum class DxilSourceInfoSectionType : uint16_t {
+  SourceContents = 0,
+  SourceNames    = 1,
+  Args           = 2,
+};
+
+struct DxilSourceInfoSection {
+  uint32_t AlignedSizeInBytes;      // Size of the section, including this header, and the padding. Aligned to 4-byte boundary.
+  uint16_t Flags;                   // Reserved, must be set to zero.
+  DxilSourceInfoSectionType Type;   // The type of data following this header.
+};
+
+struct DxilSourceInfo_Args {
+  uint32_t Flags;       // Reserved, must be set to zero.
+  uint32_t SizeInBytes; // Length of all argument pairs, including their null terminators, not including this header.
+  uint32_t Count;       // Number of arguments.
+
+  // Followed by `Count` argument pairs.
+  //
+  // For example, given the following arguments:
+  //    /T ps_6_0 -EMain -D MyDefine=1 /DMyOtherDefine=2 -Zi MyShader.hlsl
+  //
+  // The argument pair data becomes:
+  //    T\0ps_6_0\0
+  //    E\0Main\0
+  //    D\0MyDefine=1\0
+  //    D\0MyOtherDefine=2\0
+  //    Zi\0\0
+  //    \0MyShader.hlsl\0
+  //
+};
+
+struct DxilSourceInfo_SourceNames {
+  uint32_t Flags;                                   // Reserved, must be set to 0.
+  uint32_t Count;                                   // The number of data entries
+  uint16_t EntriesSizeInBytes;                      // The total size of the data entries following this header.
+
+  // Followed by `Count` data entries with the header DxilSourceInfo_SourceNamesEntry
+};
+
+struct DxilSourceInfo_SourceNamesEntry {
+  uint32_t AlignedSizeInBytes;                      // Size of the data including this header and padding. Aligned to 4-byte boundary.
+  uint32_t Flags;                                   // Reserved, must be set to 0.
+  uint32_t NameSizeInBytes;                         // Size of the file name, *including* the null terminator.
+  uint32_t ContentSizeInBytes;                      // Size of the file content, *including* the null terminator.
+  // Followed by NameSizeInBytes bytes of the UTF-8-encoded file name (including null terminator).
+  // Followed by [0-3] zero bytes to align to a 4-byte boundary.
+};
+
+enum class DxilSourceInfo_SourceContentsCompressType : uint16_t {
+  None,
+  Zlib
+};
+
+struct DxilSourceInfo_SourceContents {
+  uint32_t AlignedSizeInBytes;                             // Size of the entry including this header. Aligned to 4-byte boundary.
+  uint16_t Flags;                                          // Reserved, must be set to 0.
+  DxilSourceInfo_SourceContentsCompressType CompressType;  // The type of compression used to compress the data
+  uint32_t EntriesSizeInBytes;                             // The size of the data entries following this header.
+  uint32_t UncompressedEntriesSizeInBytes;                 // Total size of the data entries when uncompressed.
+  uint32_t Count;                                          // The number of data entries
+  // Followed by (compressed) `Count` data entries with the header DxilSourceInfo_SourceContentsEntry
+};
+
+struct DxilSourceInfo_SourceContentsEntry {
+  uint32_t AlignedSizeInBytes;                             // Size of the entry including this header and padding. Aligned to 4-byte boundary.
+  uint32_t Flags;                                          // Reserved, must be set to 0.
+  uint32_t ContentSizeInBytes;                             // Size of the data following this header, *including* the null terminator
+  // Followed by NameSizeInBytes bytes of the UTF-8-encoded content (including null terminator).
+  // Followed by [0-3] zero bytes to align to a 4-byte boundary.
+};
+
 #pragma pack(pop)
 
 /// Gets a part header by index.
@@ -244,8 +425,10 @@ GetDxilProgramHeader(const DxilContainerHeader *pHeader, DxilFourCC fourCC);
 void InitDxilContainer(_Out_ DxilContainerHeader *pHeader, uint32_t partCount,
                        uint32_t containerSizeInBytes);
 
-/// Checks whether pHeader claims by signature to be a DXIL container.
+/// Checks whether pHeader claims by signature to be a DXIL container
+/// and the length is at least sizeof(DxilContainerHeader).
 const DxilContainerHeader *IsDxilContainerLike(const void *ptr, size_t length);
+DxilContainerHeader *IsDxilContainerLike(void *ptr, size_t length);
 
 /// Checks whether the DXIL container is valid and in-bounds.
 bool IsValidDxilContainer(const DxilContainerHeader *pHeader, size_t length);
@@ -391,11 +574,13 @@ inline bool GetDxilShaderDebugName(const DxilPartHeader *pDebugNamePart,
 }
 
 enum class SerializeDxilFlags : uint32_t {
-  None = 0,                         // No flags defined.
-  IncludeDebugInfoPart = 1,         // Include the debug info part in the container.
-  IncludeDebugNamePart = 2,         // Include the debug name part in the container.
-  DebugNameDependOnSource = 4,      // Make the debug name depend on source (and not just final module).
-  StripReflectionFromDxilPart = 8,  // Strip Reflection info from DXIL part.
+  None                        = 0,      // No flags defined.
+  IncludeDebugInfoPart        = 1 << 0, // Include the debug info part in the container.
+  IncludeDebugNamePart        = 1 << 1, // Include the debug name part in the container.
+  DebugNameDependOnSource     = 1 << 2, // Make the debug name depend on source (and not just final module).
+  StripReflectionFromDxilPart = 1 << 3, // Strip Reflection info from DXIL part.
+  IncludeReflectionPart       = 1 << 4, // Include reflection in STAT part.
+  StripRootSignature          = 1 << 5, // Strip Root Signature from main shader container.
 };
 inline SerializeDxilFlags& operator |=(SerializeDxilFlags& l, const SerializeDxilFlags& r) {
   l = static_cast<SerializeDxilFlags>(static_cast<int>(l) | static_cast<int>(r));

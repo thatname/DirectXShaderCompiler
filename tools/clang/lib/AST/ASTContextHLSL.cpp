@@ -17,6 +17,7 @@
 #include "clang/AST/Expr.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/ExternalASTSource.h"
+#include "clang/AST/HlslBuiltinTypeDeclBuilder.h"
 #include "clang/AST/TypeLoc.h"
 #include "clang/Sema/SemaDiagnostic.h"
 #include "clang/Sema/Sema.h"
@@ -24,6 +25,7 @@
 #include "dxc/Support/Global.h"
 #include "dxc/HLSL/HLOperations.h"
 #include "dxc/DXIL/DxilSemantic.h"
+#include "dxc/HlslIntrinsicOp.h"
 
 using namespace clang;
 using namespace hlsl;
@@ -38,6 +40,7 @@ static const bool DelayTypeCreationTrue = true;   // delay type creation for a d
 static const SourceLocation NoLoc;                // no source location attribution available
 static const bool InlineFalse = false;            // namespace is not an inline namespace
 static const bool InlineSpecifiedFalse = false;   // function was not specified as inline
+static const bool ExplicitFalse = false;          // constructor was not specified as explicit
 static const bool IsConstexprFalse = false;       // function is not constexpr
 static const bool VirtualFalse = false;           // whether the base class is declares 'virtual'
 static const bool BaseClassFalse = false;         // whether the base class is declared as 'class' (vs. 'struct')
@@ -67,7 +70,9 @@ const char* HLSLScalarTypeNames[] = {
   "uint64_t",
   "float16_t",
   "float32_t",
-  "float64_t"
+  "float64_t",
+  "int8_t4_packed",
+  "uint8_t4_packed"
 };
 
 static_assert(HLSLScalarTypeCount == _countof(HLSLScalarTypeNames), "otherwise scalar constants are not aligned");
@@ -169,6 +174,20 @@ static HLSLScalarType FindScalarTypeByName(const char *typeName, const size_t ty
         }
       }
       break;
+    case 14: // int8_t4_packed
+      if (typeName[0] == 'i' && typeName[1] == 'n') {
+        if (strncmp(typeName, "int8_t4_packed", 14))
+          break;
+        return HLSLScalarType_int8_4packed;
+      }
+      break;
+    case 15: // uint8_t4_packed
+      if (typeName[0] == 'u' && typeName[1] == 'i') {
+        if (strncmp(typeName, "uint8_t4_packed", 15))
+          break;
+        return HLSLScalarType_uint8_4packed;
+      }
+      break;
     default:
       break;
   }
@@ -238,22 +257,6 @@ CanQualType GetHLSLObjectHandleType(ASTContext& context)
   return context.IntTy;
 }
 
-/// <summary>Adds a handle field to the specified record.</summary>
-static 
-void AddHLSLHandleField(ASTContext& context, DeclContext* recordDecl, QualType handleQualType)
-{
-  IdentifierInfo& handleId = context.Idents.get(StringRef("h"), tok::TokenKind::identifier);
-  TypeSourceInfo* fieldTypeSource = context.getTrivialTypeSourceInfo(handleQualType, NoLoc);
-  const bool MutableFalse = false;
-  const InClassInitStyle initStyle = InClassInitStyle::ICIS_NoInit;
-  FieldDecl* handleDecl = FieldDecl::Create(
-    context, recordDecl, NoLoc, NoLoc, &handleId, handleQualType, fieldTypeSource, nullptr, MutableFalse, initStyle);
-  handleDecl->setAccess(AccessSpecifier::AS_private);
-  handleDecl->setImplicit(true); 
-
-  recordDecl->addDecl(handleDecl);
-}
-
 static
 void AddSubscriptOperator(
   ASTContext& context, unsigned int templateDepth, TemplateTypeParmDecl *elementTemplateParamDecl,
@@ -297,52 +300,15 @@ void hlsl::AddHLSLMatrixTemplate(ASTContext& context, ClassTemplateDecl* vectorT
   DXASSERT_NOMSG(matrixTemplateDecl != nullptr);
   DXASSERT_NOMSG(vectorTemplateDecl != nullptr);
 
-  DeclContext* currentDeclContext = context.getTranslationUnitDecl();
-
   // Create a matrix template declaration in translation unit scope.
   // template<typename element, int row_count, int col_count> matrix { ... }
-  IdentifierInfo& elementTemplateParamId = context.Idents.get(StringRef("element"), tok::TokenKind::identifier);
-  TemplateTypeParmDecl *elementTemplateParamDecl = TemplateTypeParmDecl::Create(
-    context, currentDeclContext, NoLoc, NoLoc,
-    FirstTemplateDepth, FirstParamPosition, &elementTemplateParamId, TypenameFalse, ParameterPackFalse);
-  elementTemplateParamDecl->setDefaultArgument(context.getTrivialTypeSourceInfo(context.FloatTy));
-  QualType intType = context.IntTy;
-  Expr *literalIntFour = IntegerLiteral::Create(
-      context, llvm::APInt(context.getIntWidth(intType), 4), intType, NoLoc);
-  IdentifierInfo& rowCountParamId = context.Idents.get(StringRef("row_count"), tok::TokenKind::identifier);
-  NonTypeTemplateParmDecl* rowCountTemplateParamDecl = NonTypeTemplateParmDecl::Create(
-    context, currentDeclContext, NoLoc, NoLoc,
-    FirstTemplateDepth, FirstParamPosition + 1, &rowCountParamId, intType, ParameterPackFalse, context.getTrivialTypeSourceInfo(intType));
-  rowCountTemplateParamDecl->setDefaultArgument(literalIntFour);
-  IdentifierInfo& colCountParamId = context.Idents.get(StringRef("col_count"), tok::TokenKind::identifier);
-  NonTypeTemplateParmDecl* colCountTemplateParamDecl = NonTypeTemplateParmDecl::Create(
-    context, currentDeclContext, NoLoc, NoLoc,
-    FirstTemplateDepth, FirstParamPosition + 2, &colCountParamId, intType, ParameterPackFalse, context.getTrivialTypeSourceInfo(intType));
-  colCountTemplateParamDecl->setDefaultArgument(literalIntFour);
-  NamedDecl* templateParameters[] =
-  {
-    elementTemplateParamDecl, rowCountTemplateParamDecl, colCountTemplateParamDecl
-  };
-  TemplateParameterList* templateParameterList = TemplateParameterList::Create(
-    context, NoLoc, NoLoc, templateParameters, _countof(templateParameters), NoLoc);
-
-  IdentifierInfo& matrixId = context.Idents.get(StringRef("matrix"), tok::TokenKind::identifier);
-  CXXRecordDecl* templateRecordDecl = CXXRecordDecl::Create(
-    context, TagDecl::TagKind::TTK_Class, currentDeclContext, NoLoc, NoLoc, &matrixId,
-    nullptr, DelayTypeCreationTrue);
-  ClassTemplateDecl* classTemplateDecl = ClassTemplateDecl::Create(
-    context, currentDeclContext, NoLoc, DeclarationName(&matrixId),
-    templateParameterList, templateRecordDecl, nullptr);
-  templateRecordDecl->setDescribedClassTemplate(classTemplateDecl);
-  templateRecordDecl->addAttr(FinalAttr::CreateImplicit(context, FinalAttr::Keyword_final));
-
-  // Requesting the class name specialization will fault in required types.
-  QualType T = classTemplateDecl->getInjectedClassNameSpecialization();
-  T = context.getInjectedClassNameType(templateRecordDecl, T);
-  assert(T->isDependentType() && "Class template type is not dependent?");
-  classTemplateDecl->setLexicalDeclContext(currentDeclContext);
-  templateRecordDecl->setLexicalDeclContext(currentDeclContext);
-  templateRecordDecl->startDefinition();
+  BuiltinTypeDeclBuilder typeDeclBuilder(context.getTranslationUnitDecl(), "matrix");
+  TemplateTypeParmDecl* elementTemplateParamDecl = typeDeclBuilder.addTypeTemplateParam("element", (QualType)context.FloatTy);
+  NonTypeTemplateParmDecl* rowCountTemplateParamDecl = typeDeclBuilder.addIntegerTemplateParam("row_count", context.IntTy, 4);
+  NonTypeTemplateParmDecl* colCountTemplateParamDecl = typeDeclBuilder.addIntegerTemplateParam("col_count", context.IntTy, 4);
+  typeDeclBuilder.startDefinition();
+  CXXRecordDecl* templateRecordDecl = typeDeclBuilder.getRecordDecl();
+  ClassTemplateDecl* classTemplateDecl = typeDeclBuilder.getTemplateDecl();
 
   // Add an 'h' field to hold the handle.
   // The type is vector<element, col>[row].
@@ -352,20 +318,20 @@ void hlsl::AddHLSLMatrixTemplate(ASTContext& context, ClassTemplateDecl* vectorT
       context, NestedNameSpecifierLoc(), NoLoc, rowCountTemplateParamDecl,
       false,
       DeclarationNameInfo(rowCountTemplateParamDecl->getDeclName(), NoLoc),
-      intType, ExprValueKind::VK_RValue);
+      context.IntTy, ExprValueKind::VK_RValue);
 
   Expr *rowSizeExpr = DeclRefExpr::Create(
       context, NestedNameSpecifierLoc(), NoLoc, colCountTemplateParamDecl,
       false,
       DeclarationNameInfo(colCountTemplateParamDecl->getDeclName(), NoLoc),
-      intType, ExprValueKind::VK_RValue);
+    context.IntTy, ExprValueKind::VK_RValue);
 
   QualType vectorType = context.getDependentSizedExtVectorType(
       elementType, rowSizeExpr, SourceLocation());
   QualType vectorArrayType = context.getDependentSizedArrayType(
       vectorType, sizeExpr, ArrayType::Normal, 0, SourceRange());
 
-  AddHLSLHandleField(context, templateRecordDecl, vectorArrayType);
+  typeDeclBuilder.addField("h", vectorArrayType);
 
   // Add an operator[]. The operator ranges from zero to rowcount-1, and returns a vector of colcount elements.
   const unsigned int templateDepth = 0;
@@ -376,22 +342,7 @@ void hlsl::AddHLSLMatrixTemplate(ASTContext& context, ClassTemplateDecl* vectorT
                        colCountTemplateParamDecl, context.UnsignedIntTy,
                        templateRecordDecl, vectorTemplateDecl, ForConstTrue);
 
-  templateRecordDecl->completeDefinition();
-
-  classTemplateDecl->setImplicit(true);
-  templateRecordDecl->setImplicit(true);
-
-  // Both declarations need to be present for correct handling.
-  currentDeclContext->addDecl(classTemplateDecl);
-  currentDeclContext->addDecl(templateRecordDecl);
-
-#ifdef DBG
-  // Verify that we can read the field member from the template record.
-  DeclContext::lookup_result lookupResult = templateRecordDecl->lookup(
-    DeclarationName(&context.Idents.get(StringRef("h"))));
-  DXASSERT(!lookupResult.empty(), "otherwise matrix handle cannot be looked up");
-#endif
-
+  typeDeclBuilder.completeDefinition();
   *matrixTemplateDecl = classTemplateDecl;
 }
 
@@ -405,53 +356,20 @@ void hlsl::AddHLSLVectorTemplate(ASTContext& context, ClassTemplateDecl** vector
 {
   DXASSERT_NOMSG(vectorTemplateDecl != nullptr);
 
-  DeclContext* currentDeclContext = context.getTranslationUnitDecl();
-
   // Create a vector template declaration in translation unit scope.
   // template<typename element, int element_count> vector { ... }
-  IdentifierInfo& elementTemplateParamId = context.Idents.get(StringRef("element"), tok::TokenKind::identifier);
-  TemplateTypeParmDecl *elementTemplateParamDecl = TemplateTypeParmDecl::Create(
-    context, currentDeclContext, NoLoc, NoLoc,
-    FirstTemplateDepth, FirstParamPosition, &elementTemplateParamId, TypenameFalse, ParameterPackFalse);
-  elementTemplateParamDecl->setDefaultArgument(context.getTrivialTypeSourceInfo(context.FloatTy));
-  QualType intType = context.IntTy;
-  Expr *literalIntFour = IntegerLiteral::Create(
-      context, llvm::APInt(context.getIntWidth(intType), 4), intType, NoLoc);
-  IdentifierInfo& colCountParamId = context.Idents.get(StringRef("element_count"), tok::TokenKind::identifier);
-  NonTypeTemplateParmDecl* colCountTemplateParamDecl = NonTypeTemplateParmDecl::Create(
-    context, currentDeclContext, NoLoc, NoLoc,
-    FirstTemplateDepth, FirstParamPosition + 1, &colCountParamId, intType, ParameterPackFalse, nullptr);
-  colCountTemplateParamDecl->setDefaultArgument(literalIntFour);
-  NamedDecl* templateParameters[] =
-  {
-    elementTemplateParamDecl, colCountTemplateParamDecl
-  };
-  TemplateParameterList* templateParameterList = TemplateParameterList::Create(
-    context, NoLoc, NoLoc, templateParameters, _countof(templateParameters), NoLoc);
-
-  IdentifierInfo& vectorId = context.Idents.get(StringRef("vector"), tok::TokenKind::identifier);
-  CXXRecordDecl* templateRecordDecl = CXXRecordDecl::Create(
-    context, TagDecl::TagKind::TTK_Class, currentDeclContext, NoLoc, NoLoc, &vectorId,
-    nullptr, DelayTypeCreationTrue);
-  ClassTemplateDecl* classTemplateDecl = ClassTemplateDecl::Create(
-    context, currentDeclContext, NoLoc, DeclarationName(&vectorId),
-    templateParameterList, templateRecordDecl, nullptr);
-  templateRecordDecl->setDescribedClassTemplate(classTemplateDecl);
-  templateRecordDecl->addAttr(FinalAttr::CreateImplicit(context, FinalAttr::Keyword_final));
-
-  // Requesting the class name specialization will fault in required types.
-  QualType T = classTemplateDecl->getInjectedClassNameSpecialization();
-  T = context.getInjectedClassNameType(templateRecordDecl, T);
-  assert(T->isDependentType() && "Class template type is not dependent?");
-  classTemplateDecl->setLexicalDeclContext(currentDeclContext);
-  templateRecordDecl->setLexicalDeclContext(currentDeclContext);
-  templateRecordDecl->startDefinition();
+  BuiltinTypeDeclBuilder typeDeclBuilder(context.getTranslationUnitDecl(), "vector");
+  TemplateTypeParmDecl* elementTemplateParamDecl = typeDeclBuilder.addTypeTemplateParam("element", (QualType)context.FloatTy);
+  NonTypeTemplateParmDecl* colCountTemplateParamDecl = typeDeclBuilder.addIntegerTemplateParam("element_count", context.IntTy, 4);
+  typeDeclBuilder.startDefinition();
+  CXXRecordDecl* templateRecordDecl = typeDeclBuilder.getRecordDecl();
+  ClassTemplateDecl* classTemplateDecl = typeDeclBuilder.getTemplateDecl();
 
   Expr *vecSizeExpr = DeclRefExpr::Create(
       context, NestedNameSpecifierLoc(), NoLoc, colCountTemplateParamDecl,
       false,
       DeclarationNameInfo(colCountTemplateParamDecl->getDeclName(), NoLoc),
-      intType, ExprValueKind::VK_RValue);
+      context.IntTy, ExprValueKind::VK_RValue);
 
   const unsigned int templateDepth = 0;
   QualType resultType = context.getTemplateTypeParmType(
@@ -459,7 +377,7 @@ void hlsl::AddHLSLVectorTemplate(ASTContext& context, ClassTemplateDecl** vector
   QualType vectorType = context.getDependentSizedExtVectorType(
       resultType, vecSizeExpr, SourceLocation());
   // Add an 'h' field to hold the handle.
-  AddHLSLHandleField(context, templateRecordDecl, vectorType);
+  typeDeclBuilder.addField("h", vectorType);
 
   // Add an operator[]. The operator ranges from zero to colcount-1, and returns a scalar.
 
@@ -478,48 +396,18 @@ void hlsl::AddHLSLVectorTemplate(ASTContext& context, ClassTemplateDecl** vector
     context.DeclarationNames.getCXXOperatorName(OO_Subscript), ForConstFalse);
   AddHLSLVectorSubscriptAttr(functionDecl, context);
 
-  templateRecordDecl->completeDefinition();
-
-  classTemplateDecl->setImplicit(true);
-  templateRecordDecl->setImplicit(true);
-
-  // Both declarations need to be present for correct handling.
-  currentDeclContext->addDecl(classTemplateDecl);
-  currentDeclContext->addDecl(templateRecordDecl);
-
-#ifdef DBG
-  // Verify that we can read the field member from the template record.
-  DeclContext::lookup_result lookupResult = templateRecordDecl->lookup(
-    DeclarationName(&context.Idents.get(StringRef("h"))));
-  DXASSERT(!lookupResult.empty(), "otherwise vector handle cannot be looked up");
-#endif
-
+  typeDeclBuilder.completeDefinition();
   *vectorTemplateDecl = classTemplateDecl;
 }
 
 /// <summary>
 /// Adds a new record type in the specified context with the given name. The record type will have a handle field.
 /// </summary>
-void hlsl::AddRecordTypeWithHandle(ASTContext& context, _Outptr_ CXXRecordDecl** typeDecl, _In_z_ const char* typeName)
-{
-  DXASSERT_NOMSG(typeDecl != nullptr);
-  DXASSERT_NOMSG(typeName != nullptr);
-  
-  *typeDecl = nullptr;
-
-  DeclContext* currentDeclContext = context.getTranslationUnitDecl();
-  IdentifierInfo& newTypeId = context.Idents.get(StringRef(typeName), tok::TokenKind::identifier);
-  CXXRecordDecl* newDecl = CXXRecordDecl::Create(
-    context, TagDecl::TagKind::TTK_Struct, currentDeclContext, NoLoc, NoLoc, &newTypeId, nullptr);
-  newDecl->setLexicalDeclContext(currentDeclContext);
-  newDecl->setFreeStanding();
-  newDecl->addAttr(FinalAttr::CreateImplicit(context, FinalAttr::Keyword_final));
-  newDecl->startDefinition();
-  AddHLSLHandleField(context, newDecl, QualType(GetHLSLObjectHandleType(context)));
-  currentDeclContext->addDecl(newDecl);
-  newDecl->completeDefinition();
-
-  *typeDecl = newDecl;
+CXXRecordDecl* hlsl::DeclareRecordTypeWithHandle(ASTContext& context, StringRef name) {
+  BuiltinTypeDeclBuilder typeDeclBuilder(context.getTranslationUnitDecl(), name, TagDecl::TagKind::TTK_Struct);
+  typeDeclBuilder.startDefinition();
+  typeDeclBuilder.addField("h", GetHLSLObjectHandleType(context));
+  return typeDeclBuilder.completeDefinition();
 }
 
 // creates a global static constant unsigned integer with value.
@@ -537,42 +425,75 @@ static void AddConstUInt(clang::ASTContext& context, DeclContext *DC, StringRef 
   DC->addDecl(varDecl);
 }
 
-/// <summary> Adds a const integers for ray flags </summary>
-void hlsl::AddRayFlags(ASTContext& context) {
-  DeclContext *curDC = context.getTranslationUnitDecl();
-  // typedef uint RAY_FLAG;
-  IdentifierInfo &rayFlagId = context.Idents.get(StringRef("RAY_FLAG"), tok::TokenKind::identifier);
-  TypeSourceInfo *uintTypeSource = context.getTrivialTypeSourceInfo(context.UnsignedIntTy, NoLoc);
-  TypedefDecl *rayFlagDecl = TypedefDecl::Create(context, curDC, NoLoc, NoLoc, &rayFlagId, uintTypeSource);
-  curDC->addDecl(rayFlagDecl);
-  rayFlagDecl->setImplicit(true);
-  // static const uint RAY_FLAG_* = *;
-  AddConstUInt(context, curDC, StringRef("RAY_FLAG_NONE"), (unsigned)DXIL::RayFlag::None);
-  AddConstUInt(context, curDC, StringRef("RAY_FLAG_FORCE_OPAQUE"), (unsigned)DXIL::RayFlag::ForceOpaque);
-  AddConstUInt(context, curDC, StringRef("RAY_FLAG_FORCE_NON_OPAQUE"), (unsigned)DXIL::RayFlag::ForceNonOpaque);
-  AddConstUInt(context, curDC, StringRef("RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH"), (unsigned)DXIL::RayFlag::AcceptFirstHitAndEndSearch);
-  AddConstUInt(context, curDC, StringRef("RAY_FLAG_SKIP_CLOSEST_HIT_SHADER"), (unsigned)DXIL::RayFlag::SkipClosestHitShader);
-  AddConstUInt(context, curDC, StringRef("RAY_FLAG_CULL_BACK_FACING_TRIANGLES"), (unsigned)DXIL::RayFlag::CullBackFacingTriangles);
-  AddConstUInt(context, curDC, StringRef("RAY_FLAG_CULL_FRONT_FACING_TRIANGLES"), (unsigned)DXIL::RayFlag::CullFrontFacingTriangles);
-  AddConstUInt(context, curDC, StringRef("RAY_FLAG_CULL_OPAQUE"), (unsigned)DXIL::RayFlag::CullOpaque);
-  AddConstUInt(context, curDC, StringRef("RAY_FLAG_CULL_NON_OPAQUE"), (unsigned)DXIL::RayFlag::CullNonOpaque);
+static void AddConstUInt(clang::ASTContext& context, StringRef name, unsigned val) {
+  AddConstUInt(context, context.getTranslationUnitDecl(), name, val);
 }
 
-/// <summary> Adds a constant integers for hit kinds </summary>
-void hlsl::AddHitKinds(ASTContext& context) {
-  DeclContext *curDC = context.getTranslationUnitDecl();
+// Adds a top-level enum with the given enumerants.
+struct Enumerant { StringRef name; unsigned value; };
+
+static void AddTypedefPseudoEnum(ASTContext& context, StringRef name, ArrayRef<Enumerant> enumerants) {
+  DeclContext* curDC = context.getTranslationUnitDecl();
+  // typedef uint <name>;
+  IdentifierInfo& enumId = context.Idents.get(name, tok::TokenKind::identifier);
+  TypeSourceInfo* uintTypeSource = context.getTrivialTypeSourceInfo(context.UnsignedIntTy, NoLoc);
+  TypedefDecl* enumDecl = TypedefDecl::Create(context, curDC, NoLoc, NoLoc, &enumId, uintTypeSource);
+  curDC->addDecl(enumDecl);
+  enumDecl->setImplicit(true);
+  // static const uint <enumerant.name> = <enumerant.value>;
+  for (const Enumerant& enumerant : enumerants) {
+    AddConstUInt(context, curDC, enumerant.name, enumerant.value);
+  }
+}
+
+/// <summary> Adds all constants and enums for ray tracing </summary>
+void hlsl::AddRaytracingConstants(ASTContext& context) {
+  AddTypedefPseudoEnum(context, "RAY_FLAG", {
+    { "RAY_FLAG_NONE", (unsigned)DXIL::RayFlag::None },
+    { "RAY_FLAG_FORCE_OPAQUE", (unsigned)DXIL::RayFlag::ForceOpaque },
+    { "RAY_FLAG_FORCE_NON_OPAQUE", (unsigned)DXIL::RayFlag::ForceNonOpaque },
+    { "RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH", (unsigned)DXIL::RayFlag::AcceptFirstHitAndEndSearch },
+    { "RAY_FLAG_SKIP_CLOSEST_HIT_SHADER", (unsigned)DXIL::RayFlag::SkipClosestHitShader },
+    { "RAY_FLAG_CULL_BACK_FACING_TRIANGLES", (unsigned)DXIL::RayFlag::CullBackFacingTriangles },
+    { "RAY_FLAG_CULL_FRONT_FACING_TRIANGLES", (unsigned)DXIL::RayFlag::CullFrontFacingTriangles },
+    { "RAY_FLAG_CULL_OPAQUE", (unsigned)DXIL::RayFlag::CullOpaque },
+    { "RAY_FLAG_CULL_NON_OPAQUE", (unsigned)DXIL::RayFlag::CullNonOpaque },
+    { "RAY_FLAG_SKIP_TRIANGLES", (unsigned)DXIL::RayFlag::SkipTriangles },
+    { "RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES", (unsigned)DXIL::RayFlag::SkipProceduralPrimitives },
+  });
+
+  AddTypedefPseudoEnum(context, "COMMITTED_STATUS", {
+    { "COMMITTED_NOTHING", (unsigned)DXIL::CommittedStatus::CommittedNothing },
+    { "COMMITTED_TRIANGLE_HIT", (unsigned)DXIL::CommittedStatus::CommittedTriangleHit },
+    { "COMMITTED_PROCEDURAL_PRIMITIVE_HIT", (unsigned)DXIL::CommittedStatus::CommittedProceduralPrimitiveHit }
+  });
+
+  AddTypedefPseudoEnum(context, "CANDIDATE_TYPE", {
+    { "CANDIDATE_NON_OPAQUE_TRIANGLE", (unsigned)DXIL::CandidateType::CandidateNonOpaqueTriangle },
+    { "CANDIDATE_PROCEDURAL_PRIMITIVE", (unsigned)DXIL::CandidateType::CandidateProceduralPrimitive }
+  });
+
   // static const uint HIT_KIND_* = *;
-  AddConstUInt(context, curDC, StringRef("HIT_KIND_NONE"), (unsigned)DXIL::HitKind::None);
-  AddConstUInt(context, curDC, StringRef("HIT_KIND_TRIANGLE_FRONT_FACE"), (unsigned)DXIL::HitKind::TriangleFrontFace);
-  AddConstUInt(context, curDC, StringRef("HIT_KIND_TRIANGLE_BACK_FACE"), (unsigned)DXIL::HitKind::TriangleBackFace);
+  AddConstUInt(context, StringRef("HIT_KIND_NONE"), (unsigned)DXIL::HitKind::None);
+  AddConstUInt(context, StringRef("HIT_KIND_TRIANGLE_FRONT_FACE"), (unsigned)DXIL::HitKind::TriangleFrontFace);
+  AddConstUInt(context, StringRef("HIT_KIND_TRIANGLE_BACK_FACE"), (unsigned)DXIL::HitKind::TriangleBackFace);
+
+  AddConstUInt(context, StringRef("STATE_OBJECT_FLAGS_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITONS"), (unsigned)DXIL::StateObjectFlags::AllowLocalDependenciesOnExternalDefinitions);
+  AddConstUInt(context, StringRef("STATE_OBJECT_FLAGS_ALLOW_EXTERNAL_DEPENDENCIES_ON_LOCAL_DEFINITIONS"), (unsigned)DXIL::StateObjectFlags::AllowExternalDependenciesOnLocalDefinitions);
+  // The above "_FLAGS_" was a typo, leaving in to avoid breaking anyone.  Supposed to be _FLAG_ below.  
+  AddConstUInt(context, StringRef("STATE_OBJECT_FLAG_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITONS"), (unsigned)DXIL::StateObjectFlags::AllowLocalDependenciesOnExternalDefinitions);
+  AddConstUInt(context, StringRef("STATE_OBJECT_FLAG_ALLOW_EXTERNAL_DEPENDENCIES_ON_LOCAL_DEFINITIONS"), (unsigned)DXIL::StateObjectFlags::AllowExternalDependenciesOnLocalDefinitions);
+  AddConstUInt(context, StringRef("STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS"), (unsigned)DXIL::StateObjectFlags::AllowStateObjectAdditions);
+
+  AddConstUInt(context, StringRef("RAYTRACING_PIPELINE_FLAG_NONE"), (unsigned)DXIL::RaytracingPipelineFlags::None);
+  AddConstUInt(context, StringRef("RAYTRACING_PIPELINE_FLAG_SKIP_TRIANGLES"), (unsigned)DXIL::RaytracingPipelineFlags::SkipTriangles);
+  AddConstUInt(context, StringRef("RAYTRACING_PIPELINE_FLAG_SKIP_PROCEDURAL_PRIMITIVES"), (unsigned)DXIL::RaytracingPipelineFlags::SkipProceduralPrimitives);
 }
 
-/// <summary> Adds a constant integers for state object flags </summary>
-void hlsl::AddStateObjectFlags(ASTContext& context) {
-  DeclContext *curDC = context.getTranslationUnitDecl();
- 
-  AddConstUInt(context, curDC, StringRef("STATE_OBJECT_FLAGS_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITONS"), (unsigned)DXIL::StateObjectFlags::AllowLocalDependenciesOnExternalDefinitions);
-  AddConstUInt(context, curDC, StringRef("STATE_OBJECT_FLAGS_ALLOW_EXTERNAL_DEPENDENCIES_ON_LOCAL_DEFINITIONS"), (unsigned)DXIL::StateObjectFlags::AllowExternalDependenciesOnLocalDefinitions);
+/// <summary> Adds all constants and enums for sampler feedback </summary>
+void hlsl::AddSamplerFeedbackConstants(ASTContext& context) {
+  AddConstUInt(context, StringRef("SAMPLER_FEEDBACK_MIN_MIP"), (unsigned)DXIL::SamplerFeedbackType::MinMip);
+  AddConstUInt(context, StringRef("SAMPLER_FEEDBACK_MIP_REGION_USED"), (unsigned)DXIL::SamplerFeedbackType::MipRegionUsed);
 }
 
 static
@@ -736,79 +657,29 @@ void hlsl::AddStdIsEqualImplementation(clang::ASTContext& context, clang::Sema& 
 /// Adds a new template type in the specified context with the given name. The record type will have a handle field.
 /// </summary>
 /// <parm name="context">AST context to which template will be added.</param>
-/// <parm name="typeDecl">After execution, template declaration.</param>
-/// <parm name="recordDecl">After execution, record declaration for template.</param>
 /// <parm name="typeName">Name of template to create.</param>
 /// <parm name="templateArgCount">Number of template arguments (one or two).</param>
 /// <parm name="defaultTypeArgValue">If assigned, the default argument for the element template.</param>
-void hlsl::AddTemplateTypeWithHandle(
+CXXRecordDecl* hlsl::DeclareTemplateTypeWithHandle(
   ASTContext& context,
-  _Outptr_ ClassTemplateDecl** typeDecl,
-  _Outptr_ CXXRecordDecl** recordDecl,
-  _In_z_ const char* typeName,
+  StringRef name,
   uint8_t templateArgCount, 
-  _In_opt_ TypeSourceInfo* defaultTypeArgValue
-)
+  _In_opt_ TypeSourceInfo* defaultTypeArgValue)
 {
-  DXASSERT_NOMSG(typeDecl != nullptr);
-  DXASSERT_NOMSG(recordDecl != nullptr);
-  DXASSERT_NOMSG(typeName != nullptr);
-
   DXASSERT(templateArgCount != 0, "otherwise caller should be creating a class or struct");
   DXASSERT(templateArgCount <= 2, "otherwise the function needs to be updated for a different template pattern");
-
-  DeclContext* currentDeclContext = context.getTranslationUnitDecl();
 
   // Create an object template declaration in translation unit scope.
   // templateArgCount=1: template<typename element> typeName { ... }
   // templateArgCount=2: template<typename element, int count> typeName { ... }
-  IdentifierInfo& elementTemplateParamId = context.Idents.get(StringRef("element"), tok::TokenKind::identifier);
-  TemplateTypeParmDecl *elementTemplateParamDecl = TemplateTypeParmDecl::Create(
-    context, currentDeclContext, NoLoc, NoLoc,
-    FirstTemplateDepth, FirstParamPosition, &elementTemplateParamId, TypenameFalse, ParameterPackFalse);
-  QualType intType = context.IntTy;
-
-  if (defaultTypeArgValue != nullptr)
-  {
-    elementTemplateParamDecl->setDefaultArgument(defaultTypeArgValue);
-  }
-
+  BuiltinTypeDeclBuilder typeDeclBuilder(context.getTranslationUnitDecl(), name);
+  TemplateTypeParmDecl* elementTemplateParamDecl = typeDeclBuilder.addTypeTemplateParam("element", defaultTypeArgValue);
   NonTypeTemplateParmDecl* countTemplateParamDecl = nullptr;
-  if (templateArgCount > 1) {
-    IdentifierInfo& countParamId = context.Idents.get(StringRef("count"), tok::TokenKind::identifier);
-    countTemplateParamDecl = NonTypeTemplateParmDecl::Create(
-      context, currentDeclContext, NoLoc, NoLoc,
-      FirstTemplateDepth, FirstParamPosition + 1, &countParamId, intType, ParameterPackFalse, nullptr);
-    // Zero means default here. The count is decided by runtime.
-    Expr *literalIntZero = IntegerLiteral::Create(
-        context, llvm::APInt(context.getIntWidth(intType), 0), intType, NoLoc);
-    countTemplateParamDecl->setDefaultArgument(literalIntZero);
-  }
-  NamedDecl* templateParameters[] =
-  {
-    elementTemplateParamDecl, countTemplateParamDecl
-  };
-  TemplateParameterList* templateParameterList = TemplateParameterList::Create(
-    context, NoLoc, NoLoc, templateParameters, templateArgCount, NoLoc);
+  if (templateArgCount > 1)
+    countTemplateParamDecl = typeDeclBuilder.addIntegerTemplateParam("count", context.IntTy, 0);
 
-  IdentifierInfo& typeId = context.Idents.get(StringRef(typeName), tok::TokenKind::identifier);
-  CXXRecordDecl* templateRecordDecl = CXXRecordDecl::Create(
-    context, TagDecl::TagKind::TTK_Class, currentDeclContext, NoLoc, NoLoc, &typeId,
-    nullptr, DelayTypeCreationTrue);
-  ClassTemplateDecl* classTemplateDecl = ClassTemplateDecl::Create(
-    context, currentDeclContext, NoLoc, DeclarationName(&typeId),
-    templateParameterList, templateRecordDecl, nullptr);
-  templateRecordDecl->setDescribedClassTemplate(classTemplateDecl);
-  templateRecordDecl->addAttr(FinalAttr::CreateImplicit(context, FinalAttr::Keyword_final));
-  
-  // Requesting the class name specialization will fault in required types.
-  QualType T = classTemplateDecl->getInjectedClassNameSpecialization();
-  T = context.getInjectedClassNameType(templateRecordDecl, T);
-  assert(T->isDependentType() && "Class template type is not dependent?");
-  classTemplateDecl->setLexicalDeclContext(currentDeclContext);
-  templateRecordDecl->setLexicalDeclContext(currentDeclContext);
-  templateRecordDecl->startDefinition();
-  // Many more things to come here, like constructors and the like....
+  typeDeclBuilder.startDefinition();
+  CXXRecordDecl* templateRecordDecl = typeDeclBuilder.getRecordDecl();
 
   // Add an 'h' field to hold the handle.
   QualType elementType = context.getTemplateTypeParmType(
@@ -818,11 +689,11 @@ void hlsl::AddTemplateTypeWithHandle(
       // Only need array type for inputpatch and outputpatch.
       // Avoid Texture2DMS which may use 0 count.
       // TODO: use hlsl types to do the check.
-      !typeId.getName().startswith("Texture")) {
+      !name.startswith("Texture")) {
     Expr *countExpr = DeclRefExpr::Create(
         context, NestedNameSpecifierLoc(), NoLoc, countTemplateParamDecl, false,
         DeclarationNameInfo(countTemplateParamDecl->getDeclName(), NoLoc),
-        intType, ExprValueKind::VK_RValue);
+        context.IntTy, ExprValueKind::VK_RValue);
 
     elementType = context.getDependentSizedArrayType(
         elementType, countExpr, ArrayType::ArraySizeModifier::Normal, 0,
@@ -830,31 +701,17 @@ void hlsl::AddTemplateTypeWithHandle(
 
     // InputPatch and OutputPatch also have a "Length" static const member for the number of control points
     IdentifierInfo& lengthId = context.Idents.get(StringRef("Length"), tok::TokenKind::identifier);
-    TypeSourceInfo* lengthTypeSource = context.getTrivialTypeSourceInfo(intType.withConst());
+    TypeSourceInfo* lengthTypeSource = context.getTrivialTypeSourceInfo(context.IntTy.withConst());
     VarDecl* lengthValueDecl = VarDecl::Create(context, templateRecordDecl, NoLoc, NoLoc, &lengthId,
-      intType.withConst(), lengthTypeSource, SC_Static);
+      context.IntTy.withConst(), lengthTypeSource, SC_Static);
     lengthValueDecl->setInit(countExpr);
     lengthValueDecl->setAccess(AS_public);
     templateRecordDecl->addDecl(lengthValueDecl);
   }
 
-  AddHLSLHandleField(context, templateRecordDecl, elementType);
+  typeDeclBuilder.addField("h", elementType);
 
-  templateRecordDecl->completeDefinition();
-
-  // Both declarations need to be present for correct handling.
-  currentDeclContext->addDecl(classTemplateDecl);
-  currentDeclContext->addDecl(templateRecordDecl);
-
-#ifdef DBG
-  // Verify that we can read the field member from the template record.
-  DeclContext::lookup_result lookupResult = templateRecordDecl->lookup(
-    DeclarationName(&context.Idents.get(StringRef("h"))));
-  DXASSERT(!lookupResult.empty(), "otherwise template object handle cannot be looked up");
-#endif
-
-  *typeDecl = classTemplateDecl;
-  *recordDecl = templateRecordDecl;
+  return typeDeclBuilder.completeDefinition();
 }
 
 FunctionTemplateDecl* hlsl::CreateFunctionTemplateDecl(
@@ -892,6 +749,28 @@ void AssociateParametersToFunctionPrototype(
     DXASSERT(protoLoc.getParam(i) == nullptr, "otherwise prototype parameters were already initialized");
     protoLoc.setParam(i, paramVarDecls[i]);
   }
+}
+
+static void CreateConstructorDeclaration(
+  ASTContext &context, _In_ CXXRecordDecl *recordDecl, QualType resultType,
+  ArrayRef<QualType> args, DeclarationName declarationName, bool isConst,
+  _Out_ CXXConstructorDecl **constructorDecl, _Out_ TypeSourceInfo **tinfo) {
+  DXASSERT_NOMSG(recordDecl != nullptr);
+  DXASSERT_NOMSG(constructorDecl != nullptr);
+
+  FunctionProtoType::ExtProtoInfo functionExtInfo;
+  functionExtInfo.TypeQuals = isConst ? Qualifiers::Const : 0;
+  QualType functionQT = context.getFunctionType(
+    resultType, args, functionExtInfo, ArrayRef<ParameterModifier>());
+  DeclarationNameInfo declNameInfo(declarationName, NoLoc);
+  *tinfo = context.getTrivialTypeSourceInfo(functionQT, NoLoc);
+  DXASSERT_NOMSG(*tinfo != nullptr);
+  *constructorDecl = CXXConstructorDecl::Create(
+    context, recordDecl, NoLoc, declNameInfo, functionQT, *tinfo,
+    StorageClass::SC_None, ExplicitFalse, InlineSpecifiedFalse, IsConstexprFalse);
+  DXASSERT_NOMSG(*constructorDecl != nullptr);
+  (*constructorDecl)->setLexicalDeclContext(recordDecl);
+  (*constructorDecl)->setAccess(AccessSpecifier::AS_public);
 }
 
 static void CreateObjectFunctionDeclaration(
@@ -957,6 +836,100 @@ CXXMethodDecl* hlsl::CreateObjectFunctionDeclarationWithParams(
   recordDecl->addDecl(functionDecl);
 
   return functionDecl;
+}
+
+CXXRecordDecl* hlsl::DeclareUIntTemplatedTypeWithHandle(
+  ASTContext& context, StringRef typeName, StringRef templateParamName) {
+  // template<uint kind> FeedbackTexture2D[Array] { ... }
+  BuiltinTypeDeclBuilder typeDeclBuilder(context.getTranslationUnitDecl(), typeName);
+  typeDeclBuilder.addIntegerTemplateParam(templateParamName, context.UnsignedIntTy);
+  typeDeclBuilder.startDefinition();
+  typeDeclBuilder.addField("h", context.UnsignedIntTy); // Add an 'h' field to hold the handle.
+  return typeDeclBuilder.completeDefinition();
+}
+
+clang::CXXRecordDecl *
+hlsl::DeclareConstantBufferViewType(clang::ASTContext &context, bool bTBuf) {
+  // Create ConstantBufferView template declaration in translation unit scope
+  // like other resource.
+  // template<typename T> ConstantBuffer { int h; }
+  DeclContext *DC = context.getTranslationUnitDecl();
+
+  BuiltinTypeDeclBuilder typeDeclBuilder(DC,
+                                         bTBuf ? "TextureBuffer"
+                                               : "ConstantBuffer",
+                                         TagDecl::TagKind::TTK_Struct);
+  (void)typeDeclBuilder.addTypeTemplateParam("T");
+  typeDeclBuilder.startDefinition();
+  CXXRecordDecl *templateRecordDecl = typeDeclBuilder.getRecordDecl();
+
+  typeDeclBuilder.addField(
+      "h", context.UnsignedIntTy); // Add an 'h' field to hold the handle.
+
+  typeDeclBuilder.completeDefinition();
+
+  return templateRecordDecl;
+}
+
+CXXRecordDecl* hlsl::DeclareRayQueryType(ASTContext& context) {
+  // template<uint kind> RayQuery { ... }
+  BuiltinTypeDeclBuilder typeDeclBuilder(context.getTranslationUnitDecl(), "RayQuery");
+  typeDeclBuilder.addIntegerTemplateParam("flags", context.UnsignedIntTy);
+  typeDeclBuilder.startDefinition();
+  typeDeclBuilder.addField("h", context.UnsignedIntTy); // Add an 'h' field to hold the handle.
+
+  // Add constructor that will be lowered to the intrinsic that produces
+  // the RayQuery handle for this object.
+  CanQualType canQualType = typeDeclBuilder.getRecordDecl()->getTypeForDecl()->getCanonicalTypeUnqualified();
+  CXXConstructorDecl *pConstructorDecl = nullptr;
+  TypeSourceInfo *pTypeSourceInfo = nullptr;
+  CreateConstructorDeclaration(context, typeDeclBuilder.getRecordDecl(), context.VoidTy, {}, context.DeclarationNames.getCXXConstructorName(canQualType), false, &pConstructorDecl, &pTypeSourceInfo);
+  typeDeclBuilder.getRecordDecl()->addDecl(pConstructorDecl);
+
+  return typeDeclBuilder.completeDefinition();
+}
+
+CXXRecordDecl* hlsl::DeclareResourceType(ASTContext& context, bool bSampler) {
+  // struct ResourceDescriptor { uint8 desc; }
+  StringRef Name = bSampler?".Sampler":".Resource";
+  BuiltinTypeDeclBuilder typeDeclBuilder(context.getTranslationUnitDecl(),
+                                         Name,
+                                         TagDecl::TagKind::TTK_Struct);
+  typeDeclBuilder.startDefinition();
+
+  typeDeclBuilder.addField("h", GetHLSLObjectHandleType(context));
+
+  CXXRecordDecl *recordDecl = typeDeclBuilder.completeDefinition();
+
+  QualType indexType = context.UnsignedIntTy;
+  QualType resultType = context.getRecordType(recordDecl);
+  resultType = context.getConstType(resultType);
+
+  CXXMethodDecl *functionDecl = CreateObjectFunctionDeclarationWithParams(
+        context, recordDecl, resultType, ArrayRef<QualType>(indexType),
+        ArrayRef<StringRef>(StringRef("index")),
+      context.DeclarationNames.getCXXOperatorName(OO_Subscript), true);
+  // Mark function as createResourceFromHeap intrinsic.
+  functionDecl->addAttr(HLSLIntrinsicAttr::CreateImplicit(
+      context, "op", "",
+      static_cast<int>(hlsl::IntrinsicOp::IOP_CreateResourceFromHeap)));
+  return recordDecl;
+}
+
+VarDecl *hlsl::DeclareBuiltinGlobal(llvm::StringRef name, clang::QualType Ty,
+                              clang::ASTContext &context) {
+  IdentifierInfo &II = context.Idents.get(name);
+
+  auto *curDeclCtx =context.getTranslationUnitDecl();
+
+  VarDecl *varDecl = VarDecl::Create(context, curDeclCtx,
+                         SourceLocation(), SourceLocation(), &II, Ty,
+                         context.getTrivialTypeSourceInfo(Ty),
+                         StorageClass::SC_Extern);
+  // Mark implicit to avoid print it when rewrite.
+  varDecl->setImplicit();
+  curDeclCtx->addDecl(varDecl);
+  return varDecl;
 }
 
 bool hlsl::IsIntrinsicOp(const clang::FunctionDecl *FD) {
@@ -1196,6 +1169,9 @@ UnusualAnnotation* hlsl::UnusualAnnotation::CopyToASTContext(ASTContext& Context
     break;
   case UA_ConstantPacking:
     instanceSize = sizeof(hlsl::ConstantPacking);
+    break;  
+  case UA_PayloadAccessQualifier:
+    instanceSize = sizeof(hlsl::PayloadAccessAnnotation);
     break;
   default:
     DXASSERT(Kind == UA_SemanticDecl, "Kind == UA_SemanticDecl -- otherwise switch is incomplete");

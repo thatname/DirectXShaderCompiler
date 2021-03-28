@@ -25,16 +25,20 @@ import hctdb_instrhelp
   IOP_AddUint64,
   IOP_AllMemoryBarrier,
   IOP_AllMemoryBarrierWithGroupSync,
+  IOP_AllocateRayQuery,
   IOP_CallShader,
   IOP_CheckAccessFullyMapped,
+  IOP_CreateResourceFromHeap,
   IOP_D3DCOLORtoUBYTE4,
   IOP_DeviceMemoryBarrier,
   IOP_DeviceMemoryBarrierWithGroupSync,
+  IOP_DispatchMesh,
   IOP_DispatchRaysDimensions,
   IOP_DispatchRaysIndex,
   IOP_EvaluateAttributeAtSample,
   IOP_EvaluateAttributeCentroid,
   IOP_EvaluateAttributeSnapped,
+  IOP_GeometryIndex,
   IOP_GetAttributeAtVertex,
   IOP_GetRenderTargetSampleCount,
   IOP_GetRenderTargetSamplePosition,
@@ -47,12 +51,15 @@ import hctdb_instrhelp
   IOP_InterlockedAdd,
   IOP_InterlockedAnd,
   IOP_InterlockedCompareExchange,
+  IOP_InterlockedCompareExchangeFloatBitwise,
   IOP_InterlockedCompareStore,
+  IOP_InterlockedCompareStoreFloatBitwise,
   IOP_InterlockedExchange,
   IOP_InterlockedMax,
   IOP_InterlockedMin,
   IOP_InterlockedOr,
   IOP_InterlockedXor,
+  IOP_IsHelperLane,
   IOP_NonUniformResourceIndex,
   IOP_ObjectRayDirection,
   IOP_ObjectRayOrigin,
@@ -78,6 +85,7 @@ import hctdb_instrhelp
   IOP_RayTCurrent,
   IOP_RayTMin,
   IOP_ReportHit,
+  IOP_SetMeshOutputCounts,
   IOP_TraceRay,
   IOP_WaveActiveAllEqual,
   IOP_WaveActiveAllTrue,
@@ -94,6 +102,13 @@ import hctdb_instrhelp
   IOP_WaveGetLaneCount,
   IOP_WaveGetLaneIndex,
   IOP_WaveIsFirstLane,
+  IOP_WaveMatch,
+  IOP_WaveMultiPrefixBitAnd,
+  IOP_WaveMultiPrefixBitOr,
+  IOP_WaveMultiPrefixBitXor,
+  IOP_WaveMultiPrefixCountBits,
+  IOP_WaveMultiPrefixProduct,
+  IOP_WaveMultiPrefixSum,
   IOP_WavePrefixCountBits,
   IOP_WavePrefixProduct,
   IOP_WavePrefixSum,
@@ -170,7 +185,12 @@ import hctdb_instrhelp
   IOP_msad4,
   IOP_mul,
   IOP_normalize,
+  IOP_pack_clamp_s8,
+  IOP_pack_clamp_u8,
+  IOP_pack_s8,
+  IOP_pack_u8,
   IOP_pow,
+  IOP_printf,
   IOP_radians,
   IOP_rcp,
   IOP_reflect,
@@ -211,6 +231,13 @@ import hctdb_instrhelp
   IOP_texCUBEproj,
   IOP_transpose,
   IOP_trunc,
+  IOP_unpack_s8s16,
+  IOP_unpack_s8s32,
+  IOP_unpack_u8u16,
+  IOP_unpack_u8u32,
+#ifdef ENABLE_SPIRV_CODEGEN
+  IOP_VkReadClock,
+#endif // ENABLE_SPIRV_CODEGEN
   MOP_Append,
   MOP_RestartStrip,
   MOP_CalculateLevelOfDetail,
@@ -238,14 +265,26 @@ import hctdb_instrhelp
   MOP_Load3,
   MOP_Load4,
   MOP_InterlockedAdd,
+  MOP_InterlockedAdd64,
   MOP_InterlockedAnd,
+  MOP_InterlockedAnd64,
   MOP_InterlockedCompareExchange,
+  MOP_InterlockedCompareExchange64,
+  MOP_InterlockedCompareExchangeFloatBitwise,
   MOP_InterlockedCompareStore,
+  MOP_InterlockedCompareStore64,
+  MOP_InterlockedCompareStoreFloatBitwise,
   MOP_InterlockedExchange,
+  MOP_InterlockedExchange64,
+  MOP_InterlockedExchangeFloat,
   MOP_InterlockedMax,
+  MOP_InterlockedMax64,
   MOP_InterlockedMin,
+  MOP_InterlockedMin64,
   MOP_InterlockedOr,
+  MOP_InterlockedOr64,
   MOP_InterlockedXor,
+  MOP_InterlockedXor64,
   MOP_Store,
   MOP_Store2,
   MOP_Store3,
@@ -253,6 +292,50 @@ import hctdb_instrhelp
   MOP_DecrementCounter,
   MOP_IncrementCounter,
   MOP_Consume,
+  MOP_WriteSamplerFeedback,
+  MOP_WriteSamplerFeedbackBias,
+  MOP_WriteSamplerFeedbackGrad,
+  MOP_WriteSamplerFeedbackLevel,
+  MOP_Abort,
+  MOP_CandidateGeometryIndex,
+  MOP_CandidateInstanceContributionToHitGroupIndex,
+  MOP_CandidateInstanceID,
+  MOP_CandidateInstanceIndex,
+  MOP_CandidateObjectRayDirection,
+  MOP_CandidateObjectRayOrigin,
+  MOP_CandidateObjectToWorld3x4,
+  MOP_CandidateObjectToWorld4x3,
+  MOP_CandidatePrimitiveIndex,
+  MOP_CandidateProceduralPrimitiveNonOpaque,
+  MOP_CandidateTriangleBarycentrics,
+  MOP_CandidateTriangleFrontFace,
+  MOP_CandidateTriangleRayT,
+  MOP_CandidateType,
+  MOP_CandidateWorldToObject3x4,
+  MOP_CandidateWorldToObject4x3,
+  MOP_CommitNonOpaqueTriangleHit,
+  MOP_CommitProceduralPrimitiveHit,
+  MOP_CommittedGeometryIndex,
+  MOP_CommittedInstanceContributionToHitGroupIndex,
+  MOP_CommittedInstanceID,
+  MOP_CommittedInstanceIndex,
+  MOP_CommittedObjectRayDirection,
+  MOP_CommittedObjectRayOrigin,
+  MOP_CommittedObjectToWorld3x4,
+  MOP_CommittedObjectToWorld4x3,
+  MOP_CommittedPrimitiveIndex,
+  MOP_CommittedRayT,
+  MOP_CommittedStatus,
+  MOP_CommittedTriangleBarycentrics,
+  MOP_CommittedTriangleFrontFace,
+  MOP_CommittedWorldToObject3x4,
+  MOP_CommittedWorldToObject4x3,
+  MOP_Proceed,
+  MOP_RayFlags,
+  MOP_RayTMin,
+  MOP_TraceRayInline,
+  MOP_WorldRayDirection,
+  MOP_WorldRayOrigin,
 #ifdef ENABLE_SPIRV_CODEGEN
   MOP_SubpassLoad,
 #endif // ENABLE_SPIRV_CODEGEN
@@ -263,6 +346,8 @@ import hctdb_instrhelp
   IOP_WaveActiveUMin,
   IOP_WaveActiveUProduct,
   IOP_WaveActiveUSum,
+  IOP_WaveMultiPrefixUProduct,
+  IOP_WaveMultiPrefixUSum,
   IOP_WavePrefixUProduct,
   IOP_WavePrefixUSum,
   IOP_uabs,
@@ -293,6 +378,8 @@ import hctdb_instrhelp
   case IntrinsicOp::IOP_WaveActiveMin:
   case IntrinsicOp::IOP_WaveActiveProduct:
   case IntrinsicOp::IOP_WaveActiveSum:
+  case IntrinsicOp::IOP_WaveMultiPrefixProduct:
+  case IntrinsicOp::IOP_WaveMultiPrefixSum:
   case IntrinsicOp::IOP_WavePrefixProduct:
   case IntrinsicOp::IOP_WavePrefixSum:
   case IntrinsicOp::IOP_abs:
@@ -304,7 +391,9 @@ import hctdb_instrhelp
   case IntrinsicOp::IOP_mul:
   case IntrinsicOp::IOP_sign:
   case IntrinsicOp::MOP_InterlockedMax:
+  case IntrinsicOp::MOP_InterlockedMax64:
   case IntrinsicOp::MOP_InterlockedMin:
+  case IntrinsicOp::MOP_InterlockedMin64:
 // HLSL-HAS-UNSIGNED-INTRINSICS:END
     return true;
   default:
@@ -332,6 +421,10 @@ import hctdb_instrhelp
     return static_cast<unsigned>(IntrinsicOp::IOP_WaveActiveUProduct);
   case IntrinsicOp::IOP_WaveActiveSum:
     return static_cast<unsigned>(IntrinsicOp::IOP_WaveActiveUSum);
+  case IntrinsicOp::IOP_WaveMultiPrefixProduct:
+    return static_cast<unsigned>(IntrinsicOp::IOP_WaveMultiPrefixUProduct);
+  case IntrinsicOp::IOP_WaveMultiPrefixSum:
+    return static_cast<unsigned>(IntrinsicOp::IOP_WaveMultiPrefixUSum);
   case IntrinsicOp::IOP_WavePrefixProduct:
     return static_cast<unsigned>(IntrinsicOp::IOP_WavePrefixUProduct);
   case IntrinsicOp::IOP_WavePrefixSum:
@@ -354,7 +447,11 @@ import hctdb_instrhelp
     return static_cast<unsigned>(IntrinsicOp::IOP_usign);
   case IntrinsicOp::MOP_InterlockedMax:
     return static_cast<unsigned>(IntrinsicOp::MOP_InterlockedUMax);
+  case IntrinsicOp::MOP_InterlockedMax64:
+    return static_cast<unsigned>(IntrinsicOp::MOP_InterlockedUMax);
   case IntrinsicOp::MOP_InterlockedMin:
+    return static_cast<unsigned>(IntrinsicOp::MOP_InterlockedUMin);
+  case IntrinsicOp::MOP_InterlockedMin64:
     return static_cast<unsigned>(IntrinsicOp::MOP_InterlockedUMin);
 // HLSL-GET-UNSIGNED-INTRINSICS:END
   default:

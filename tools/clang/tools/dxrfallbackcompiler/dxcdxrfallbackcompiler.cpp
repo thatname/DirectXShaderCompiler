@@ -110,13 +110,13 @@ static DxilModule* ExtractDxil(LLVMContext& context, IDxcBlob* pContainer)
 }
 
 
-static void saveModuleToAsmFile(const llvm::Module* module, const std::string& filename)
+static void saveModuleToAsmFile(const llvm::Module* mod, const std::string& filename)
 {
   std::error_code EC;
   raw_fd_ostream out(filename, EC, sys::fs::F_Text);
   if (!out.has_error())
   {
-    module->print(out, nullptr);
+    mod->print(out, nullptr);
     out.close();
   }
   if (out.has_error())
@@ -251,7 +251,7 @@ HRESULT STDMETHODCALLTYPE DxcDxrFallbackCompiler::RenameAndLink(
 
         // Create a diagnostic printer
         CComPtr<AbstractMemoryStream> pDiagStream;
-        IFT(CreateMemoryStream(TM.p, &pDiagStream));
+        IFT(CreateMemoryStream(TM.GetInstalledAllocator(), &pDiagStream));
         raw_stream_ostream DiagStream(pDiagStream);
         DiagnosticPrinterRawOStream DiagPrinter(DiagStream);
         PrintDiagnosticContext DiagContext(DiagPrinter);
@@ -318,19 +318,16 @@ HRESULT STDMETHODCALLTYPE DxcDxrFallbackCompiler::RenameAndLink(
         if (M)
         {
             CComPtr<AbstractMemoryStream> pOutputStream;
-            IFT(CreateMemoryStream(TM.p, &pOutputStream));
+            IFT(CreateMemoryStream(TM.GetInstalledAllocator(), &pOutputStream));
             raw_stream_ostream outStream(pOutputStream.p);
             WriteBitcodeToFile(M.get(), outStream);
             outStream.flush();
 
             // Validation.
-            dxcutil::AssembleToContainer(
-                std::move(M), pResultBlob, TM.p, SerializeDxilFlags::None,
-                pOutputStream
-#if !DISABLE_GET_CUSTOM_DIAG_ID
-                , Diag
-#endif
-            );
+            dxcutil::AssembleInputs inputs(
+                std::move(M), pResultBlob, TM.GetInstalledAllocator(), SerializeDxilFlags::None,
+                pOutputStream);
+            dxcutil::AssembleToContainer(inputs);
         }
 
         DiagStream.flush();
@@ -371,7 +368,7 @@ HRESULT STDMETHODCALLTYPE DxcDxrFallbackCompiler::PatchShaderBindingTables(
 
         // Create a diagnostic printer
         CComPtr<AbstractMemoryStream> pDiagStream;
-        IFT(CreateMemoryStream(TM.p, &pDiagStream));
+        IFT(CreateMemoryStream(TM.GetInstalledAllocator(), &pDiagStream));
         raw_stream_ostream DiagStream(pDiagStream);
         DiagnosticPrinterRawOStream DiagPrinter(DiagStream);
         PrintDiagnosticContext DiagContext(DiagPrinter);
@@ -404,16 +401,17 @@ HRESULT STDMETHODCALLTYPE DxcDxrFallbackCompiler::PatchShaderBindingTables(
         if (M)
         {
             CComPtr<AbstractMemoryStream> pOutputStream;
-            IFT(CreateMemoryStream(TM.p, &pOutputStream));
+            IFT(CreateMemoryStream(TM.GetInstalledAllocator(), &pOutputStream));
             raw_stream_ostream outStream(pOutputStream.p);
             WriteBitcodeToFile(M.get(), outStream);
             outStream.flush();
-            dxcutil::AssembleToContainer(
+            dxcutil::AssembleInputs inputs(
                 std::move(M),
                 pResultBlob,
-                TM.p,
+                TM.GetInstalledAllocator(),
                 SerializeDxilFlags::None,
                 pOutputStream);
+            dxcutil::AssembleToContainer(inputs);
         }
 
         DiagStream.flush();
@@ -459,7 +457,7 @@ HRESULT STDMETHODCALLTYPE DxcDxrFallbackCompiler::Link(
 
         // Create a diagnostic printer
         CComPtr<AbstractMemoryStream> pDiagStream;
-        IFT(CreateMemoryStream(TM.p, &pDiagStream));
+        IFT(CreateMemoryStream(TM.GetInstalledAllocator(), &pDiagStream));
         raw_stream_ostream DiagStream(pDiagStream);
         DiagnosticPrinterRawOStream DiagPrinter(DiagStream);
         PrintDiagnosticContext DiagContext(DiagPrinter);
@@ -558,20 +556,18 @@ HRESULT STDMETHODCALLTYPE DxcDxrFallbackCompiler::Link(
         if (M)
         {
             CComPtr<AbstractMemoryStream> pOutputStream;
-            IFT(CreateMemoryStream(TM.p, &pOutputStream));
+            IFT(CreateMemoryStream(TM.GetInstalledAllocator(), &pOutputStream));
             raw_stream_ostream outStream(pOutputStream.p);
             WriteBitcodeToFile(M.get(), outStream);
             outStream.flush();
 
             // Validation.
-            HRESULT valHR = dxcutil::ValidateAndAssembleToContainer(
-                std::move(M), pResultBlob, TM.p, SerializeDxilFlags::None,
+            dxcutil::AssembleInputs inputs(
+                std::move(M), pResultBlob, TM.GetInstalledAllocator(), SerializeDxilFlags::None,
                 pOutputStream,
                 /*bDebugInfo*/ false
-#if !DISABLE_GET_CUSTOM_DIAG_ID
-                , Diag
-#endif
             );
+            HRESULT valHR = dxcutil::ValidateAndAssembleToContainer(inputs);
 
             if (FAILED(valHR))
                 hasErrors = true;
@@ -625,7 +621,7 @@ HRESULT STDMETHODCALLTYPE DxcDxrFallbackCompiler::Compile(
 
     // Create a diagnostic printer
     CComPtr<AbstractMemoryStream> pDiagStream;
-    IFT(CreateMemoryStream(TM.p, &pDiagStream));
+    IFT(CreateMemoryStream(TM.GetInstalledAllocator(), &pDiagStream));
     raw_stream_ostream DiagStream(pDiagStream);
     DiagnosticPrinterRawOStream DiagPrinter(DiagStream);
     PrintDiagnosticContext DiagContext(DiagPrinter);
@@ -719,16 +715,17 @@ HRESULT STDMETHODCALLTYPE DxcDxrFallbackCompiler::Compile(
     if (M)
     {
       CComPtr<AbstractMemoryStream> pOutputStream;
-      IFT(CreateMemoryStream(TM.p, &pOutputStream));
+      IFT(CreateMemoryStream(TM.GetInstalledAllocator(), &pOutputStream));
       raw_stream_ostream outStream(pOutputStream.p);
       WriteBitcodeToFile(M.get(), outStream);
       outStream.flush();
-      dxcutil::AssembleToContainer(
+      dxcutil::AssembleInputs inputs(
           std::move(M), 
           pResultBlob, 
-          TM.p, 
+          TM.GetInstalledAllocator(),
           SerializeDxilFlags::None,
           pOutputStream);
+      dxcutil::AssembleToContainer(inputs);
     }
 
     DiagStream.flush();

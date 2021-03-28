@@ -11,15 +11,20 @@
 
 #pragma once
 
+#include "llvm/IR/IRBuilder.h"
 #include <string>
 
 namespace llvm {
-class Module;
-class Function;
-class CallInst;
 class Argument;
-class StringRef;
+template<typename T> class ArrayRef;
+class AttributeSet;
+class CallInst;
+class Function;
 class FunctionType;
+class Module;
+class StringRef;
+class Type;
+class Value;
 }
 
 namespace hlsl {
@@ -36,6 +41,7 @@ enum class HLOpcodeGroup {
   HLMatLoadStore,
   HLSelect,
   HLCreateHandle,
+  HLAnnotateHandle,
   NumOfHLOps
 };
 
@@ -122,6 +128,9 @@ unsigned  GetHLOpcode(const llvm::CallInst *CI);
 unsigned  GetRowMajorOpcode(HLOpcodeGroup group, unsigned opcode);
 void SetHLLowerStrategy(llvm::Function *F, llvm::StringRef S);
 
+void SetHLWaveSensitive(llvm::Function *F);
+bool IsHLWaveSensitive(llvm::Function *F);
+
 // For intrinsic opcode.
 bool HasUnsignedOpcode(unsigned opcode);
 unsigned GetUnsignedOpcode(unsigned opcode);
@@ -134,6 +143,9 @@ llvm::StringRef GetHLOpcodeGroupName(HLOpcodeGroup op);
 namespace HLOperandIndex {
 // Opcode parameter.
 const unsigned kOpcodeIdx = 0;
+
+// Used to initialize values that have no valid index in the HL overload.
+const unsigned kInvalidIdx = UINT32_MAX;
 
 // Matrix store.
 const unsigned kMatStoreDstPtrOpIdx = 1;
@@ -180,6 +192,9 @@ const unsigned kTrinaryOpSrc2Idx = 3;
 const unsigned kInterlockedDestOpIndex = 1;
 const unsigned kInterlockedValueOpIndex = 2;
 const unsigned kInterlockedOriginalValueOpIndex = 3;
+
+// Interlocked method
+const unsigned kInterlockedMethodValueOpIndex = 3;
 
 // InterlockedCompareExchange.
 const unsigned kInterlockedCmpDestOpIndex = 1;
@@ -288,6 +303,7 @@ const unsigned kGatherOffsetArgIndex = 4;
 const unsigned kGatherStatusArgIndex = 5;
 const unsigned kGatherSampleOffsetArgIndex = 5;
 const unsigned kGatherStatusWithSampleOffsetArgIndex = 8;
+const unsigned kGatherCubeStatusArgIndex = 4;
 
 // GatherCmp.
 const unsigned kGatherCmpCmpValArgIndex = 4;
@@ -295,6 +311,19 @@ const unsigned kGatherCmpOffsetArgIndex = 5;
 const unsigned kGatherCmpStatusArgIndex = 6;
 const unsigned kGatherCmpSampleOffsetArgIndex = 6;
 const unsigned kGatherCmpStatusWithSampleOffsetArgIndex = 9;
+const unsigned kGatherCmpCubeStatusArgIndex = 5;
+
+// WriteSamplerFeedback.
+const unsigned kWriteSamplerFeedbackSampledArgIndex = 2;
+const unsigned kWriteSamplerFeedbackSamplerArgIndex = 3;
+const unsigned kWriteSamplerFeedbackCoordArgIndex = 4;
+const unsigned kWriteSamplerFeedbackBias_BiasArgIndex = 5;
+const unsigned kWriteSamplerFeedbackLevel_LodArgIndex = 5;
+const unsigned kWriteSamplerFeedbackGrad_DdxArgIndex = 5;
+const unsigned kWriteSamplerFeedbackGrad_DdyArgIndex = 6;
+const unsigned kWriteSamplerFeedback_ClampArgIndex = 5;
+const unsigned kWriteSamplerFeedbackBias_ClampArgIndex = 6;
+const unsigned kWriteSamplerFeedbackGrad_ClampArgIndex = 7;
 
 // StreamAppend.
 const unsigned kStreamAppendStreamOpIndex = 1;
@@ -329,12 +358,29 @@ const unsigned kWaveAllEqualValueOpIdx = 1;
 const unsigned kCreateHandleResourceOpIdx = 1;
 const unsigned kCreateHandleIndexOpIdx = 2; // Only for array of cbuffer.
 
+// AnnotateHandle.
+const unsigned kAnnotateHandleHandleOpIdx = 1;
+const unsigned kAnnotateHandleResourcePropertiesOpIdx = 2;
+const unsigned kAnnotateHandleResourceTypeOpIdx = 3;
+
 // TraceRay.
 const unsigned kTraceRayRayDescOpIdx = 7;
 const unsigned kTraceRayPayLoadOpIdx = 8;
 
+// CallShader.
+const unsigned kCallShaderPayloadOpIdx = 2;
+
+// TraceRayInline.
+const unsigned kTraceRayInlineRayDescOpIdx = 5;
+
 // ReportIntersection.
 const unsigned kReportIntersectionAttributeOpIdx = 3;
+
+// DispatchMesh
+const unsigned kDispatchMeshOpThreadX = 1;
+const unsigned kDispatchMeshOpThreadY = 2;
+const unsigned kDispatchMeshOpThreadZ = 3;
+const unsigned kDispatchMeshOpPayload = 4;
 
 } // namespace HLOperandIndex
 
@@ -348,9 +394,30 @@ llvm::Function *GetOrCreateHLFunction(llvm::Module &M,
                                       llvm::StringRef *fnName,
                                       unsigned opcode);
 
+llvm::Function *GetOrCreateHLFunction(llvm::Module &M,
+                                      llvm::FunctionType *funcTy,
+                                      HLOpcodeGroup group, unsigned opcode,
+                                      const llvm::AttributeSet &attribs);
+llvm::Function *GetOrCreateHLFunction(llvm::Module &M,
+                                      llvm::FunctionType *funcTy,
+                                      HLOpcodeGroup group,
+                                      llvm::StringRef *groupName,
+                                      llvm::StringRef *fnName,
+                                      unsigned opcode,
+                                      const llvm::AttributeSet &attribs);
+
 llvm::Function *GetOrCreateHLFunctionWithBody(llvm::Module &M,
                                               llvm::FunctionType *funcTy,
                                               HLOpcodeGroup group,
                                               unsigned opcode,
                                               llvm::StringRef name);
+
+llvm::Value *callHLFunction(llvm::Module &Module, HLOpcodeGroup OpcodeGroup, unsigned Opcode,
+                            llvm::Type *RetTy, llvm::ArrayRef<llvm::Value*> Args,
+                            const llvm::AttributeSet &attribs, llvm::IRBuilder<> &Builder);
+
+llvm::Value *callHLFunction(llvm::Module &Module, HLOpcodeGroup OpcodeGroup, unsigned Opcode,
+                            llvm::Type *RetTy, llvm::ArrayRef<llvm::Value*> Args,
+                            llvm::IRBuilder<> &Builder);
+
 } // namespace hlsl

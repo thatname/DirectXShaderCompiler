@@ -108,6 +108,30 @@ namespace hlsl {
     void SetShadingRate(bool flag) { m_bShadingRate = flag; }
     bool GetShadingRate() const { return m_bShadingRate; }
 
+    void SetRaytracingTier1_1(bool flag) { m_bRaytracingTier1_1 = flag; }
+    bool GetRaytracingTier1_1() const { return m_bRaytracingTier1_1; }
+
+    void SetSamplerFeedback(bool flag) { m_bSamplerFeedback = flag; }
+    bool GetSamplerFeedback() const { return m_bSamplerFeedback; }
+
+    void SetAtomicInt64OnTypedResource(bool flag) { m_bAtomicInt64OnTypedResource = flag; }
+    bool GetAtomicInt64OnTypedResource() const { return m_bAtomicInt64OnTypedResource; }
+
+    void SetAtomicInt64OnGroupShared(bool flag) { m_bAtomicInt64OnGroupShared = flag; }
+    bool GetAtomicInt64OnGroupShared() const { return m_bAtomicInt64OnGroupShared; }
+
+    void SetDerivativesInMeshAndAmpShaders(bool flag) { m_bDerivativesInMeshAndAmpShaders = flag; }
+    bool GetDerivativesInMeshAndAmpShaders() { return m_bDerivativesInMeshAndAmpShaders; }
+
+    void SetAtomicInt64OnHeapResource(bool flag) { m_bAtomicInt64OnHeapResource = flag; }
+    bool GetAtomicInt64OnHeapResource() const { return m_bAtomicInt64OnHeapResource; }
+
+    void SetResourceDescriptorHeapIndexing(bool flag) { m_bResourceDescriptorHeapIndexing = flag; }
+    bool GetResourceDescriptorHeapIndexing() const { return m_bResourceDescriptorHeapIndexing; }
+
+    void SetSamplerDescriptorHeapIndexing(bool flag) { m_bSamplerDescriptorHeapIndexing = flag; }
+    bool GetSamplerDescriptorHeapIndexing() const { return m_bSamplerDescriptorHeapIndexing; }
+
   private:
     unsigned m_bDisableOptimizations :1;   // D3D11_1_SB_GLOBAL_FLAG_SKIP_OPTIMIZATION
     unsigned m_bDisableMathRefactoring :1; //~D3D10_SB_GLOBAL_FLAG_REFACTORING_ALLOWED
@@ -143,8 +167,20 @@ namespace hlsl {
 
     unsigned m_bShadingRate : 1;      // SHADER_FEATURE_SHADINGRATE
 
-    unsigned m_align0 : 7;        // align to 32 bit.
-    uint32_t m_align1;            // align to 64 bit.
+    unsigned m_bRaytracingTier1_1 : 1; // SHADER_FEATURE_RAYTRACING_TIER_1_1
+    unsigned m_bSamplerFeedback : 1; // SHADER_FEATURE_SAMPLER_FEEDBACK
+
+    unsigned m_bAtomicInt64OnTypedResource : 1; // SHADER_FEATURE_ATOMIC_INT64_ON_TYPED_RESOURCE
+    unsigned m_bAtomicInt64OnGroupShared : 1; // SHADER_FEATURE_ATOMIC_INT64_ON_GROUP_SHARED
+
+    unsigned m_bDerivativesInMeshAndAmpShaders : 1; //SHADER_FEATURE_DERIVATIVES_IN_MESH_AND_AMPLIFICATION_SHADERS
+
+    unsigned m_bResourceDescriptorHeapIndexing : 1;  // SHADER_FEATURE_RESOURCE_DESCRIPTOR_HEAP_INDEXING
+    unsigned m_bSamplerDescriptorHeapIndexing : 1;  // SHADER_FEATURE_SAMPLER_DESCRIPTOR_HEAP_INDEXING
+
+    unsigned m_bAtomicInt64OnHeapResource : 1; // SHADER_FEATURE_ATOMIC_INT64_ON_DESCRIPTOR_HEAP_RESOURCE
+
+    uint32_t m_align1 : 31;            // align to 64 bit.
   };
 
 

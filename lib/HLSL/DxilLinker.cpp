@@ -17,8 +17,10 @@
 #include "dxc/DXIL/DxilSampler.h"
 #include "dxc/DXIL/DxilUtil.h"
 #include "dxc/Support/Global.h"
-#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -50,7 +52,7 @@ using namespace hlsl;
 namespace {
 
 void CollectUsedFunctions(Constant *C,
-                          std::unordered_set<Function *> &funcSet) {
+                          llvm::SetVector<Function *> &funcSet) {
   for (User *U : C->users()) {
     if (Instruction *I = dyn_cast<Instruction>(U)) {
       funcSet.insert(I->getParent()->getParent());
@@ -64,7 +66,7 @@ void CollectUsedFunctions(Constant *C,
 template <class T>
 void AddResourceMap(
     const std::vector<std::unique_ptr<T>> &resTab, DXIL::ResourceClass resClass,
-    std::unordered_map<const llvm::Constant *, DxilResourceBase *> &resMap,
+    llvm::MapVector<const llvm::Constant *, DxilResourceBase *> &resMap,
     DxilModule &DM) {
   for (auto &Res : resTab) {
     resMap[Res->GetGlobalSymbol()] = Res.get();
@@ -101,9 +103,9 @@ namespace {
 struct DxilFunctionLinkInfo {
   DxilFunctionLinkInfo(llvm::Function *F);
   llvm::Function *func;
-  std::unordered_set<llvm::Function *> usedFunctions;
-  std::unordered_set<llvm::GlobalVariable *> usedGVs;
-  std::unordered_set<DxilResourceBase *> usedResources;
+  // SetVectors for deterministic iteration
+  llvm::SetVector<llvm::Function *> usedFunctions;
+  llvm::SetVector<llvm::GlobalVariable *> usedGVs;
 };
 
 // Library to link.
@@ -117,24 +119,28 @@ public:
     return m_functionNameMap;
   }
   bool IsInitFunc(llvm::Function *F);
+  bool IsEntry(llvm::Function *F);
   bool IsResourceGlobal(const llvm::Constant *GV);
   DxilResourceBase *GetResource(const llvm::Constant *GV);
 
   DxilModule &GetDxilModule() { return m_DM; }
   void LazyLoadFunction(Function *F);
   void BuildGlobalUsage();
-  void CollectUsedInitFunctions(StringSet<> &addedFunctionSet,
+  void CollectUsedInitFunctions(SetVector<StringRef> &addedFunctionSet,
                                 SmallVector<StringRef, 4> &workList);
+
+  void FixIntrinsicOverloads();
 
 private:
   std::unique_ptr<llvm::Module> m_pModule;
   DxilModule &m_DM;
   // Map from name to Link info for extern functions.
   llvm::StringMap<std::unique_ptr<DxilFunctionLinkInfo>> m_functionNameMap;
-  // Map from resource link global to resource.
-  std::unordered_map<const llvm::Constant *, DxilResourceBase *> m_resourceMap;
-  // Set of initialize functions for global variable.
-  std::unordered_set<llvm::Function *> m_initFuncSet;
+  llvm::SmallPtrSet<llvm::Function*,4>  m_entrySet;
+  // Map from resource link global to resource. MapVector for deterministic iteration.
+  llvm::MapVector<const llvm::Constant *, DxilResourceBase *> m_resourceMap;
+  // Set of initialize functions for global variable. SetVector for deterministic iteration.
+  llvm::SetVector<llvm::Function *> m_initFuncSet;
 };
 
 struct DxilLinkJob;
@@ -157,7 +163,7 @@ private:
   bool AttachLib(DxilLib *lib);
   bool DetachLib(DxilLib *lib);
   bool AddFunctions(SmallVector<StringRef, 4> &workList,
-                    DenseSet<DxilLib *> &libSet, StringSet<> &addedFunctionSet,
+                    SetVector<DxilLib *> &libSet, SetVector<StringRef> &addedFunctionSet,
                     DxilLinkJob &linkJob, bool bLazyLoadDone,
                     bool bAllowFuncionDecls);
   // Attached libs to link.
@@ -186,7 +192,7 @@ DxilFunctionLinkInfo::DxilFunctionLinkInfo(Function *F) : func(F) {
 DxilLib::DxilLib(std::unique_ptr<llvm::Module> pModule)
     : m_pModule(std::move(pModule)), m_DM(m_pModule->GetOrCreateDxilModule()) {
   Module &M = *m_pModule;
-  const std::string &MID = M.getModuleIdentifier();
+  const std::string MID = (Twine(M.getModuleIdentifier()) + ".").str();
 
   // Collect function defines.
   for (Function &F : M.functions()) {
@@ -198,6 +204,8 @@ DxilLib::DxilLib(std::unique_ptr<llvm::Module> pModule)
     }
     m_functionNameMap[F.getName()] =
         llvm::make_unique<DxilFunctionLinkInfo>(&F);
+    if (m_DM.IsEntry(&F))
+      m_entrySet.insert(&F);
   }
 
   // Update internal global name.
@@ -207,6 +215,15 @@ DxilLib::DxilLib(std::unique_ptr<llvm::Module> pModule)
       GV.setName(MID + GV.getName());
     }
   }
+
+}
+
+void DxilLib::FixIntrinsicOverloads() {
+  // Fix DXIL overload name collisions that may be caused by name
+  // collisions between dxil ops with different overload types,
+  // when those types may have had the same name in the original
+  // modules.
+  m_DM.GetOP()->FixOverloadNames();
 }
 
 void DxilLib::LazyLoadFunction(Function *F) {
@@ -264,7 +281,7 @@ void DxilLib::BuildGlobalUsage() {
 
   // Build used globals.
   for (GlobalVariable &GV : M.globals()) {
-    std::unordered_set<Function *> funcSet;
+    llvm::SetVector<Function *> funcSet;
     CollectUsedFunctions(&GV, funcSet);
     for (Function *F : funcSet) {
       DXASSERT(m_functionNameMap.count(F->getName()), "must exist in table");
@@ -282,7 +299,7 @@ void DxilLib::BuildGlobalUsage() {
                  m_resourceMap, m_DM);
 }
 
-void DxilLib::CollectUsedInitFunctions(StringSet<> &addedFunctionSet,
+void DxilLib::CollectUsedInitFunctions(SetVector<StringRef> &addedFunctionSet,
                                        SmallVector<StringRef, 4> &workList) {
   // Add init functions to used functions.
   for (Function *Ctor : m_initFuncSet) {
@@ -292,7 +309,7 @@ void DxilLib::CollectUsedInitFunctions(StringSet<> &addedFunctionSet,
     // If function other than Ctor used GV of Ctor.
     // Add Ctor to usedFunctions for it.
     for (GlobalVariable *GV : linkInfo->usedGVs) {
-      std::unordered_set<Function *> funcSet;
+      llvm::SetVector<Function *> funcSet;
       CollectUsedFunctions(GV, funcSet);
       bool bAdded = false;
       for (Function *F : funcSet) {
@@ -315,6 +332,7 @@ bool DxilLib::HasFunction(std::string &name) {
   return m_functionNameMap.count(name);
 }
 
+bool DxilLib::IsEntry(llvm::Function *F) { return m_entrySet.count(F); }
 bool DxilLib::IsInitFunc(llvm::Function *F) { return m_initFuncSet.count(F); }
 bool DxilLib::IsResourceGlobal(const llvm::Constant *GV) {
   return m_resourceMap.count(GV);
@@ -339,6 +357,8 @@ struct DxilLinkJob {
        const ShaderModel *pSM);
   std::unique_ptr<llvm::Module> LinkToLib(const ShaderModel *pSM);
   void StripDeadDebugInfo(llvm::Module &M);
+  // Fix issues when link to different shader model.
+  void FixShaderModelMismatch(llvm::Module &M);
   void RunPreparePass(llvm::Module &M);
   void AddFunction(std::pair<DxilFunctionLinkInfo *, DxilLib *> &linkPair);
   void AddFunction(llvm::Function *F);
@@ -347,20 +367,30 @@ private:
   void LinkNamedMDNodes(Module *pM, ValueToValueMapTy &vmap);
   void AddFunctionDecls(Module *pM);
   bool AddGlobals(DxilModule &DM, ValueToValueMapTy &vmap);
+  void EmitCtorListForLib(Module *pM);
   void CloneFunctions(ValueToValueMapTy &vmap);
-  void AddFunctions(DxilModule &DM, ValueToValueMapTy &vmap,
-                    std::unordered_set<Function *> &initFuncSet);
+  void AddFunctions(DxilModule &DM, ValueToValueMapTy &vmap);
   bool AddResource(DxilResourceBase *res, llvm::GlobalVariable *GV);
   void AddResourceToDM(DxilModule &DM);
-  std::unordered_map<DxilFunctionLinkInfo *, DxilLib *> m_functionDefs;
-  llvm::StringMap<llvm::Function *> m_functionDecls;
-  // New created functions.
-  llvm::StringMap<llvm::Function *> m_newFunctions;
-  // New created globals.
-  llvm::StringMap<llvm::GlobalVariable *> m_newGlobals;
-  // Map for resource.
-  llvm::StringMap<std::pair<DxilResourceBase *, llvm::GlobalVariable *>>
-      m_resourceMap;
+  llvm::MapVector<DxilFunctionLinkInfo *, DxilLib *> m_functionDefs;
+
+  // Function decls, in order added.
+  llvm::MapVector<llvm::StringRef,
+                  std::pair<llvm::SmallPtrSet<llvm::FunctionType *, 2>,
+                            llvm::SmallVector<llvm::Function *, 2>>>
+    m_functionDecls;
+
+  // New created functions, in order added.
+  llvm::MapVector<llvm::StringRef, llvm::Function *> m_newFunctions;
+
+  // New created globals, in order added.
+  llvm::MapVector<llvm::StringRef, llvm::GlobalVariable *> m_newGlobals;
+
+  // Map for resource, ordered by name.
+  std::map<llvm::StringRef,
+           std::pair<DxilResourceBase *, llvm::GlobalVariable *>>
+    m_resourceMap;
+
   LLVMContext &m_ctx;
   dxilutil::ExportMap &m_exportMap;
   unsigned m_valMajor, m_valMinor;
@@ -457,14 +487,15 @@ bool IsMatchedType(Type *Ty0, Type *Ty) {
 bool DxilLinkJob::AddResource(DxilResourceBase *res, llvm::GlobalVariable *GV) {
   if (m_resourceMap.count(res->GetGlobalName())) {
     DxilResourceBase *res0 = m_resourceMap[res->GetGlobalName()].first;
-    Type *Ty0 = res0->GetGlobalSymbol()->getType()->getPointerElementType();
-    Type *Ty = res->GetGlobalSymbol()->getType()->getPointerElementType();
+    Type *Ty0 = res0->GetHLSLType()->getPointerElementType();
+    Type *Ty = res->GetHLSLType()->getPointerElementType();
     // Make sure res0 match res.
     bool bMatch = IsMatchedType(Ty0, Ty);
     if (!bMatch) {
       // Report error.
-      m_ctx.emitError(Twine(kRedefineResource) + res->GetResClassName() + " for " +
-                      res->GetGlobalName());
+      dxilutil::EmitErrorOnGlobalVariable(m_ctx, dyn_cast<GlobalVariable>(res->GetGlobalSymbol()),
+                                          Twine(kRedefineResource) + res->GetResClassName() + " for " +
+                                          res->GetGlobalName());
       return false;
     }
   } else {
@@ -573,11 +604,15 @@ void DxilLinkJob::LinkNamedMDNodes(Module *pM, ValueToValueMapTy &vmap) {
 
 void DxilLinkJob::AddFunctionDecls(Module *pM) {
   for (auto &it : m_functionDecls) {
-    Function *F = it.second;
-    Function *NewF = Function::Create(F->getFunctionType(), F->getLinkage(),
-                                      F->getName(), pM);
-    NewF->setAttributes(F->getAttributes());
-    m_newFunctions[NewF->getName()] = NewF;
+    for (auto F : it.second.second) {
+      Function *NewF = pM->getFunction(F->getName());
+      if (!NewF || F->getFunctionType() != NewF->getFunctionType()) {
+        NewF = Function::Create(F->getFunctionType(), F->getLinkage(),
+                                          F->getName(), pM);
+        NewF->setAttributes(F->getAttributes());
+      }
+      m_newFunctions[F->getName()] = NewF;
+    }
   }
 }
 
@@ -607,7 +642,7 @@ bool DxilLinkJob::AddGlobals(DxilModule &DM, ValueToValueMapTy &vmap) {
           }
 
           // Redefine of global.
-          m_ctx.emitError(Twine(kRedefineGlobal) + GV->getName());
+          dxilutil::EmitErrorOnGlobalVariable(m_ctx, GV, Twine(kRedefineGlobal) + GV->getName());
           bSuccess = false;
         }
         continue;
@@ -658,8 +693,7 @@ void DxilLinkJob::CloneFunctions(ValueToValueMapTy &vmap) {
   }
 }
 
-void DxilLinkJob::AddFunctions(DxilModule &DM, ValueToValueMapTy &vmap,
-                               std::unordered_set<Function *> &initFuncSet) {
+void DxilLinkJob::AddFunctions(DxilModule &DM, ValueToValueMapTy &vmap) {
   DxilTypeSystem &typeSys = DM.GetTypeSystem();
   Module *pM = DM.GetModule();
   for (auto &it : m_functionDefs) {
@@ -684,8 +718,6 @@ void DxilLinkJob::AddFunctions(DxilModule &DM, ValueToValueMapTy &vmap,
 
     // Add to function map.
     m_newFunctions[NewF->getName()] = NewF;
-    if (pLib->IsInitFunc(F))
-      initFuncSet.insert(NewF);
 
     vmap[F] = NewF;
   }
@@ -698,7 +730,7 @@ DxilLinkJob::Link(std::pair<DxilFunctionLinkInfo *, DxilLib *> &entryLinkPair,
   DxilModule &entryDM = entryLinkPair.second->GetDxilModule();
   if (!entryDM.HasDxilFunctionProps(entryFunc)) {
     // Cannot get function props.
-    m_ctx.emitError(Twine(kNoEntryProps) + entryFunc->getName());
+    dxilutil::EmitErrorOnFunction(m_ctx, entryFunc, Twine(kNoEntryProps) + entryFunc->getName());
     return nullptr;
   }
 
@@ -706,9 +738,9 @@ DxilLinkJob::Link(std::pair<DxilFunctionLinkInfo *, DxilLib *> &entryLinkPair,
 
   if (pSM->GetKind() != props.shaderKind) {
     // Shader kind mismatch.
-    m_ctx.emitError(Twine(kShaderKindMismatch) +
-                    ShaderModel::GetKindName(pSM->GetKind()) + " and " +
-                    ShaderModel::GetKindName(props.shaderKind));
+    dxilutil::EmitErrorOnFunction(m_ctx, entryFunc, Twine(kShaderKindMismatch) +
+                                  ShaderModel::GetKindName(pSM->GetKind()) + " and " +
+                                  ShaderModel::GetKindName(props.shaderKind));
     return nullptr;
   }
 
@@ -730,9 +762,8 @@ DxilLinkJob::Link(std::pair<DxilFunctionLinkInfo *, DxilLib *> &entryLinkPair,
 
   ValueToValueMapTy vmap;
 
-  std::unordered_set<Function *> initFuncSet;
   // Add function
-  AddFunctions(DM, vmap, initFuncSet);
+  AddFunctions(DM, vmap);
 
   // Set Entry
   Function *NewEntryFunc = m_newFunctions[entryFunc->getName()];
@@ -769,11 +800,14 @@ DxilLinkJob::Link(std::pair<DxilFunctionLinkInfo *, DxilLib *> &entryLinkPair,
   CloneFunctions(vmap);
 
   // Call global constrctor.
-  IRBuilder<> Builder(dxilutil::FirstNonAllocaInsertionPt(DM.GetEntryFunction()));
+  IRBuilder<> Builder(dxilutil::FindAllocaInsertionPt(DM.GetEntryFunction()));
   for (auto &it : m_functionDefs) {
     DxilFunctionLinkInfo *linkInfo = it.first;
     DxilLib *pLib = it.second;
-
+    // Skip constructor in entry lib which is already called for entries inside
+    // entry lib.
+    if (pLib == entryLinkPair.second)
+      continue;
     Function *F = linkInfo->func;
     if (pLib->IsInitFunc(F)) {
       Function *NewF = m_newFunctions[F->getName()];
@@ -794,6 +828,49 @@ DxilLinkJob::Link(std::pair<DxilFunctionLinkInfo *, DxilLib *> &entryLinkPair,
   RunPreparePass(*pM);
 
   return pM;
+}
+
+// Based on CodeGenModule::EmitCtorList.
+void DxilLinkJob::EmitCtorListForLib(Module *pM) {
+  LLVMContext &Ctx = pM->getContext();
+
+  Type *VoidTy = Type::getVoidTy(Ctx);
+  Type *Int32Ty = Type::getInt32Ty(Ctx);
+  Type *VoidPtrTy = Type::getInt8PtrTy(Ctx);
+  // Ctor function type is void()*.
+  llvm::FunctionType *CtorFTy = llvm::FunctionType::get(VoidTy, false);
+  llvm::Type *CtorPFTy = llvm::PointerType::getUnqual(CtorFTy);
+
+  // Get the type of a ctor entry, { i32, void ()*, i8* }.
+  llvm::StructType *CtorStructTy = llvm::StructType::get(
+      Int32Ty, llvm::PointerType::getUnqual(CtorFTy), VoidPtrTy, nullptr);
+
+  // Construct the constructor and destructor arrays.
+  SmallVector<llvm::Constant *, 8> Ctors;
+
+  for (auto &it : m_functionDefs) {
+    DxilFunctionLinkInfo *linkInfo = it.first;
+    DxilLib *pLib = it.second;
+
+    Function *F = linkInfo->func;
+    if (pLib->IsInitFunc(F)) {
+      Function *NewF = m_newFunctions[F->getName()];
+
+      llvm::Constant *S[] = {
+          llvm::ConstantInt::get(Int32Ty, 65535, false),
+          llvm::ConstantExpr::getBitCast(NewF, CtorPFTy),
+          (llvm::Constant::getNullValue(VoidPtrTy))};
+      Ctors.push_back(llvm::ConstantStruct::get(CtorStructTy, S));
+    }
+  }
+
+  if (!Ctors.empty()) {
+    const StringRef GlobalName = "llvm.global_ctors";
+    llvm::ArrayType *AT = llvm::ArrayType::get(CtorStructTy, Ctors.size());
+    new llvm::GlobalVariable(*pM, AT, false,
+                             llvm::GlobalValue::AppendingLinkage,
+                             llvm::ConstantArray::get(AT, Ctors), GlobalName);
+  }
 }
 
 std::unique_ptr<Module>
@@ -822,9 +899,8 @@ DxilLinkJob::LinkToLib(const ShaderModel *pSM) {
 
   ValueToValueMapTy vmap;
 
-  std::unordered_set<Function *> initFuncSet;
   // Add function
-  AddFunctions(DM, vmap, initFuncSet);
+  AddFunctions(DM, vmap);
 
   // Set DxilFunctionProps.
   DxilEntryPropsMap EntryPropMap;
@@ -861,6 +937,9 @@ DxilLinkJob::LinkToLib(const ShaderModel *pSM) {
 
   // Link metadata like debug info.
   LinkNamedMDNodes(pM.get(), vmap);
+
+  // Build global.ctors.
+  EmitCtorListForLib(pM.get());
 
   RunPreparePass(*pM);
 
@@ -937,7 +1016,12 @@ void DxilLinkJob::AddFunction(
 }
 
 void DxilLinkJob::AddFunction(llvm::Function *F) {
-  m_functionDecls[F->getName()] = F;
+  // Rarely, DXIL op overloads could collide, due to different types with same name.
+  // Later, we will rename these functions, but for now, we need to prevent clobbering
+  // an existing entry.
+  auto &entry = m_functionDecls[F->getName()];
+  if (entry.first.insert(F->getFunctionType()).second)
+    entry.second.push_back(F);
 }
 
 // Clone of StripDeadDebugInfo::runOnModule.
@@ -1018,8 +1102,131 @@ void DxilLinkJob::StripDeadDebugInfo(Module &M) {
   }
 }
 
+// TODO: move FixShaderModelMismatch to separate file.
+#include "dxc/DXIL/DxilInstructions.h"
+namespace {
+bool onlyUsedByAnnotateHandle(Value *V) {
+  bool bResult = true;
+  for (User *U : V->users()) {
+    CallInst *CI = dyn_cast<CallInst>(U);
+    if (!CI) {
+      bResult = false;
+      break;
+    }
+    DxilInst_AnnotateHandle Hdl(CI);
+    if (!Hdl) {
+      bResult = false;
+      break;
+    }
+  }
+  return bResult;
+}
+
+DxilResourceBase *
+findResourceFromPtr(Value *Ptr, DxilModule &DM,
+                    DenseMap<Value *, DxilResourceBase *> &PtrResMap) {
+  auto it = PtrResMap.find(Ptr);
+  if (Ptr)
+    return it->second;
+  DxilResourceBase *Res = nullptr;
+  if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Ptr)) {
+    DXASSERT(false, "global resource should already in map");
+  } else {
+    // Not support allocaInst of resource when missing annotateHandle.
+    GEPOperator *GEP = cast<GEPOperator>(Ptr);
+    Res = findResourceFromPtr(GEP->getPointerOperand(), DM, PtrResMap);
+  }
+  PtrResMap[Ptr] = Res;
+  return Res;
+}
+
+template <typename T>
+void addGVFromResTable(T &Tab,
+                       DenseMap<Value *, DxilResourceBase *> &PtrResMap) {
+  for (auto &it : Tab) {
+    PtrResMap[it->GetGlobalSymbol()] = it.get();
+  }
+}
+
+// Make sure createHandleForLib is annotated before use.
+bool addAnnotHandle(Module &M, DxilModule &DM) {
+  hlsl::OP *hlslOP = DM.GetOP();
+  auto *pSM = DM.GetShaderModel();
+  if (!pSM->IsSM66Plus())
+    return false;
+  // If no createHandleForLib, do nothing.
+  if (!hlslOP->IsDxilOpUsed(DXIL::OpCode::CreateHandleForLib))
+    return false;
+
+  Type *pVoidTy = Type::getVoidTy(M.getContext());
+  SmallVector<CallInst *, 4> Candidates;
+  for (Function &F : M) {
+    if (!F.isDeclaration())
+      continue;
+    if (!hlslOP->IsDxilOpFunc(&F))
+      continue;
+    DXIL::OpCodeClass opClass;
+    if (!hlslOP->GetOpCodeClass(&F, opClass))
+      continue;
+    if (opClass != DXIL::OpCodeClass::CreateHandleForLib)
+      continue;
+    for (User *U : F.users()) {
+      CallInst *CI = cast<CallInst>(U);
+      // Check user is annotateHandle.
+      if (onlyUsedByAnnotateHandle(CI))
+        continue;
+      Candidates.emplace_back(CI);
+    }
+  }
+
+  if (Candidates.empty())
+    return false;
+
+  DenseMap<Value *, DxilResourceBase *> PtrResMap;
+  // Add GV from resTable first.
+  addGVFromResTable(DM.GetCBuffers(), PtrResMap);
+  addGVFromResTable(DM.GetSRVs(), PtrResMap);
+  addGVFromResTable(DM.GetUAVs(), PtrResMap);
+  addGVFromResTable(DM.GetSamplers(), PtrResMap);
+
+  Function *annotHandleFn =
+      hlslOP->GetOpFunc(DXIL::OpCode::AnnotateHandle, pVoidTy);
+  Value *annotHandleArg =
+      hlslOP->GetI32Const((unsigned)DXIL::OpCode::AnnotateHandle);
+  // Replace createHandle with annotateHandle and createHandleFromBinding.
+  Type *resPropertyTy = hlslOP->GetResourcePropertiesType();
+  for (CallInst *CI : Candidates) {
+    DxilInst_CreateHandleForLib Hdl(CI);
+    LoadInst *Ld = cast<LoadInst>(Hdl.get_Resource());
+    Value *Ptr = Ld->getPointerOperand();
+    DxilResourceBase *Res = findResourceFromPtr(Ptr, DM, PtrResMap);
+    DXASSERT(Res, "fail to find resource when missing annotateHandle");
+
+    DxilResourceProperties RP = resource_helper::loadPropsFromResourceBase(Res);
+    Value *propertiesV =
+        resource_helper::getAsConstant(RP, resPropertyTy, *DM.GetShaderModel());
+    IRBuilder<> B(CI->getNextNode());
+    CallInst *annotHdl =
+        B.CreateCall(annotHandleFn, {annotHandleArg, CI, propertiesV});
+    CI->replaceAllUsesWith(annotHdl);
+    annotHdl->setArgOperand(DxilInst_AnnotateHandle::arg_res, CI);
+  }
+  return true;
+}
+} // namespace
+
+void DxilLinkJob::FixShaderModelMismatch(llvm::Module &M) {
+  // TODO: fix more issues.
+  addAnnotHandle(M, M.GetDxilModule());
+}
+
 void DxilLinkJob::RunPreparePass(Module &M) {
   StripDeadDebugInfo(M);
+  FixShaderModelMismatch(M);
+
+  DxilModule &DM = M.GetDxilModule();
+  const ShaderModel *pSM = DM.GetShaderModel();
+
   legacy::PassManager PM;
   PM.add(createAlwaysInlinerPass(/*InsertLifeTime*/ false));
 
@@ -1028,6 +1235,8 @@ void DxilLinkJob::RunPreparePass(Module &M) {
 
   // SROA
   PM.add(createSROAPass(/*RequiresDomTree*/false, /*SkipHLSLMat*/false));
+  // For static global handle.
+  PM.add(createLowerStaticGlobalIntoAlloca());
 
   // Remove MultiDimArray from function call arg.
   PM.add(createMultiDimArrayToOneDimArrayPass());
@@ -1047,6 +1256,9 @@ void DxilLinkJob::RunPreparePass(Module &M) {
 
   PM.add(createDeadCodeEliminationPass());
   PM.add(createGlobalDCEPass());
+
+  if (pSM->IsSM66Plus() && pSM->IsLib())
+    PM.add(createDxilMutateResourceToHandlePass());
 
   PM.add(createDxilLowerCreateHandleForLibPass());
   PM.add(createDxilTranslateRawBuffer());
@@ -1124,7 +1336,8 @@ bool DxilLinkerImpl::AttachLib(DxilLib *lib) {
     StringRef name = it->getKey();
     if (m_functionNameMap.count(name)) {
       // Redefine of function.
-      m_ctx.emitError(Twine(kRedefineFunction) + name);
+      const DxilFunctionLinkInfo *DFLI = it->getValue().get();
+      dxilutil::EmitErrorOnFunction(m_ctx, DFLI->func, Twine(kRedefineFunction) + name);
       bSuccess = false;
       continue;
     }
@@ -1172,8 +1385,8 @@ bool DxilLinkerImpl::DetachLib(DxilLib *lib) {
 }
 
 bool DxilLinkerImpl::AddFunctions(SmallVector<StringRef, 4> &workList,
-                                  DenseSet<DxilLib *> &libSet,
-                                  StringSet<> &addedFunctionSet,
+                                  SetVector<DxilLib *> &libSet,
+                                  SetVector<StringRef> &addedFunctionSet,
                                   DxilLinkJob &linkJob, bool bLazyLoadDone,
                                   bool bAllowFuncionDecls) {
   while (!workList.empty()) {
@@ -1245,8 +1458,8 @@ DxilLinkerImpl::Link(StringRef entry, StringRef profile, dxilutil::ExportMap &ex
 
   DxilLinkJob linkJob(m_ctx, exportMap, m_valMajor, m_valMinor);
 
-  DenseSet<DxilLib *> libSet;
-  StringSet<> addedFunctionSet;
+  SetVector<DxilLib *> libSet;
+  SetVector<StringRef> addedFunctionSet;
 
   bool bIsLib = pSM->IsLib();
   if (!bIsLib) {
@@ -1259,7 +1472,7 @@ DxilLinkerImpl::Link(StringRef entry, StringRef profile, dxilutil::ExportMap &ex
       return nullptr;
 
   } else {
-    if (exportMap.empty()) {
+    if (exportMap.empty() && !exportMap.isExportShadersOnly()) {
       // Add every function for lib profile.
       for (auto &it : m_functionNameMap) {
         StringRef name = it.getKey();
@@ -1289,6 +1502,28 @@ DxilLinkerImpl::Link(StringRef entry, StringRef profile, dxilutil::ExportMap &ex
           }
         }
       }
+    } else if (exportMap.isExportShadersOnly()) {
+      SmallVector<StringRef, 4> workList;
+      for (auto *pLib : m_attachedLibs) {
+        auto &DM = pLib->GetDxilModule();
+        auto *pM = DM.GetModule();
+        for (Function &F : pM->functions()) {
+          if (!pLib->IsEntry(&F)) {
+            if (!F.isDeclaration()) {
+              // Set none entry to be internal so they could be removed.
+              F.setLinkage(GlobalValue::LinkageTypes::InternalLinkage);
+            }
+            continue;
+          }
+          workList.emplace_back(F.getName());
+        }
+        libSet.insert(pLib);
+      }
+
+      if (!AddFunctions(workList, libSet, addedFunctionSet, linkJob,
+                        /*bLazyLoadDone*/ false,
+                        /*bAllowFuncionDecls*/ false))
+        return nullptr;
     } else {
       SmallVector<StringRef, 4> workList;
 
@@ -1317,6 +1552,11 @@ DxilLinkerImpl::Link(StringRef entry, StringRef profile, dxilutil::ExportMap &ex
   for (auto &pLib : libSet) {
     pLib->CollectUsedInitFunctions(addedFunctionSet, workList);
   }
+
+  for (auto &pLib : libSet) {
+    pLib->FixIntrinsicOverloads();
+  }
+
   // Add init functions if used.
   // All init function already loaded in BuildGlobalUsage,
   // so set bLazyLoadDone to true here.

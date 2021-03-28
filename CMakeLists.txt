@@ -1,6 +1,10 @@
 # See docs/CMake.html for instructions about how to build LLVM with CMake.
 cmake_minimum_required(VERSION 2.8.12.2)
 
+if (NOT "${DXC_CMAKE_BEGINS_INCLUDE}" STREQUAL "")
+  include(${DXC_CMAKE_BEGINS_INCLUDE})
+endif()
+
 if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   message(STATUS "No build type selected, default to Debug")
   set(CMAKE_BUILD_TYPE "Debug")
@@ -79,16 +83,28 @@ if ( LLVM_USE_FOLDERS )
   set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 endif()
 
-option(HLSL_ENABLE_FIXED_VER "Sets up fixed version information." OFF) # HLSL Change
+option(HLSL_EMBED_VERSION "If set, embeds version information in the binaries." ON) # HLSL Change
+# HLSL Change - Directory with version.inc file used for the build (generated or copied from HLSL_FIXED_VERSION_LOCATION)
+set(HLSL_VERSION_LOCATION ${CMAKE_CURRENT_BINARY_DIR}/utils/version)
+option(HLSL_OFFICIAL_BUILD "If set, embeds official version in the binaries (based on the latest release version)" OFF) # HLSL Change
+option(HLSL_ENABLE_FIXED_VER "Reads version information from a file." OFF) # HLSL Change
+
 option(HLSL_ENABLE_ANALYZE "Enables compiler analysis during compilation." OFF) # HLSL Change
 option(HLSL_OPTIONAL_PROJS_IN_DEFAULT "Include optional projects in default build target." OFF) # HLSL Change
+option(HLSL_BUILD_DXILCONV "Include DXBC to DXIL converter and tools." ON) # HLSL Change
+
+option(HLSL_ENABLE_DEBUG_ITERATORS "Disable debug iterators for faster debug and to remove some additional allocations with improper noexcept attribution" OFF) # HLSL Change
 
 # HLSL Change Starts - support commit querying
 option(HLSL_SUPPORT_QUERY_GIT_COMMIT_INFO "Supports querying Git commit info." ON)
 if ( HLSL_SUPPORT_QUERY_GIT_COMMIT_INFO )
   add_definitions(-DSUPPORT_QUERY_GIT_COMMIT_INFO)
 endif()
-# HLSL Chnage Ends
+# adjust link option to enable debugging from kernel mode; not compatible with incremental linking
+if(NOT CMAKE_VERSION VERSION_LESS "3.13" AND WIN32)
+  add_link_options(/DEBUGTYPE:CV,FIXUP,PDATA /INCREMENTAL:NO)
+endif()
+# HLSL Change Ends
 
 # HLSL Change Starts - set flag for Appveyor CI
 if ( "$ENV{CI}" AND "$ENV{APPVEYOR}" )
@@ -396,21 +412,8 @@ set(TARGET_TRIPLE "${LLVM_DEFAULT_TARGET_TRIPLE}")
 
 include(HandleLLVMOptions)
 
-# Verify that we can find a Python 2 interpreter.  Python 3 is unsupported.
-# FIXME: We should support systems with only Python 3, but that requires work
-# on LLDB.
-set(Python_ADDITIONAL_VERSIONS 2.7)
-include(FindPythonInterp)
-if( NOT PYTHONINTERP_FOUND )
-  message(FATAL_ERROR
-"Unable to find Python interpreter, required for builds and testing.
-
-Please install Python or specify the PYTHON_EXECUTABLE CMake variable.")
-endif()
-
-if( ${PYTHON_VERSION_STRING} VERSION_LESS 2.7 )
-  message(FATAL_ERROR "Python 2.7 or newer is required")
-endif()
+# Verify that we can find a Python 3 interpreter and force cmake to use it.
+find_package(PythonInterp 3 REQUIRED)
 
 ######
 # LLVMBuild Integration
@@ -630,6 +633,10 @@ add_subdirectory(include/dxc/Tracing) # HLSL Change
 
 add_subdirectory(lib)
 
+if (HLSL_EMBED_VERSION) 
+  add_subdirectory(utils/version)
+endif()
+
 if( LLVM_INCLUDE_UTILS )
   # add_subdirectory(utils/FileCheck) # HLSL Change
   # add_subdirectory(utils/FileUpdate) # HLSL Change
@@ -739,4 +746,8 @@ if (NOT LLVM_INSTALL_TOOLCHAIN_ONLY)
                               -DCMAKE_INSTALL_COMPONENT=llvm-headers
                               -P "${CMAKE_BINARY_DIR}/cmake_install.cmake")
   endif()
+endif()
+
+if (NOT "${DXC_CMAKE_ENDS_INCLUDE}" STREQUAL "")
+  include(${DXC_CMAKE_ENDS_INCLUDE})
 endif()

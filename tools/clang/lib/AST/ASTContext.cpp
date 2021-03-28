@@ -39,6 +39,7 @@
 #include "llvm/Support/Capacity.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/MathExtras.h" // HLSL Change
 #include <map>
 
 using namespace clang;
@@ -1102,7 +1103,9 @@ void ASTContext::InitBuiltinTypes(const TargetInfo &Target) {
     InitBuiltinType(HalfFloatTy, BuiltinType::HalfFloat);
     InitBuiltinType(LitIntTy, BuiltinType::LitInt);
     InitBuiltinType(LitFloatTy, BuiltinType::LitFloat);
-    
+    InitBuiltinType(Int8_4PackedTy, BuiltinType::Int8_4Packed);
+    InitBuiltinType(UInt8_4PackedTy, BuiltinType::UInt8_4Packed);
+
     HLSLStringTy = this->getPointerType(CharTy);
 
     hlsl::InitializeASTContextForHLSL(*this); // Previously in constructor, guarded by !DelayInitialization
@@ -1117,8 +1120,16 @@ DiagnosticsEngine &ASTContext::getDiagnostics() const {
 AttrVec& ASTContext::getDeclAttrs(const Decl *D) {
   AttrVec *&Result = DeclAttrs[D];
   if (!Result) {
+    try { // HLSL Change
     void *Mem = Allocate(sizeof(AttrVec));
     Result = new (Mem) AttrVec;
+    // HLSL Change Begin: Don't leave empty entry on exception
+    }
+    catch (...) {
+      DeclAttrs.erase(D);
+      throw;
+    }
+    // HLSL Change End
   }
     
   return *Result;
@@ -1567,6 +1578,7 @@ TypeInfo ASTContext::getTypeInfoImpl(const Type *T) const {
     // HLSL Change Begins.
     // Vector align to its element.
     if (getLangOpts().HLSL) {
+      Width = llvm::RoundUpToAlignment(EltInfo.Width, EltInfo.Align) * VT->getNumElements(); // Match data layout's behaviour
       Align = EltInfo.Align;
     }
     // HLSL Change Ends.
@@ -1616,7 +1628,6 @@ TypeInfo ASTContext::getTypeInfoImpl(const Type *T) const {
       Width = Target->getChar32Width();
       Align = Target->getChar32Align();
       break;
-    case BuiltinType::Min16UInt: // HLSL Change
     case BuiltinType::UShort:
     case BuiltinType::Short:
       Width = Target->getShortWidth();
@@ -1624,6 +1635,8 @@ TypeInfo ASTContext::getTypeInfoImpl(const Type *T) const {
       break;
     case BuiltinType::UInt:
     case BuiltinType::Int:
+    case BuiltinType::Int8_4Packed:  // HLSL Change
+    case BuiltinType::UInt8_4Packed: // HLSL Change
       Width = Target->getIntWidth();
       Align = Target->getIntAlign();
       break;
@@ -1659,12 +1672,19 @@ TypeInfo ASTContext::getTypeInfoImpl(const Type *T) const {
     case BuiltinType::Min10Float:
     case BuiltinType::Min16Float:
       Width = 16;
-      Align = 16;
+      if (!getLangOpts().UseMinPrecision)
+        Align = 16;
+      else
+        Align = 32;
       break;
     case BuiltinType::Min12Int:
     case BuiltinType::Min16Int:
+    case BuiltinType::Min16UInt:
       Width = 16;
-      Align = 16;
+      if (!getLangOpts().UseMinPrecision)
+        Align = 16;
+      else
+        Align = 32;
       break;
     // Treat literals as largest size possible here, as it will be used
     // to determine MaxWidth in GetExprRange
@@ -5489,6 +5509,8 @@ static char getObjCEncodingForPrimitiveKind(const ASTContext *C,
     case BuiltinType::HalfFloat:
     case BuiltinType::LitInt:
     case BuiltinType::LitFloat:
+    case BuiltinType::Int8_4Packed:
+    case BuiltinType::UInt8_4Packed:
       llvm_unreachable("@encoding HLSL primitive type");
     // HLSL Change Ends
     }

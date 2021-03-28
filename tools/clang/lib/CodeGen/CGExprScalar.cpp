@@ -1825,7 +1825,7 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
     // and a numeric type (scalar, vector or matrix) on the other.
     // If the aggregate type is the cast source, it should be a pointer.
     // Aggregate to aggregate casts are handled in CGExprAgg.cpp
-    auto areCompoundAndNumeric = [this](QualType lhs, QualType rhs) {
+    auto areCompoundAndNumeric = [](QualType lhs, QualType rhs) {
       return hlsl::IsHLSLAggregateType(lhs)
         && (rhs->isBuiltinType() || hlsl::IsHLSLVecMatType(rhs));
     };
@@ -3701,7 +3701,8 @@ VisitAbstractConditionalOperator(const AbstractConditionalOperator *E) {
     return tmp5;
   }
   // HLSL Change Starts
-  if (CGF.getLangOpts().HLSL && hlsl::IsHLSLVecType(E->getType())) {
+  if (CGF.getLangOpts().HLSL &&
+      (hlsl::IsHLSLVecType(E->getType()) || E->getType()->isArithmeticType())) {
     llvm::Value *CondV = CGF.EmitScalarExpr(condExpr);
     llvm::Value *LHS = Visit(lhsExpr);
     llvm::Value *RHS = Visit(rhsExpr);

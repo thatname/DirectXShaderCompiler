@@ -24,6 +24,7 @@
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/CodeGen/CodeGenAction.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "dxc/Support/WinIncludes.h"
 #include "dxc/HLSL/HLSLExtensionsCodegenHelper.h"
 #include "dxc/DxilRootSignature/DxilRootSignature.h"
@@ -32,6 +33,8 @@
 #include "dxc/Support/WinIncludes.h"
 #include "dxc/DxilContainer/DxilContainerAssembler.h"
 #include "dxc/dxcapi.internal.h"
+#include "dxc/DXIL/DxilPDB.h"
+#include "dxc/DXIL/DxilModule.h"
 
 #include "dxc/Support/dxcapi.use.h"
 #include "dxc/Support/Global.h"
@@ -41,10 +44,14 @@
 #include "dxc/Support/dxcapi.impl.h"
 #include "dxc/Support/DxcLangExtensionsHelper.h"
 #include "dxc/Support/HLSLOptions.h"
+
 #ifdef _WIN32
 #include "dxcetw.h"
 #endif
 #include "dxillib.h"
+#include "dxcshadersourceinfo.h"
+#include "dxcompileradapter.h"
+#include "dxcversion.inc"
 #include <algorithm>
 #include <cfloat>
 
@@ -65,8 +72,6 @@ using namespace clang;
 using namespace hlsl;
 using std::string;
 
-DEFINE_CROSS_PLATFORM_UUIDOF(IDxcLangExtensions)
-
 // This declaration is used for the locally-linked validator.
 HRESULT CreateDxcValidator(_In_ REFIID riid, _Out_ LPVOID *ppv);
 
@@ -80,25 +85,272 @@ HRESULT RunInternalValidator(_In_ IDxcValidator *pValidator,
                              _In_ IDxcBlob *pShader, UINT32 Flags,
                              _In_ IDxcOperationResult **ppResult);
 
-static void CreateOperationResultFromOutputs(
-    IDxcBlob *pResultBlob, dxcutil::DxcArgsFileSystem *msfPtr,
-    const std::string &warnings, clang::DiagnosticsEngine &diags,
-    _COM_Outptr_ IDxcOperationResult **ppResult) {
-  CComPtr<IStream> pErrorStream;
-  CComPtr<IDxcBlobEncoding> pErrorBlob;
-  msfPtr->GetStdOutpuHandleStream(&pErrorStream);
-  dxcutil::CreateOperationResultFromOutputs(pResultBlob, pErrorStream, warnings,
-                                            diags.hasErrorOccurred(), ppResult);
+static bool ShouldBeCopiedIntoPDB(UINT32 FourCC) {
+  switch (FourCC) {
+  case hlsl::DFCC_ShaderDebugName:
+  case hlsl::DFCC_ShaderHash:
+    return true;
+  }
+  return false;
 }
 
-static void CreateOperationResultFromOutputs(
-    AbstractMemoryStream *pOutputStream, dxcutil::DxcArgsFileSystem *msfPtr,
-    const std::string &warnings, clang::DiagnosticsEngine &diags,
-    _COM_Outptr_ IDxcOperationResult **ppResult) {
-  CComPtr<IDxcBlob> pResultBlob;
-  IFT(pOutputStream->QueryInterface(&pResultBlob));
-  CreateOperationResultFromOutputs(pResultBlob, msfPtr, warnings, diags,
-                                   ppResult);
+struct CompilerVersionPartWriter {
+  hlsl::DxilCompilerVersion m_Header = {};
+  CComHeapPtr<char> m_CommitShaStorage;
+  llvm::StringRef m_CommitSha = "";
+  CComHeapPtr<char> m_CustomStringStorage;
+  llvm::StringRef m_CustomString = "";
+
+  void Init(IDxcVersionInfo *pVersionInfo) {
+    m_Header = {};
+
+    UINT32 Major = 0, Minor = 0;
+    UINT32 Flags = 0;
+    IFT(pVersionInfo->GetVersion(&Major, &Minor));
+    IFT(pVersionInfo->GetFlags(&Flags));
+
+    m_Header.Major = Major;
+    m_Header.Minor = Minor;
+    m_Header.VersionFlags = Flags;
+    CComPtr<IDxcVersionInfo2> pVersionInfo2;
+    if (SUCCEEDED(pVersionInfo->QueryInterface(&pVersionInfo2))) {
+      UINT32 CommitCount = 0;
+      IFT(pVersionInfo2->GetCommitInfo(&CommitCount, &m_CommitShaStorage));
+      m_CommitSha = llvm::StringRef(m_CommitShaStorage.m_pData, strlen(m_CommitShaStorage.m_pData));
+      m_Header.CommitCount = CommitCount;
+      m_Header.VersionStringListSizeInBytes += m_CommitSha.size() + /*null term*/1;
+    }
+
+    CComPtr<IDxcVersionInfo3> pVersionInfo3;
+    if (SUCCEEDED(pVersionInfo->QueryInterface(&pVersionInfo3))) {
+      IFT(pVersionInfo3->GetCustomVersionString(&m_CustomStringStorage));
+      m_CustomString = llvm::StringRef(m_CustomStringStorage, strlen(m_CustomStringStorage.m_pData));
+      m_Header.VersionStringListSizeInBytes += m_CustomString.size() + /*null term*/1;
+    }
+  }
+
+  static uint32_t PadToDword(uint32_t size, uint32_t *outNumPadding=nullptr) {
+    uint32_t rem = size % 4;
+    if (rem) {
+      uint32_t padding = (4 - rem);
+      if (outNumPadding)
+        *outNumPadding = padding;
+      return size + padding;
+    }
+    if (outNumPadding)
+      *outNumPadding = 0;
+    return size;
+  }
+
+  UINT32 GetSize(UINT32 *pPadding = nullptr) const {
+    return PadToDword(sizeof(m_Header) + m_Header.VersionStringListSizeInBytes, pPadding);
+  }
+
+  void Write(IStream *pStream) {
+    const uint8_t padByte = 0;
+    UINT32 uPadding = 0;
+    UINT32 uSize = GetSize(&uPadding);
+    (void)uSize;
+
+    ULONG cbWritten = 0;
+    IFT(pStream->Write(&m_Header, sizeof(m_Header), &cbWritten));
+
+    // Write a null terminator even if the string is empty
+    IFT(pStream->Write(m_CommitSha.data(), m_CommitSha.size(), &cbWritten));
+    // Null terminator for the commit sha
+    IFT(pStream->Write(&padByte, sizeof(padByte), &cbWritten));
+
+    // Write the custom version string.
+    IFT(pStream->Write(m_CustomString.data(), m_CustomString.size(), &cbWritten));
+    // Null terminator for the custom version string.
+    IFT(pStream->Write(&padByte, sizeof(padByte), &cbWritten));
+
+    // Write padding
+    for (unsigned i = 0; i < uPadding; i++) {
+      IFT(pStream->Write(&padByte, sizeof(padByte), &cbWritten));
+    }
+  }
+};
+
+static HRESULT CreateContainerForPDB(IMalloc *pMalloc,
+  IDxcBlob *pOldContainer,
+  IDxcBlob *pDebugBlob, IDxcVersionInfo *pVersionInfo,
+  const hlsl::DxilSourceInfo *pSourceInfo,
+  AbstractMemoryStream *pReflectionStream,
+  IDxcBlob **ppNewContaner)
+{
+  // If the pContainer is not a valid container, give up.
+  if (!hlsl::IsValidDxilContainer((hlsl::DxilContainerHeader *)pOldContainer->GetBufferPointer(), pOldContainer->GetBufferSize()))
+    return E_FAIL;
+
+  hlsl::DxilContainerHeader *DxilHeader = (hlsl::DxilContainerHeader *)pOldContainer->GetBufferPointer();
+  hlsl::DxilProgramHeader *ProgramHeader = nullptr;
+
+  struct Part {
+    typedef std::function<HRESULT(IStream *)> WriteProc;
+    UINT32 uFourCC = 0;
+    UINT32 uSize = 0;
+    WriteProc Writer;
+
+    Part(UINT32 uFourCC, UINT32 uSize, WriteProc Writer) :
+      uFourCC(uFourCC),
+      uSize(uSize),
+      Writer(Writer)
+    {}
+  };
+
+  // Compute offset table.
+  SmallVector<UINT32, 4> OffsetTable;
+  SmallVector<Part, 4> PartWriters;
+  UINT32 uTotalPartsSize = 0;
+
+  auto AddPart = [&PartWriters, &OffsetTable, &uTotalPartsSize](Part NewPart, UINT32 uSize) {
+    OffsetTable.push_back(uTotalPartsSize);
+    uTotalPartsSize += uSize + sizeof(hlsl::DxilPartHeader);
+    PartWriters.push_back(NewPart);
+  };
+
+  for (unsigned i = 0; i < DxilHeader->PartCount; i++) {
+    hlsl::DxilPartHeader *PartHeader = GetDxilContainerPart(DxilHeader, i);
+    if (ShouldBeCopiedIntoPDB(PartHeader->PartFourCC)) {
+      UINT32 uSize = PartHeader->PartSize;
+      const void *pPartData = PartHeader+1;
+      Part NewPart(
+        PartHeader->PartFourCC,
+        uSize,
+        [pPartData, uSize](IStream *pStream) {
+          ULONG uBytesWritten = 0;
+          IFR(pStream->Write(pPartData, uSize, &uBytesWritten));
+          return S_OK;
+        }
+      );
+      AddPart(NewPart, uSize);
+    }
+
+    // Could use any of these. We're mostly after the header version and all that.
+    if (PartHeader->PartFourCC == hlsl::DFCC_DXIL ||
+      PartHeader->PartFourCC == hlsl::DFCC_ShaderDebugInfoDXIL)
+    {
+      ProgramHeader = (hlsl::DxilProgramHeader *)(PartHeader+1);
+    }
+  }
+
+  if (!ProgramHeader)
+    return E_FAIL;
+
+  if (pSourceInfo) {
+    const UINT32 uPartSize = pSourceInfo->AlignedSizeInBytes;
+
+    Part NewPart(
+      hlsl::DFCC_ShaderSourceInfo,
+      uPartSize,
+      [pSourceInfo](IStream *pStream) {
+        ULONG uBytesWritten = 0;
+        pStream->Write(pSourceInfo, pSourceInfo->AlignedSizeInBytes, &uBytesWritten);
+        return S_OK;
+      }
+    );
+
+    AddPart(NewPart, uPartSize);
+  }
+
+  if (pReflectionStream) {
+    const hlsl::DxilPartHeader *pReflectionPartHeader =
+      (const hlsl::DxilPartHeader *)pReflectionStream->GetPtr();
+    Part NewPart(
+      hlsl::DFCC_ShaderStatistics,
+      pReflectionPartHeader->PartSize,
+      [pReflectionPartHeader](IStream *pStream) {
+        ULONG uBytesWritten = 0;
+        pStream->Write(pReflectionPartHeader+1, pReflectionPartHeader->PartSize, &uBytesWritten);
+        return S_OK;
+      }
+    );
+    AddPart(NewPart, pReflectionPartHeader->PartSize);
+  }
+
+  CompilerVersionPartWriter versionWriter;
+  if (pVersionInfo) {
+    versionWriter.Init(pVersionInfo);
+
+    Part NewPart(
+      hlsl::DFCC_CompilerVersion,
+      versionWriter.GetSize(),
+      [&versionWriter](IStream *pStream) {
+        versionWriter.Write(pStream);
+        return S_OK;
+      }
+    );
+    AddPart(NewPart, versionWriter.GetSize());
+  }
+
+  if (pDebugBlob) {
+    static auto AlignByDword = [](UINT32 uSize, UINT32 *pPaddingBytes) {
+      UINT32 uRem = uSize % sizeof(UINT32);
+      UINT32 uResult = (uSize/sizeof(UINT32) + (uRem ? 1 : 0)) * sizeof(UINT32);
+      *pPaddingBytes = uRem ? (sizeof(UINT32)-uRem) : 0;
+      return uResult;
+    };
+
+    UINT32 uPaddingSize = 0;
+    UINT32 uPartSize = AlignByDword(sizeof(hlsl::DxilProgramHeader) + pDebugBlob->GetBufferSize(), &uPaddingSize);
+    
+    Part NewPart(
+      hlsl::DFCC_ShaderDebugInfoDXIL,
+      uPartSize,
+      [uPartSize, ProgramHeader, pDebugBlob, uPaddingSize](IStream *pStream) {
+        hlsl::DxilProgramHeader Header = *ProgramHeader;
+        Header.BitcodeHeader.BitcodeSize = pDebugBlob->GetBufferSize();
+        Header.BitcodeHeader.BitcodeOffset = sizeof(hlsl::DxilBitcodeHeader);
+        Header.SizeInUint32 = uPartSize / sizeof(UINT32);
+
+        ULONG uBytesWritten = 0;
+        IFR(pStream->Write(&Header, sizeof(Header), &uBytesWritten));
+        IFR(pStream->Write(pDebugBlob->GetBufferPointer(), pDebugBlob->GetBufferSize(), &uBytesWritten));
+        if(uPaddingSize) {
+          UINT32 uPadding = 0;
+          assert(uPaddingSize <= sizeof(uPadding) && "Padding size calculation is wrong.");
+          IFR(pStream->Write(&uPadding, uPaddingSize, &uBytesWritten));
+        }
+        return S_OK;
+      }
+    );
+    AddPart(NewPart, uPartSize);
+  }
+
+  // Offset the offset table by the offset table itself
+  for (unsigned i = 0; i < OffsetTable.size(); i++)
+    OffsetTable[i] += sizeof(hlsl::DxilContainerHeader) + OffsetTable.size() * sizeof(UINT32);
+
+  // Create the new header
+  hlsl::DxilContainerHeader NewDxilHeader = *DxilHeader;
+  NewDxilHeader.PartCount = OffsetTable.size();
+  NewDxilHeader.ContainerSizeInBytes =
+    sizeof(NewDxilHeader) +
+    OffsetTable.size() * sizeof(UINT32) +
+    uTotalPartsSize;
+
+  // Write it to the result stream
+  ULONG uSizeWritten = 0;
+  CComPtr<hlsl::AbstractMemoryStream> pStrippedContainerStream;
+  IFR(hlsl::CreateMemoryStream(pMalloc, &pStrippedContainerStream));
+  IFR(pStrippedContainerStream->Write(&NewDxilHeader, sizeof(NewDxilHeader), &uSizeWritten));
+
+  // Write offset table
+  IFR(pStrippedContainerStream->Write(OffsetTable.data(), OffsetTable.size() * sizeof(OffsetTable.data()[0]), &uSizeWritten));
+
+  for (unsigned i = 0; i < PartWriters.size(); i++) {
+    auto &Writer = PartWriters[i];
+    hlsl::DxilPartHeader PartHeader = {};
+    PartHeader.PartFourCC = Writer.uFourCC;
+    PartHeader.PartSize = Writer.uSize;
+    IFR(pStrippedContainerStream->Write(&PartHeader, sizeof(PartHeader), &uSizeWritten));
+    IFR(Writer.Writer(pStrippedContainerStream));
+  }
+
+  IFR(pStrippedContainerStream.QueryInterface(ppNewContaner));
+
+  return S_OK;
 }
 
 #ifdef _WIN32
@@ -155,10 +407,46 @@ private:
   void WriteSemanticDefines(llvm::Module *M, const ParsedSemanticDefineList &defines) {
     // Create all metadata nodes for each define. Each node is a (name, value) pair.
     std::vector<MDNode *> mdNodes;
+    const std::string enableStr("_ENABLE_");
+    const std::string disableStr("_DISABLE_");
+    const std::string selectStr("_SELECT_");
+
+    auto &optToggles = m_CI.getCodeGenOpts().HLSLOptimizationToggles;
+    auto &optSelects = m_CI.getCodeGenOpts().HLSLOptimizationSelects;
+
+    const llvm::SmallVector<std::string, 2> &semDefPrefixes =
+                             m_langExtensionsHelper.GetSemanticDefines();
+
+    // Add semantic defines to mdNodes and also to codeGenOpts
     for (const ParsedSemanticDefine &define : defines) {
       MDString *name  = MDString::get(M->getContext(), define.Name);
       MDString *value = MDString::get(M->getContext(), define.Value);
       mdNodes.push_back(MDNode::get(M->getContext(), { name, value }));
+
+      // Find index for end of matching semantic define prefix
+      size_t prefixPos = 0;
+      for (auto prefix : semDefPrefixes) {
+        if (IsMacroMatch(define.Name, prefix)) {
+          prefixPos = prefix.length() - 1;
+          break;
+        }
+      }
+
+      // Add semantic defines to option flag equivalents
+      // Convert define-style '_' into option-style '-' and lowercase everything
+      if (!define.Name.compare(prefixPos, enableStr.length(), enableStr)) {
+        std::string optName = define.Name.substr(prefixPos + enableStr.length());
+        std::replace(optName.begin(), optName.end(), '_', '-');
+        optToggles[StringRef(optName).lower()] = true;
+      } else if (!define.Name.compare(prefixPos, disableStr.length(), disableStr)) {
+        std::string optName = define.Name.substr(prefixPos + disableStr.length());
+        std::replace(optName.begin(), optName.end(), '_', '-');
+        optToggles[StringRef(optName).lower()] = false;
+      } else if (!define.Name.compare(prefixPos, selectStr.length(), selectStr)) {
+        std::string optName = define.Name.substr(prefixPos + selectStr.length());
+        std::replace(optName.begin(), optName.end(), '_', '-');
+        optSelects[StringRef(optName).lower()] = define.Value;
+      }
     }
 
     // Add root node with pointers to all define metadata nodes.
@@ -204,10 +492,15 @@ public:
     return errors;
   }
 
+  virtual bool IsOptionEnabled(std::string option) override {
+    return m_CI.getCodeGenOpts().HLSLOptimizationToggles.count(option) &&
+      m_CI.getCodeGenOpts().HLSLOptimizationToggles.find(option)->second;
+  }
+
   virtual std::string GetIntrinsicName(UINT opcode) override {
     return m_langExtensionsHelper.GetIntrinsicName(opcode);
   }
-  
+
   virtual bool GetDxilOpcode(UINT opcode, OP::OpCode &dxilOpcode) override {
     UINT dop = static_cast<UINT>(OP::OpCode::NumOpCodes);
     if (m_langExtensionsHelper.GetDxilOpCode(opcode, dop)) {
@@ -238,42 +531,44 @@ public:
   }
 };
 
-class DxcCompiler : public IDxcCompiler2,
-                    public IDxcLangExtensions,
+static void CreateDefineStrings(
+    _In_count_(defineCount) const DxcDefine *pDefines,
+    UINT defineCount,
+    std::vector<std::string> &defines) {
+  // Not very efficient but also not very important.
+  for (UINT32 i = 0; i < defineCount; i++) {
+    CW2A utf8Name(pDefines[i].Name, CP_UTF8);
+    CW2A utf8Value(pDefines[i].Value, CP_UTF8);
+    std::string val(utf8Name.m_psz);
+    val += "=";
+    val += (pDefines[i].Value) ? utf8Value.m_psz : "1";
+    defines.push_back(val);
+  }
+}
+
+class DxcCompiler : public IDxcCompiler3,
+                    public IDxcLangExtensions2,
                     public IDxcContainerEvent,
+                    public IDxcVersionInfo3,
 #ifdef SUPPORT_QUERY_GIT_COMMIT_INFO
                     public IDxcVersionInfo2
-#else
-                    public IDxcVersionInfo
 #endif // SUPPORT_QUERY_GIT_COMMIT_INFO
 {
 private:
   DXC_MICROCOM_TM_REF_FIELDS()
   DxcLangExtensionsHelper m_langExtensionsHelper;
   CComPtr<IDxcContainerEventsHandler> m_pDxcContainerEventsHandler;
-
-  void CreateDefineStrings(_In_count_(defineCount) const DxcDefine *pDefines,
-                           UINT defineCount,
-                           std::vector<std::string> &defines) {
-    // Not very efficient but also not very important.
-    for (UINT32 i = 0; i < defineCount; i++) {
-      CW2A utf8Name(pDefines[i].Name, CP_UTF8);
-      CW2A utf8Value(pDefines[i].Value, CP_UTF8);
-      std::string val(utf8Name.m_psz);
-      val += "=";
-      val += (pDefines[i].Value) ? utf8Value.m_psz : "1";
-      defines.push_back(val);
-    }
-  }
+  DxcCompilerAdapter m_DxcCompilerAdapter;
 
 public:
+  DxcCompiler(IMalloc *pMalloc) : m_dwRef(0), m_pMalloc(pMalloc), m_DxcCompilerAdapter(this, pMalloc) {}
   DXC_MICROCOM_TM_ADDREF_RELEASE_IMPL()
-  DXC_MICROCOM_TM_CTOR(DxcCompiler)
+  DXC_MICROCOM_TM_ALLOC(DxcCompiler)
   DXC_LANGEXTENSIONS_HELPER_IMPL(m_langExtensionsHelper)
 
   HRESULT STDMETHODCALLTYPE RegisterDxilContainerEventHandler(IDxcContainerEventsHandler *pHandler, UINT64 *pCookie) override {
     DXASSERT(m_pDxcContainerEventsHandler == nullptr, "else events handler is already registered");
-    *pCookie = 1; // Only one EventsHandler supported 
+    *pCookie = 1; // Only one EventsHandler supported
     m_pDxcContainerEventsHandler = pHandler;
     return S_OK;
   };
@@ -284,68 +579,48 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **ppvObject) override {
-    return DoBasicQueryInterface<IDxcCompiler,
-                                 IDxcCompiler2,
-                                 IDxcLangExtensions,
-                                 IDxcContainerEvent,
-                                 IDxcVersionInfo
+    HRESULT hr = DoBasicQueryInterface<
+      IDxcCompiler3,
+      IDxcLangExtensions,
+      IDxcLangExtensions2,
+      IDxcContainerEvent,
+      IDxcVersionInfo
 #ifdef SUPPORT_QUERY_GIT_COMMIT_INFO
-                                ,IDxcVersionInfo2
+      ,IDxcVersionInfo2
 #endif // SUPPORT_QUERY_GIT_COMMIT_INFO
-                                >
-                                 (this, iid, ppvObject);
-  }
-
-  // Compile a single entry point to the target shader model
-  HRESULT STDMETHODCALLTYPE Compile(
-    _In_ IDxcBlob *pSource,                       // Source text to compile
-    _In_opt_ LPCWSTR pSourceName,                 // Optional file name for pSource. Used in errors and include handlers.
-    _In_ LPCWSTR pEntryPoint,                     // entry point name
-    _In_ LPCWSTR pTargetProfile,                  // shader profile to compile
-    _In_count_(argCount) LPCWSTR *pArguments,     // Array of pointers to arguments
-    _In_ UINT32 argCount,                         // Number of arguments
-    _In_count_(defineCount) const DxcDefine *pDefines,  // Array of defines
-    _In_ UINT32 defineCount,                      // Number of defines
-    _In_opt_ IDxcIncludeHandler *pIncludeHandler, // user-provided interface to handle #include directives (optional)
-    _COM_Outptr_ IDxcOperationResult **ppResult   // Compiler output status, buffer, and errors
-  ) override {
-    return CompileWithDebug(pSource, pSourceName, pEntryPoint, pTargetProfile,
-                            pArguments, argCount, pDefines, defineCount,
-                            pIncludeHandler, ppResult, nullptr, nullptr);
+      ,IDxcVersionInfo3
+     >
+     (this, iid, ppvObject);
+    if (FAILED(hr)) {
+      return DoBasicQueryInterface<IDxcCompiler, IDxcCompiler2>(&m_DxcCompilerAdapter, iid, ppvObject);
+    }
+    return hr;
   }
 
   // Compile a single entry point to the target shader model with debug information.
-  HRESULT STDMETHODCALLTYPE CompileWithDebug(
-    _In_ IDxcBlob *pSource,                       // Source text to compile
-    _In_opt_ LPCWSTR pSourceName,                 // Optional file name for pSource. Used in errors and include handlers.
-    _In_ LPCWSTR pEntryPoint,                     // Entry point name
-    _In_ LPCWSTR pTargetProfile,                  // Shader profile to compile
-    _In_count_(argCount) LPCWSTR *pArguments,     // Array of pointers to arguments
+  HRESULT STDMETHODCALLTYPE Compile(
+    _In_ const DxcBuffer *pSource,                // Source text to compile
+    _In_opt_count_(argCount) LPCWSTR *pArguments, // Array of pointers to arguments
     _In_ UINT32 argCount,                         // Number of arguments
-    _In_count_(defineCount) const DxcDefine *pDefines,  // Array of defines
-    _In_ UINT32 defineCount,                      // Number of defines
     _In_opt_ IDxcIncludeHandler *pIncludeHandler, // user-provided interface to handle #include directives (optional)
-    _COM_Outptr_ IDxcOperationResult **ppResult,  // Compiler output status, buffer, and errors
-    _Outptr_opt_result_z_ LPWSTR *ppDebugBlobName,// Suggested file name for debug blob.
-    _COM_Outptr_opt_ IDxcBlob **ppDebugBlob       // Debug blob
+    _In_ REFIID riid, _Out_ LPVOID *ppResult      // IDxcResult: status, buffer, and errors
   ) override {
-    if (pSource == nullptr || ppResult == nullptr ||
-        (defineCount > 0 && pDefines == nullptr) ||
-        (argCount > 0 && pArguments == nullptr) || pEntryPoint == nullptr ||
-        pTargetProfile == nullptr)
+    if (pSource == nullptr ||
+        (argCount > 0 && pArguments == nullptr))
+      return E_INVALIDARG;
+    if (!(IsEqualIID(riid, __uuidof(IDxcResult)) ||
+          IsEqualIID(riid, __uuidof(IDxcOperationResult))))
       return E_INVALIDARG;
 
     *ppResult = nullptr;
-    AssignToOutOpt(nullptr, ppDebugBlobName);
-    AssignToOutOpt(nullptr, ppDebugBlob);
 
     HRESULT hr = S_OK;
-    CComPtr<IDxcBlobEncoding> utf8Source;
+    CComPtr<IDxcBlobUtf8> utf8Source;
     CComPtr<AbstractMemoryStream> pOutputStream;
-    CComHeapPtr<wchar_t> DebugBlobName;
-
-    DxcEtw_DXCompilerCompile_Start();
-    pSourceName = (pSourceName && *pSourceName) ? pSourceName : L"hlsl.hlsl"; // declared optional, so pick a default
+    CComPtr<IDxcOperationResult> pDxcOperationResult;
+    bool bCompileStarted = false;
+    bool bPreprocessStarted = false;
+    DxilShaderHash ShaderHashContent;
     DxcThreadMalloc TM(m_pMalloc);
 
     try {
@@ -358,42 +633,86 @@ public:
       IFT(UIntToInt(argCount, &argCountInt));
       hlsl::options::MainArgs mainArgs(argCountInt, pArguments, 0);
       hlsl::options::DxcOpts opts;
-      CW2A pUtf8TargetProfile(pTargetProfile, CP_UTF8);
-      // Set target profile before reading options and validate
-      opts.TargetProfile = pUtf8TargetProfile.m_psz;
-      bool finished = false;
-      dxcutil::ReadOptsAndValidate(mainArgs, opts, pOutputStream, ppResult, finished);
-      if (finished) {
-        hr = S_OK;
-        goto Cleanup;
+      std::string warnings;
+      raw_string_ostream w(warnings);
+      {
+        bool finished = false;
+        CComPtr<AbstractMemoryStream> pOptionErrorStream;
+        IFT(CreateMemoryStream(m_pMalloc, &pOptionErrorStream));
+        dxcutil::ReadOptsAndValidate(mainArgs, opts, pOptionErrorStream, &pDxcOperationResult, finished);
+        if (finished) {
+          IFT(pDxcOperationResult->QueryInterface(riid, ppResult));
+          hr = S_OK;
+          goto Cleanup;
+        }
+        if (pOptionErrorStream->GetPtrSize() > 0) {
+          w << StringRef((const char*)pOptionErrorStream->GetPtr(), (size_t)pOptionErrorStream->GetPtrSize());
+        }
       }
 
-#ifdef ENABLE_SPIRV_CODEGEN
+      bool isPreprocessing = !opts.Preprocess.empty();
+      if (isPreprocessing) {
+        DxcEtw_DXCompilerPreprocess_Start();
+        bPreprocessStarted = true;
+      } else {
+        DxcEtw_DXCompilerCompile_Start();
+        bCompileStarted = true;
+      }
+
+      CComPtr<DxcResult> pResult = DxcResult::Alloc(m_pMalloc);
+      IFT(pResult->SetEncoding(opts.DefaultTextCodePage));
+      DxcOutputObject primaryOutput;
+
+      // Formerly API values.
+      const char *pUtf8SourceName = opts.InputFile.empty() ? "hlsl.hlsl" : opts.InputFile.data();
+      CA2W pUtf16SourceName(pUtf8SourceName, CP_UTF8);
+      const char *pUtf8EntryPoint = opts.EntryPoint.empty() ? "main" : opts.EntryPoint.data();
+      const char *pUtf8OutputName = isPreprocessing
+                                    ? opts.Preprocess.data()
+                                    : opts.OutputObject.empty()
+                                      ? "" : opts.OutputObject.data();
+      CA2W pUtf16OutputName(isPreprocessing ?
+                              opts.Preprocess.data() : pUtf8OutputName,
+                            CP_UTF8);
+      LPCWSTR pObjectName = (!isPreprocessing && opts.OutputObject.empty()) ?
+                            nullptr : pUtf16OutputName.m_psz;
+      IFT(primaryOutput.SetName(pObjectName));
+
+      // Wrap source in blob
+      CComPtr<IDxcBlobEncoding> pSourceEncoding;
+      IFT(hlsl::DxcCreateBlob(pSource->Ptr, pSource->Size,
+        true, false, pSource->Encoding != 0, pSource->Encoding,
+        nullptr, &pSourceEncoding));
+
+ #ifdef ENABLE_SPIRV_CODEGEN
       // We want to embed the preprocessed source code in the final SPIR-V if
       // debug information is enabled. Therefore, we invoke Preprocess() here
       // first for such case. Then we invoke the compilation process over the
       // preprocessed source code, so that line numbers are consistent with the
       // embedded source code.
-      CComPtr<IDxcBlob> ppSrcCode;
-      if (opts.GenSPIRV && opts.DebugInfo) {
-        CComPtr<IDxcOperationResult> ppSrcCodeResult;
-        IFT(Preprocess(pSource, pSourceName, pArguments, argCount, pDefines,
-                       defineCount, pIncludeHandler, &ppSrcCodeResult));
+      if (!isPreprocessing && opts.GenSPIRV && opts.DebugInfo) {
+        CComPtr<IDxcResult> pSrcCodeResult;
+        std::vector<LPCWSTR> PreprocessArgs;
+        PreprocessArgs.reserve(argCount + 1);
+        PreprocessArgs.assign(pArguments, pArguments + argCount);
+        PreprocessArgs.push_back(L"-P");
+        PreprocessArgs.push_back(L"preprocessed.hlsl");
+        IFT(Compile(pSource, PreprocessArgs.data(), PreprocessArgs.size(), pIncludeHandler, IID_PPV_ARGS(&pSrcCodeResult)));
         HRESULT status;
-        IFT(ppSrcCodeResult->GetStatus(&status));
+        IFT(pSrcCodeResult->GetStatus(&status));
         if (SUCCEEDED(status)) {
-          IFT(ppSrcCodeResult->GetResult(&ppSrcCode));
-          pSource = ppSrcCode;
+          pSourceEncoding.Release();
+          IFT(pSrcCodeResult->GetOutput(DXC_OUT_HLSL, IID_PPV_ARGS(&pSourceEncoding), nullptr));
         }
       }
 #endif // ENABLE_SPIRV_CODEGEN
 
       // Convert source code encoding
-      IFC(hlsl::DxcGetBlobAsUtf8(pSource, &utf8Source));
+      IFC(hlsl::DxcGetBlobAsUtf8(pSourceEncoding, m_pMalloc, &utf8Source));
 
       CComPtr<IDxcBlob> pOutputBlob;
       dxcutil::DxcArgsFileSystem *msfPtr =
-        dxcutil::CreateDxcArgsFileSystem(utf8Source, pSourceName, pIncludeHandler);
+        dxcutil::CreateDxcArgsFileSystem(utf8Source, pUtf16SourceName.m_psz, pIncludeHandler);
       std::unique_ptr<::llvm::sys::fs::MSFileSystem> msf(msfPtr);
 
       ::llvm::sys::fs::AutoPerThreadSystem pts(msf.get());
@@ -401,49 +720,45 @@ public:
 
       IFT(pOutputStream.QueryInterface(&pOutputBlob));
 
+      primaryOutput.kind = DXC_OUT_OBJECT;
+      if (opts.AstDump || opts.OptDump)
+        primaryOutput.kind = DXC_OUT_TEXT;
+      else if (isPreprocessing)
+        primaryOutput.kind = DXC_OUT_HLSL;
+
+      IFT(pResult->SetOutputName(DXC_OUT_REFLECTION, opts.OutputReflectionFile));
+      IFT(pResult->SetOutputName(DXC_OUT_SHADER_HASH, opts.OutputShaderHashFile));
+      IFT(pResult->SetOutputName(DXC_OUT_ERRORS, opts.OutputWarningsFile));
+      IFT(pResult->SetOutputName(DXC_OUT_ROOT_SIGNATURE, opts.OutputRootSigFile));
+
       if (opts.DisplayIncludeProcess)
         msfPtr->EnableDisplayIncludeProcess();
-
-      // Prepare UTF8-encoded versions of API values.
-      CW2A pUtf8EntryPoint(pEntryPoint, CP_UTF8);
-      CW2A utf8SourceName(pSourceName, CP_UTF8);
-      const char *pUtf8SourceName = utf8SourceName.m_psz;
-      if (pUtf8SourceName == nullptr) {
-        if (opts.InputFile.empty()) {
-          pUtf8SourceName = "input.hlsl";
-        }
-        else {
-          pUtf8SourceName = opts.InputFile.data();
-        }
-      }
 
       IFT(msfPtr->RegisterOutputStream(L"output.bc", pOutputStream));
       IFT(msfPtr->CreateStdStreams(m_pMalloc));
 
-      StringRef Data((LPSTR)utf8Source->GetBufferPointer(),
-                     utf8Source->GetBufferSize());
-      std::unique_ptr<llvm::MemoryBuffer> pBuffer(
-          llvm::MemoryBuffer::getMemBufferCopy(Data, pUtf8SourceName));
+      StringRef Data(utf8Source->GetStringPointer(),
+                     utf8Source->GetStringLength());
 
       // Not very efficient but also not very important.
       std::vector<std::string> defines;
-      CreateDefineStrings(pDefines, defineCount, defines);
       CreateDefineStrings(opts.Defines.data(), opts.Defines.size(), defines);
 
       // Setup a compiler instance.
-      std::string warnings;
-      raw_string_ostream w(warnings);
       raw_stream_ostream outStream(pOutputStream.p);
       llvm::LLVMContext llvmContext; // LLVMContext should outlive CompilerInstance
+      std::unique_ptr<llvm::Module> debugModule;
+      CComPtr<AbstractMemoryStream> pReflectionStream;
       CompilerInstance compiler;
       std::unique_ptr<TextDiagnosticPrinter> diagPrinter =
           llvm::make_unique<TextDiagnosticPrinter>(w, &compiler.getDiagnosticOpts());
-      SetupCompilerForCompile(compiler, &m_langExtensionsHelper, utf8SourceName, diagPrinter.get(), defines, opts, pArguments, argCount);
+      SetupCompilerForCompile(compiler, &m_langExtensionsHelper, pUtf8SourceName, diagPrinter.get(), defines, opts, pArguments, argCount);
       msfPtr->SetupForCompilerInstance(compiler);
 
       // The clang entry point (cc1_main) would now create a compiler invocation
-      // from arguments, but for this path we're exclusively trying to compile
-      // to LLVM bitcode and then package that into a DXBC blob.
+      // from arguments, but depending on the Preprocess option, we either compile
+      // to LLVM bitcode and then package that into a DXBC blob, or preprocess to
+      // HLSL text.
       //
       // With the compiler invocation built from command line arguments, the
       // next step is to call ExecuteCompilerInvocation, which creates a
@@ -453,50 +768,85 @@ public:
       compiler.WriteDefaultOutputDirectly = true;
       compiler.setOutStream(&outStream);
 
-      compiler.getLangOpts().HLSLEntryFunction =
-      compiler.getCodeGenOpts().HLSLEntryFunction = pUtf8EntryPoint.m_psz;
-      compiler.getLangOpts().HLSLProfile =
-      compiler.getCodeGenOpts().HLSLProfile = pUtf8TargetProfile.m_psz;
-
       unsigned rootSigMajor = 0;
       unsigned rootSigMinor = 0;
-      if (compiler.getCodeGenOpts().HLSLProfile == "rootsig_1_1") {
-        rootSigMajor = 1;
-        rootSigMinor = 1;
-      } else if (compiler.getCodeGenOpts().HLSLProfile == "rootsig_1_0") {
-        rootSigMajor = 1;
-        rootSigMinor = 0;
-      }
-      compiler.getLangOpts().IsHLSLLibrary = opts.IsLibraryProfile();
-
-      // Clear entry function if library target
-      if (compiler.getLangOpts().IsHLSLLibrary)
-        compiler.getLangOpts().HLSLEntryFunction =
-          compiler.getCodeGenOpts().HLSLEntryFunction = "";
-
       // NOTE: this calls the validation component from dxil.dll; the built-in
       // validator can be used as a fallback.
-      bool produceFullContainer = !opts.CodeGenHighLevel && !opts.AstDump && !opts.OptDump && rootSigMajor == 0;
+      bool produceFullContainer = false;
+      bool needsValidation = false;
+      bool validateRootSigContainer = false;
 
-      bool needsValidation = produceFullContainer && !opts.DisableValidation;
-      // Disable validation for lib_6_1 and lib_6_2.
-      if (compiler.getCodeGenOpts().HLSLProfile == "lib_6_1" ||
-          compiler.getCodeGenOpts().HLSLProfile == "lib_6_2") {
-        needsValidation = false;
-      }
+      if (isPreprocessing) {
+        // These settings are back-compatible with fxc.
+        clang::PreprocessorOutputOptions &PPOutOpts =
+          compiler.getPreprocessorOutputOpts();
+        PPOutOpts.ShowCPP = 1;            // Print normal preprocessed output.
+        PPOutOpts.ShowComments = 0;       // Show comments.
+        PPOutOpts.ShowLineMarkers = 1;    // Show \#line markers.
+        PPOutOpts.UseLineDirectives = 1;  // Use \#line instead of GCC-style \# N.
+        PPOutOpts.ShowMacroComments = 0;  // Show comments, even in macros.
+        PPOutOpts.ShowMacros = 0;         // Print macro definitions.
+        PPOutOpts.RewriteIncludes = 0;    // Preprocess include directives only.
 
-      if (needsValidation || (opts.CodeGenHighLevel && !opts.DisableValidation)) {
-        UINT32 majorVer, minorVer;
-        dxcutil::GetValidatorVersion(&majorVer, &minorVer);
-        compiler.getCodeGenOpts().HLSLValidatorMajorVer = majorVer;
-        compiler.getCodeGenOpts().HLSLValidatorMinorVer = minorVer;
+        FrontendInputFile file(pUtf8SourceName, IK_HLSL);
+        clang::PrintPreprocessedAction action;
+        if (action.BeginSourceFile(compiler, file)) {
+          action.Execute();
+          action.EndSourceFile();
+        }
+        outStream.flush();
+      } else {
+        compiler.getLangOpts().HLSLEntryFunction =
+          compiler.getCodeGenOpts().HLSLEntryFunction = pUtf8EntryPoint;
+        compiler.getLangOpts().HLSLProfile =
+          compiler.getCodeGenOpts().HLSLProfile = opts.TargetProfile;
+
+        if (compiler.getCodeGenOpts().HLSLProfile == "rootsig_1_1") {
+          rootSigMajor = 1;
+          rootSigMinor = 1;
+        } else if (compiler.getCodeGenOpts().HLSLProfile == "rootsig_1_0") {
+          rootSigMajor = 1;
+          rootSigMinor = 0;
+        }
+        compiler.getLangOpts().IsHLSLLibrary = opts.IsLibraryProfile();
+
+        // Clear entry function if library target
+        if (compiler.getLangOpts().IsHLSLLibrary)
+          compiler.getLangOpts().HLSLEntryFunction =
+            compiler.getCodeGenOpts().HLSLEntryFunction = "";
+
+        // NOTE: this calls the validation component from dxil.dll; the built-in
+        // validator can be used as a fallback.
+        produceFullContainer = !opts.CodeGenHighLevel && !opts.AstDump && !opts.OptDump && rootSigMajor == 0;
+        needsValidation = produceFullContainer && !opts.DisableValidation;
+
+        if (compiler.getCodeGenOpts().HLSLProfile == "lib_6_x") {
+          // Currently do not support stripping reflection from offline linking target.
+          opts.KeepReflectionInDxil = true;
+        }
+
+        if (opts.ValVerMajor != UINT_MAX) {
+          // user-specified validator version override
+          compiler.getCodeGenOpts().HLSLValidatorMajorVer = opts.ValVerMajor;
+          compiler.getCodeGenOpts().HLSLValidatorMinorVer = opts.ValVerMinor;
+        } else {
+          // Version from dxil.dll, or internal validator if unavailable
+          dxcutil::GetValidatorVersion(&compiler.getCodeGenOpts().HLSLValidatorMajorVer,
+                                      &compiler.getCodeGenOpts().HLSLValidatorMinorVer);
+        }
+
+        // Root signature-only container validation is only supported on 1.5 and above.
+        validateRootSigContainer = DXIL::CompareVersions(
+          compiler.getCodeGenOpts().HLSLValidatorMajorVer,
+          compiler.getCodeGenOpts().HLSLValidatorMinorVer,
+          1, 5) >= 0;
       }
 
       if (opts.AstDump) {
         clang::ASTDumpAction dumpAction;
         // Consider - ASTDumpFilter, ASTDumpLookups
         compiler.getFrontendOpts().ASTDumpDecls = true;
-        FrontendInputFile file(utf8SourceName.m_psz, IK_HLSL);
+        FrontendInputFile file(pUtf8SourceName, IK_HLSL);
         dumpAction.BeginSourceFile(compiler, file);
         dumpAction.Execute();
         dumpAction.EndSourceFile();
@@ -504,7 +854,7 @@ public:
       }
       else if (opts.OptDump) {
         EmitOptDumpAction action(&llvmContext);
-        FrontendInputFile file(utf8SourceName.m_psz, IK_HLSL);
+        FrontendInputFile file(pUtf8SourceName, IK_HLSL);
         action.BeginSourceFile(compiler, file);
         action.Execute();
         action.EndSourceFile();
@@ -514,7 +864,7 @@ public:
         HLSLRootSignatureAction action(
             compiler.getCodeGenOpts().HLSLEntryFunction, rootSigMajor,
             rootSigMinor);
-        FrontendInputFile file(utf8SourceName.m_psz, IK_HLSL);
+        FrontendInputFile file(pUtf8SourceName, IK_HLSL);
         action.BeginSourceFile(compiler, file);
         action.Execute();
         action.EndSourceFile();
@@ -531,11 +881,17 @@ public:
 
           pOutputBlob.Release();
           IFT(pContainerStream.QueryInterface(&pOutputBlob));
+          if (validateRootSigContainer && !opts.DisableValidation) {
+            CComPtr<IDxcBlobEncoding> pValErrors;
+            // Validation failure communicated through diagnostic error
+            dxcutil::ValidateRootSignatureInContainer(
+              pOutputBlob, &compiler.getDiagnostics());
+          }
         }
       }
       // SPIRV change starts
 #ifdef ENABLE_SPIRV_CODEGEN
-      else if (opts.GenSPIRV) {
+      else if (!isPreprocessing && opts.GenSPIRV) {
         // Since SpirvOptions is passed to the SPIR-V CodeGen as a whole
         // structure, we need to copy a few non-spirv-specific options into the
         // structure.
@@ -550,7 +906,7 @@ public:
 
         compiler.getCodeGenOpts().SpirvOptions = opts.SpirvOptions;
         clang::EmitSpirvAction action;
-        FrontendInputFile file(utf8SourceName.m_psz, IK_HLSL);
+        FrontendInputFile file(pUtf8SourceName, IK_HLSL);
         action.BeginSourceFile(compiler, file);
         action.Execute();
         action.EndSourceFile();
@@ -558,9 +914,9 @@ public:
       }
 #endif
       // SPIRV change ends
-      else {
+      else if (!isPreprocessing) {
         EmitBCAction action(&llvmContext);
-        FrontendInputFile file(utf8SourceName.m_psz, IK_HLSL);
+        FrontendInputFile file(pUtf8SourceName, IK_HLSL);
         bool compileOK;
         if (action.BeginSourceFile(compiler, file)) {
           action.Execute();
@@ -581,30 +937,50 @@ public:
         // embed the debug info and emit a note.
         if (opts.EmbedDebugInfo()) {
           SerializeFlags |= SerializeDxilFlags::IncludeDebugInfoPart;
-        } else if (opts.DebugInfo && !ppDebugBlob) {
-          w << "warning: no output provided for debug - embedding PDB in shader container.  Use -Qembed_debug to silence this warning.\n";
-          SerializeFlags |= SerializeDxilFlags::IncludeDebugInfoPart;
         }
         if (opts.DebugNameForSource) {
+          // Implies name part
+          SerializeFlags |= SerializeDxilFlags::IncludeDebugNamePart;
           SerializeFlags |= SerializeDxilFlags::DebugNameDependOnSource;
+        } else if (opts.DebugNameForBinary) {
+          // Implies name part
+          SerializeFlags |= SerializeDxilFlags::IncludeDebugNamePart;
         }
-        if (opts.StripReflection) {
+        if (!opts.KeepReflectionInDxil) {
           SerializeFlags |= SerializeDxilFlags::StripReflectionFromDxilPart;
+        }
+        if (!opts.StripReflection) {
+          SerializeFlags |= SerializeDxilFlags::IncludeReflectionPart;
+        }
+        if (opts.StripRootSignature) {
+          SerializeFlags |= SerializeDxilFlags::StripRootSignature;
         }
 
         // Don't do work to put in a container if an error has occurred
         // Do not create a container when there is only a a high-level representation in the module.
         if (compileOK && !opts.CodeGenHighLevel) {
           HRESULT valHR = S_OK;
+          CComPtr<AbstractMemoryStream> pRootSigStream;
+          IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &pReflectionStream));
+          IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &pRootSigStream));
+
+          std::unique_ptr<llvm::Module> serializeModule( action.takeModule() );
+
+          // Clone and save the copy.
+          if (opts.GenerateFullDebugInfo()) {
+            debugModule.reset(llvm::CloneModule(serializeModule.get()));
+          }
+
+          dxcutil::AssembleInputs inputs(
+                std::move(serializeModule), pOutputBlob, m_pMalloc, SerializeFlags,
+                pOutputStream,
+                opts.GetPDBName(), &compiler.getDiagnostics(),
+                &ShaderHashContent, pReflectionStream, pRootSigStream);
 
           if (needsValidation) {
-            valHR = dxcutil::ValidateAndAssembleToContainer(
-                action.takeModule(), pOutputBlob, m_pMalloc, SerializeFlags,
-                pOutputStream, opts.IsDebugInfoEnabled(), opts.GetPDBName(), compiler.getDiagnostics());
+            valHR = dxcutil::ValidateAndAssembleToContainer(inputs);
           } else {
-            dxcutil::AssembleToContainer(action.takeModule(),
-                                                 pOutputBlob, m_pMalloc,
-                                                 SerializeFlags, pOutputStream);
+            dxcutil::AssembleToContainer(inputs);
           }
 
           // Callback after valid DXIL is produced
@@ -617,194 +993,178 @@ public:
               }
             }
 
-            if (ppDebugBlobName && produceFullContainer) {
+            if (pOutputBlob && produceFullContainer && (SerializeFlags & SerializeDxilFlags::IncludeDebugNamePart) != 0) {
               const DxilContainerHeader *pContainer = reinterpret_cast<DxilContainerHeader *>(pOutputBlob->GetBufferPointer());
               DXASSERT(IsValidDxilContainer(pContainer, pOutputBlob->GetBufferSize()), "else invalid container generated");
-              auto it = std::find_if(begin(pContainer), end(pContainer),
-                DxilPartIsType(DFCC_ShaderDebugName));
+              auto it = std::find_if(begin(pContainer), end(pContainer), DxilPartIsType(DFCC_ShaderDebugName));
               if (it != end(pContainer)) {
                 const char *pDebugName;
                 if (GetDxilShaderDebugName(*it, &pDebugName, nullptr) && pDebugName && *pDebugName) {
-                  IFTBOOL(Unicode::UTF8BufferToUTF16ComHeap(pDebugName, &DebugBlobName), DXC_E_CONTAINER_INVALID);
+                  IFT(pResult->SetOutputName(DXC_OUT_PDB, pDebugName));
                 }
               }
             }
-          }
-        }
+
+            if (pReflectionStream && pReflectionStream->GetPtrSize()) {
+              CComPtr<IDxcBlob> pReflection;
+              IFT(pReflectionStream->QueryInterface(&pReflection));
+              IFT(pResult->SetOutputObject(DXC_OUT_REFLECTION, pReflection));
+            }
+            if (pRootSigStream && pRootSigStream->GetPtrSize()) {
+              CComPtr<IDxcBlob> pRootSignature;
+              IFT(pRootSigStream->QueryInterface(&pRootSignature));
+              if (validateRootSigContainer && needsValidation) {
+                CComPtr<IDxcBlobEncoding> pValErrors;
+                // Validation failure communicated through diagnostic error
+                dxcutil::ValidateRootSignatureInContainer(pRootSignature, &compiler.getDiagnostics());
+              }
+              IFT(pResult->SetOutputObject(DXC_OUT_ROOT_SIGNATURE, pRootSignature));
+            }
+            CComPtr<IDxcBlob> pHashBlob;
+            IFT(hlsl::DxcCreateBlobOnHeapCopy(&ShaderHashContent, (UINT32)sizeof(ShaderHashContent), &pHashBlob));
+            IFT(pResult->SetOutputObject(DXC_OUT_SHADER_HASH, pHashBlob));
+          } // SUCCEEDED(valHR)
+        } // compileOK && !opts.CodeGenHighLevel
       }
 
       // Add std err to warnings.
       msfPtr->WriteStdErrToStream(w);
-
-      CreateOperationResultFromOutputs(pOutputBlob, msfPtr, warnings,
-                                       compiler.getDiagnostics(), ppResult);
-
-      // On success, return values. After assigning ppResult, nothing should fail.
-      HRESULT status;
-      DXVERIFY_NOMSG(SUCCEEDED((*ppResult)->GetStatus(&status)));
-      if (SUCCEEDED(status)) {
-        if (opts.IsDebugInfoEnabled() && ppDebugBlob) {
-          DXVERIFY_NOMSG(SUCCEEDED(pOutputStream.QueryInterface(ppDebugBlob)));
-        }
-        if (ppDebugBlobName) {
-          *ppDebugBlobName = DebugBlobName.Detach();
-        }
+      CComPtr<IStream> pErrorStream;
+      msfPtr->GetStdOutpuHandleStream(&pErrorStream);
+      CComPtr<IDxcBlob> pErrorBlob;
+      IFT(pErrorStream.QueryInterface(&pErrorBlob));
+      if (IsBlobNullOrEmpty(pErrorBlob)) {
+        IFT(pResult->SetOutputString(DXC_OUT_ERRORS, warnings.c_str(), warnings.size()));
+      } else {
+        IFT(pResult->SetOutputObject(DXC_OUT_ERRORS, pErrorBlob));
       }
+
+      bool hasErrorOccurred = compiler.getDiagnostics().hasErrorOccurred();
+
+      bool writePDB = opts.GeneratePDB() && produceFullContainer;
+
+      // SPIRV change starts
+#if defined(ENABLE_SPIRV_CODEGEN)
+      writePDB &= !opts.GenSPIRV;
+#endif
+      // SPIRV change ends
+
+      if (!hasErrorOccurred && writePDB) {
+        CComPtr<IDxcBlob> pStrippedContainer;
+        {
+          // Create the shader source information for PDB
+          hlsl::SourceInfoWriter debugSourceInfoWriter;
+          const hlsl::DxilSourceInfo *pSourceInfo = nullptr;
+          if (!opts.SourceInDebugModule) { // If we are using old PDB format where sources are in debug module, do not generate source info at all
+            debugSourceInfoWriter.Write(opts.TargetProfile, opts.EntryPoint, compiler.getCodeGenOpts(), compiler.getSourceManager());
+            pSourceInfo = debugSourceInfoWriter.GetPart();
+          }
+
+          CComPtr<IDxcBlob> pDebugProgramBlob;
+          CComPtr<AbstractMemoryStream> pReflectionInPdb;
+          // Don't include the debug part if using source only PDB
+          if (opts.SourceOnlyDebug) {
+            assert(pSourceInfo);
+            pReflectionInPdb = pReflectionStream;
+          }
+          else {
+            if (!opts.SourceInDebugModule) {
+              // Strip out the source related metadata
+              debugModule->GetOrCreateDxilModule()
+                .StripShaderSourcesAndCompileOptions(/* bReplaceWithDummyData */ true);
+            }
+            CComPtr<AbstractMemoryStream> pDebugBlobStorage;
+            IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &pDebugBlobStorage));
+            raw_stream_ostream outStream(pDebugBlobStorage.p);
+            WriteBitcodeToFile(debugModule.get(), outStream, true);
+            outStream.flush();
+            IFT(pDebugBlobStorage.QueryInterface(&pDebugProgramBlob));
+          }
+
+          IFT(CreateContainerForPDB(
+            m_pMalloc,
+            pOutputBlob, pDebugProgramBlob,
+            static_cast<IDxcVersionInfo *>(this), pSourceInfo,
+            pReflectionInPdb,
+            &pStrippedContainer));
+        }
+
+        // Create the final PDB Blob
+        CComPtr<IDxcBlob> pPdbBlob;
+        IFT(hlsl::pdb::WriteDxilPDB(m_pMalloc, pStrippedContainer, ShaderHashContent.Digest, &pPdbBlob));
+        IFT(pResult->SetOutputObject(DXC_OUT_PDB, pPdbBlob));
+
+        // If option Qpdb_in_private given, add the PDB to the DXC_OUT_OBJECT container output as a
+        // DFCC_PrivateData part.
+        if (opts.PdbInPrivate) {
+          CComPtr<IDxcBlobEncoding> pContainerBlob;
+          hlsl::DxcCreateBlobWithEncodingFromPinned(pOutputBlob->GetBufferPointer(), pOutputBlob->GetBufferSize(), CP_ACP, &pContainerBlob);
+
+          CComPtr<IDxcContainerBuilder> pContainerBuilder;
+          DxcCreateInstance2(this->m_pMalloc, CLSID_DxcContainerBuilder, IID_PPV_ARGS(&pContainerBuilder));
+          IFT(pContainerBuilder->Load(pOutputBlob));
+          IFT(pContainerBuilder->AddPart(hlsl::DFCC_PrivateData, pPdbBlob));
+
+          CComPtr<IDxcOperationResult> pReserializeResult;
+          IFT(pContainerBuilder->SerializeContainer(&pReserializeResult));
+
+          CComPtr<IDxcBlob> pNewOutput;
+          IFT(pReserializeResult->GetResult(&pNewOutput));
+          pOutputBlob = pNewOutput;
+        } // PDB in private
+      } // Write PDB
+
+      IFT(primaryOutput.SetObject(pOutputBlob, opts.DefaultTextCodePage));
+      IFT(pResult->SetOutput(primaryOutput));
+      IFT(pResult->SetStatusAndPrimaryResult(hasErrorOccurred ? E_FAIL : S_OK, primaryOutput.kind));
+      IFT(pResult->QueryInterface(riid, ppResult));
 
       hr = S_OK;
     } catch (std::bad_alloc &) {
       hr = E_OUTOFMEMORY;
     } catch (hlsl::Exception &e) {
       _Analysis_assume_(DXC_FAILED(e.hr));
-      if (e.hr == DXC_E_ABORT_COMPILATION_ERROR) {
-        e.hr = S_OK;
-        CComPtr<IDxcBlobEncoding> pErrorBlob;
-        IFT(DxcCreateBlobWithEncodingOnHeapCopy(e.msg.c_str(), e.msg.size(),
-                                                CP_UTF8, &pErrorBlob));
-        IFT(DxcOperationResult::CreateFromResultErrorStatus(
-            nullptr, pErrorBlob, DXC_E_GENERAL_INTERNAL_ERROR, ppResult));
-      }
+      CComPtr<IDxcResult> pResult;
       hr = e.hr;
+      std::string msg("Internal Compiler error: ");
+      msg += e.msg;
+      if (SUCCEEDED(DxcResult::Create(e.hr, DXC_OUT_NONE, {
+              DxcOutputObject::ErrorOutput(CP_UTF8,
+                msg.c_str(), msg.size())
+            }, &pResult)) &&
+          SUCCEEDED(pResult->QueryInterface(riid, ppResult))) {
+        hr = S_OK;
+      }
     } catch (...) {
       hr = E_FAIL;
     }
   Cleanup:
-    DxcEtw_DXCompilerCompile_Stop(hr);
-    return hr;
-  }
-
-  // Preprocess source text
-  HRESULT STDMETHODCALLTYPE Preprocess(
-    _In_ IDxcBlob *pSource,                       // Source text to preprocess
-    _In_opt_ LPCWSTR pSourceName,                 // Optional file name for pSource. Used in errors and include handlers.
-    _In_count_(argCount) LPCWSTR *pArguments,     // Array of pointers to arguments
-    _In_ UINT32 argCount,                         // Number of arguments
-    _In_count_(defineCount) const DxcDefine *pDefines,  // Array of defines
-    _In_ UINT32 defineCount,                      // Number of defines
-    _In_opt_ IDxcIncludeHandler *pIncludeHandler, // user-provided interface to handle #include directives (optional)
-    _COM_Outptr_ IDxcOperationResult **ppResult   // Preprocessor output status, buffer, and errors
-    ) override {
-    if (pSource == nullptr || ppResult == nullptr ||
-        (defineCount > 0 && pDefines == nullptr) ||
-        (argCount > 0 && pArguments == nullptr))
-      return E_INVALIDARG;
-    *ppResult = nullptr;
-
-    HRESULT hr = S_OK;
-    DxcEtw_DXCompilerPreprocess_Start();
-    DxcThreadMalloc TM(m_pMalloc);
-    CComPtr<IDxcBlobEncoding> utf8Source;
-    IFC(hlsl::DxcGetBlobAsUtf8(pSource, &utf8Source));
-
-    try {
-      DefaultFPEnvScope fpEnvScope;
-
-      CComPtr<AbstractMemoryStream> pOutputStream;
-      dxcutil::DxcArgsFileSystem *msfPtr = dxcutil::CreateDxcArgsFileSystem(utf8Source, pSourceName, pIncludeHandler);
-      std::unique_ptr<::llvm::sys::fs::MSFileSystem> msf(msfPtr);
-
-      ::llvm::sys::fs::AutoPerThreadSystem pts(msf.get());
-      IFTLLVM(pts.error_code());
-
-      IFT(CreateMemoryStream(m_pMalloc, &pOutputStream));
-
-      int argCountInt;
-      IFT(UIntToInt(argCount, &argCountInt));
-      hlsl::options::MainArgs mainArgs(argCountInt, pArguments, 0);
-      hlsl::options::DxcOpts opts;
-      bool finished;
-      dxcutil::ReadOptsAndValidate(mainArgs, opts, pOutputStream, ppResult, finished);
-      if (finished) {
-        hr = S_OK;
-        goto Cleanup;
-      }
-
-      // Prepare UTF8-encoded versions of API values.
-      CW2A utf8SourceName(pSourceName, CP_UTF8);
-      const char *pUtf8SourceName = utf8SourceName.m_psz;
-      if (pUtf8SourceName == nullptr) {
-        if (opts.InputFile.empty()) {
-          pUtf8SourceName = "input.hlsl";
-        }
-        else {
-          pUtf8SourceName = opts.InputFile.data();
-        }
-      }
-
-      IFT(msfPtr->RegisterOutputStream(L"output.hlsl", pOutputStream));
-      IFT(msfPtr->CreateStdStreams(m_pMalloc));
-
-      StringRef Data((LPSTR)utf8Source->GetBufferPointer(),
-        utf8Source->GetBufferSize());
-      std::unique_ptr<llvm::MemoryBuffer> pBuffer(
-        llvm::MemoryBuffer::getMemBufferCopy(Data, pUtf8SourceName));
-
-      // Not very efficient but also not very important.
-      std::vector<std::string> defines;
-      CreateDefineStrings(pDefines, defineCount, defines);
-
-      // Setup a compiler instance.
-      std::string warnings;
-      raw_string_ostream w(warnings);
-      raw_stream_ostream outStream(pOutputStream.p);
-      CompilerInstance compiler;
-      std::unique_ptr<TextDiagnosticPrinter> diagPrinter =
-          llvm::make_unique<TextDiagnosticPrinter>(w, &compiler.getDiagnosticOpts());
-      SetupCompilerForCompile(compiler, &m_langExtensionsHelper, utf8SourceName, diagPrinter.get(), defines, opts, pArguments, argCount);
-      msfPtr->SetupForCompilerInstance(compiler);
-
-      // The clang entry point (cc1_main) would now create a compiler invocation
-      // from arguments, but for this path we're exclusively trying to preproces
-      // to text.
-      compiler.getFrontendOpts().OutputFile = "output.hlsl";
-      compiler.WriteDefaultOutputDirectly = true;
-      compiler.setOutStream(&outStream);
-
-      // These settings are back-compatible with fxc.
-      clang::PreprocessorOutputOptions &PPOutOpts =
-          compiler.getPreprocessorOutputOpts();
-      PPOutOpts.ShowCPP = 1;            // Print normal preprocessed output.
-      PPOutOpts.ShowComments = 0;       // Show comments.
-      PPOutOpts.ShowLineMarkers = 1;    // Show \#line markers.
-      PPOutOpts.UseLineDirectives = 1;  // Use \#line instead of GCC-style \# N.
-      PPOutOpts.ShowMacroComments = 0;  // Show comments, even in macros.
-      PPOutOpts.ShowMacros = 0;         // Print macro definitions.
-      PPOutOpts.RewriteIncludes = 0;    // Preprocess include directives only.
-
-      FrontendInputFile file(utf8SourceName.m_psz, IK_HLSL);
-      clang::PrintPreprocessedAction action;
-      if (action.BeginSourceFile(compiler, file)) {
-        action.Execute();
-        action.EndSourceFile();
-      }
-      outStream.flush();
-
-      // Add std err to warnings.
-      msfPtr->WriteStdErrToStream(w);
-
-      CreateOperationResultFromOutputs(pOutputStream, msfPtr, warnings,
-        compiler.getDiagnostics(), ppResult);
-      hr = S_OK;
+    if (bPreprocessStarted) {
+      DxcEtw_DXCompilerPreprocess_Stop(hr);
     }
-    CATCH_CPP_ASSIGN_HRESULT();
-  Cleanup:
-    DxcEtw_DXCompilerPreprocess_Stop(hr);
+    if (bCompileStarted) {
+      DxcEtw_DXCompilerCompile_Stop(hr);
+    }
     return hr;
   }
 
-  // Disassemble a shader.
-  HRESULT STDMETHODCALLTYPE Disassemble(
-    _In_ IDxcBlob *pProgram,                      // Program to disassemble.
-    _COM_Outptr_ IDxcBlobEncoding** ppDisassembly // Disassembly text.
+  // Disassemble a program.
+  virtual HRESULT STDMETHODCALLTYPE Disassemble(
+    _In_ const DxcBuffer *pObject,                // Program to disassemble: dxil container or bitcode.
+    _In_ REFIID riid, _Out_ LPVOID *ppResult      // IDxcResult: status, disassembly text, and errors
     ) override {
-    if (pProgram == nullptr || ppDisassembly == nullptr)
+    if (pObject == nullptr || ppResult == nullptr)
+      return E_INVALIDARG;
+    if (!(IsEqualIID(riid, __uuidof(IDxcResult)) ||
+          IsEqualIID(riid, __uuidof(IDxcOperationResult))))
       return E_INVALIDARG;
 
-    *ppDisassembly = nullptr;
+    *ppResult = nullptr;
+    CComPtr<IDxcResult> pResult;
 
     HRESULT hr = S_OK;
     DxcEtw_DXCompilerDisassemble_Start();
-    DxcThreadMalloc TM(m_pMalloc); 
+    DxcThreadMalloc TM(m_pMalloc);
     try {
       DefaultFPEnvScope fpEnvScope;
 
@@ -818,14 +1178,32 @@ public:
       std::string StreamStr;
       raw_string_ostream Stream(StreamStr);
 
+      CComPtr<IDxcBlobEncoding> pProgram;
+      IFT(hlsl::DxcCreateBlob(pObject->Ptr, pObject->Size, true, false, false, 0, nullptr, &pProgram))
       IFC(dxcutil::Disassemble(pProgram, Stream));
 
-      IFT(DxcCreateBlobWithEncodingOnHeapCopy(
-          StreamStr.c_str(), StreamStr.size(), CP_UTF8, ppDisassembly));
+      IFT(DxcResult::Create(S_OK, DXC_OUT_DISASSEMBLY, {
+          DxcOutputObject::StringOutput(DXC_OUT_DISASSEMBLY,
+            CP_UTF8, StreamStr.c_str(), StreamStr.size(), DxcOutNoName)
+        }, &pResult));
+      IFT(pResult->QueryInterface(riid, ppResult));
 
       return S_OK;
+    } catch (std::bad_alloc &) {
+      hr = E_OUTOFMEMORY;
+    } catch (hlsl::Exception &e) {
+      _Analysis_assume_(DXC_FAILED(e.hr));
+      hr = e.hr;
+      if (SUCCEEDED(DxcResult::Create(e.hr, DXC_OUT_NONE, {
+              DxcOutputObject::ErrorOutput(CP_UTF8,
+                e.msg.c_str(), e.msg.size())
+            }, &pResult)) &&
+          SUCCEEDED(pResult->QueryInterface(riid, ppResult))) {
+        hr = S_OK;
+      }
+    } catch (...) {
+      hr = E_FAIL;
     }
-    CATCH_CPP_ASSIGN_HRESULT();
   Cleanup:
     DxcEtw_DXCompilerDisassemble_Stop(hr);
     return hr;
@@ -841,10 +1219,15 @@ public:
     // Setup a compiler instance.
     std::shared_ptr<TargetOptions> targetOptions(new TargetOptions);
     targetOptions->Triple = "dxil-ms-dx";
+    if (helper) {
+      targetOptions->Triple = helper->GetTargetTriple();
+    }
     targetOptions->DescriptionString = Opts.Enable16BitTypes
       ? hlsl::DXIL::kNewLayoutString
       : hlsl::DXIL::kLegacyLayoutString;
     compiler.HlslLangExtensions = helper;
+    compiler.getDiagnosticOpts().ShowOptionNames = Opts.ShowOptionNames ? 1 : 0;
+    compiler.getDiagnosticOpts().Warnings = std::move(Opts.Warnings);
     compiler.createDiagnostics(diagPrinter, false);
     // don't output warning to stderr/file if "/no-warnings" is present.
     compiler.getDiagnostics().setIgnoreAllWarnings(!Opts.OutputWarnings);
@@ -859,13 +1242,22 @@ public:
 
     compiler.getFrontendOpts().Inputs.push_back(FrontendInputFile(pMainFile, IK_HLSL));
     // Setup debug information.
-    if (Opts.IsDebugInfoEnabled()) {
+    if (Opts.GenerateFullDebugInfo()) {
       CodeGenOptions &CGOpts = compiler.getCodeGenOpts();
+      // HLSL Change - begin
       CGOpts.setDebugInfo(CodeGenOptions::FullDebugInfo);
+      CGOpts.HLSLEmbedSourcesInModule = true;
+      // HLSL Change - end
+      // CGOpts.setDebugInfo(CodeGenOptions::FullDebugInfo); // HLSL change
       CGOpts.DebugColumnInfo = 1;
       CGOpts.DwarfVersion = 4; // Latest version.
       // TODO: consider
       // DebugPass, DebugCompilationDir, DwarfDebugFlags, SplitDwarfFile
+    }
+    else {
+      CodeGenOptions &CGOpts = compiler.getCodeGenOpts();
+      CGOpts.setDebugInfo(CodeGenOptions::LocTrackingOnly);
+      CGOpts.DebugColumnInfo = 1;
     }
 
     clang::PreprocessorOptions &PPOpts(compiler.getPreprocessorOpts());
@@ -912,6 +1304,8 @@ public:
 
     compiler.getLangOpts().UseMinPrecision = !Opts.Enable16BitTypes;
 
+    compiler.getLangOpts().EnablePayloadAccessQualifiers = Opts.EnablePayloadQualifiers;
+
 // SPIRV change starts
 #ifdef ENABLE_SPIRV_CODEGEN
     compiler.getLangOpts().SPIRV = Opts.GenSPIRV;
@@ -946,7 +1340,12 @@ public:
       compiler.getCodeGenOpts().UnrollLoops = true;
 
     compiler.getCodeGenOpts().HLSLHighLevel = Opts.CodeGenHighLevel;
+    compiler.getCodeGenOpts().HLSLAllowPreserveValues = Opts.AllowPreserveValues;
+    compiler.getCodeGenOpts().HLSLOnlyWarnOnUnrollFail = Opts.EnableFXCCompatMode;
     compiler.getCodeGenOpts().HLSLResMayAlias = Opts.ResMayAlias;
+    compiler.getCodeGenOpts().ScanLimit = Opts.ScanLimit;
+    compiler.getCodeGenOpts().HLSLOptimizationToggles = Opts.DxcOptimizationToggles;
+    compiler.getCodeGenOpts().HLSLOptimizationSelects = Opts.DxcOptimizationSelects;
     compiler.getCodeGenOpts().HLSLAllResourcesBound = Opts.AllResourcesBound;
     compiler.getCodeGenOpts().HLSLDefaultRowMajor = Opts.DefaultRowMajor;
     compiler.getCodeGenOpts().HLSLPreferControlFlow = Opts.PreferFlowControl;
@@ -954,7 +1353,12 @@ public:
     compiler.getCodeGenOpts().HLSLNotUseLegacyCBufLoad = Opts.NotUseLegacyCBufLoad;
     compiler.getCodeGenOpts().HLSLLegacyResourceReservation = Opts.LegacyResourceReservation;
     compiler.getCodeGenOpts().HLSLDefines = defines;
+    compiler.getCodeGenOpts().HLSLPreciseOutputs = Opts.PreciseOutputs;
     compiler.getCodeGenOpts().MainFileName = pMainFile;
+    compiler.getCodeGenOpts().HLSLPrintAfterAll = Opts.PrintAfterAll;
+    compiler.getCodeGenOpts().HLSLForceZeroStoreLifetimes = Opts.ForceZeroStoreLifetimes;
+    compiler.getCodeGenOpts().HLSLEnableLifetimeMarkers = Opts.EnableLifetimeMarkers;
+    compiler.getCodeGenOpts().HLSLEnablePayloadAccessQualifiers = Opts.EnablePayloadQualifiers;
 
     // Translate signature packing options
     if (Opts.PackPrefixStable)
@@ -967,9 +1371,11 @@ public:
     // Constructing vector of wide strings to pass in to codegen. Just passing
     // in pArguments will expose ownership of memory to both CodeGenOptions and
     // this caller, which can lead to unexpected behavior.
-    for (UINT32 i = 0; i != argCount; ++i) {
-      compiler.getCodeGenOpts().HLSLArguments.emplace_back(
-          Unicode::UTF16ToUTF8StringOrThrow(pArguments[i]));
+    for (UINT32 i = 0; i != Opts.Args.getNumInputArgStrings(); ++i) {
+      auto arg = Opts.Args.getArgString(i);
+      if (Opts.InputFile.compare(arg) != 0) {
+        compiler.getCodeGenOpts().HLSLArguments.emplace_back(arg);
+      }
     }
     // Overrding default set of loop unroll.
     if (Opts.PreferFlowControl)
@@ -1009,6 +1415,19 @@ public:
     *pMinor = DXIL::kDxilMinor;
     return S_OK;
   }
+  HRESULT STDMETHODCALLTYPE GetCustomVersionString(
+    _Outptr_result_z_ char **pVersionString // Custom version string for compiler. (Must be CoTaskMemFree()'d!)
+  ) override
+  {
+    size_t size = strlen(RC_FILE_VERSION);
+    char *const result = (char *)CoTaskMemAlloc(size + 1);
+    if (result == nullptr)
+      return E_OUTOFMEMORY;
+    std::strcpy(result, RC_FILE_VERSION);
+    *pVersionString = result;
+    return S_OK;
+  }
+
 #ifdef SUPPORT_QUERY_GIT_COMMIT_INFO
   HRESULT STDMETHODCALLTYPE GetCommitInfo(_Out_ UINT32 *pCommitCount,
                                           _Out_ char **pCommitHash) override {
@@ -1026,6 +1445,7 @@ public:
     return S_OK;
   }
 #endif // SUPPORT_QUERY_GIT_COMMIT_INFO
+
   HRESULT STDMETHODCALLTYPE GetFlags(_Out_ UINT32 *pFlags) override {
     if (pFlags == nullptr)
       return E_INVALIDARG;
@@ -1036,6 +1456,257 @@ public:
     return S_OK;
   }
 };
+
+//////////////////////////////////////////////////////////////
+// legacy IDxcCompiler2 implementation that maps to DxcCompiler
+ULONG STDMETHODCALLTYPE DxcCompilerAdapter::AddRef() {
+  return m_pCompilerImpl->AddRef();
+}
+ULONG STDMETHODCALLTYPE DxcCompilerAdapter::Release() {
+  return m_pCompilerImpl->Release();
+}
+HRESULT STDMETHODCALLTYPE DxcCompilerAdapter::QueryInterface(REFIID iid, void **ppvObject) {
+   return m_pCompilerImpl->QueryInterface(iid, ppvObject);
+}
+
+// Preprocess source text
+HRESULT STDMETHODCALLTYPE DxcCompilerAdapter::Preprocess(
+  _In_ IDxcBlob *pSource,                       // Source text to preprocess
+  _In_opt_z_ LPCWSTR pSourceName,               // Optional file name for pSource. Used in errors and include handlers.
+  _In_opt_count_(argCount) LPCWSTR *pArguments, // Array of pointers to arguments
+  _In_ UINT32 argCount,                         // Number of arguments
+  _In_count_(defineCount)
+    const DxcDefine *pDefines,                  // Array of defines
+  _In_ UINT32 defineCount,                      // Number of defines
+  _In_opt_ IDxcIncludeHandler *pIncludeHandler, // user-provided interface to handle #include directives (optional)
+  _COM_Outptr_ IDxcOperationResult **ppResult   // Preprocessor output status, buffer, and errors
+) {
+  if (pSource == nullptr || ppResult == nullptr ||
+      (defineCount > 0 && pDefines == nullptr) ||
+      (argCount > 0 && pArguments == nullptr))
+    return E_INVALIDARG;
+  *ppResult = nullptr;
+
+  return WrapCompile(
+    TRUE,
+    pSource, pSourceName,
+    nullptr, nullptr,
+    pArguments, argCount,
+    pDefines, defineCount,
+    pIncludeHandler,
+    ppResult, nullptr, nullptr);
+}
+
+// Disassemble a program.
+HRESULT STDMETHODCALLTYPE DxcCompilerAdapter::Disassemble(
+  _In_ IDxcBlob *pProgram,                        // Program to disassemble.
+  _COM_Outptr_ IDxcBlobEncoding **ppDisassembly   // Disassembly text.
+) {
+  if (pProgram == nullptr || ppDisassembly == nullptr)
+    return E_INVALIDARG;
+
+  *ppDisassembly = nullptr;
+
+  HRESULT hr = S_OK;
+  DxcThreadMalloc TM(m_pMalloc);
+
+  DxcBuffer buffer = { pProgram->GetBufferPointer(), pProgram->GetBufferSize(), 0 };
+  CComPtr<IDxcResult> pResult;
+  IFR(m_pCompilerImpl->Disassemble(&buffer, IID_PPV_ARGS(&pResult)));
+  IFRBOOL(pResult, E_OUTOFMEMORY);
+
+  IFR(pResult->GetStatus(&hr));
+  if (SUCCEEDED(hr)) {
+    // Extract disassembly
+    IFR(pResult->GetOutput(DXC_OUT_DISASSEMBLY, IID_PPV_ARGS(ppDisassembly), nullptr));
+  }
+  return hr;
+}
+
+HRESULT CreateDxcUtils(_In_ REFIID riid, _Out_ LPVOID *ppv);
+
+HRESULT STDMETHODCALLTYPE DxcCompilerAdapter::CompileWithDebug(
+  _In_ IDxcBlob *pSource,                       // Source text to compile
+  _In_opt_ LPCWSTR pSourceName,                 // Optional file name for pSource. Used in errors and include handlers.
+  _In_ LPCWSTR pEntryPoint,                     // Entry point name
+  _In_ LPCWSTR pTargetProfile,                  // Shader profile to compile
+  _In_count_(argCount) LPCWSTR *pArguments,     // Array of pointers to arguments
+  _In_ UINT32 argCount,                         // Number of arguments
+  _In_count_(defineCount) const DxcDefine *pDefines,  // Array of defines
+  _In_ UINT32 defineCount,                      // Number of defines
+  _In_opt_ IDxcIncludeHandler *pIncludeHandler, // user-provided interface to handle #include directives (optional)
+  _COM_Outptr_ IDxcOperationResult **ppResult,  // Compiler output status, buffer, and errors
+  _Outptr_opt_result_z_ LPWSTR *ppDebugBlobName,// Suggested file name for debug blob.
+  _COM_Outptr_opt_ IDxcBlob **ppDebugBlob       // Debug blob
+) {
+  if (pSource == nullptr || ppResult == nullptr ||
+      (defineCount > 0 && pDefines == nullptr) ||
+      (argCount > 0 && pArguments == nullptr) ||
+      pTargetProfile == nullptr)
+    return E_INVALIDARG;
+
+  *ppResult = nullptr;
+  AssignToOutOpt(nullptr, ppDebugBlobName);
+  AssignToOutOpt(nullptr, ppDebugBlob);
+
+  return WrapCompile(
+    FALSE,
+    pSource, pSourceName,
+    pEntryPoint, pTargetProfile,
+    pArguments, argCount,
+    pDefines, defineCount,
+    pIncludeHandler,
+    ppResult, ppDebugBlobName, ppDebugBlob);
+}
+
+HRESULT DxcCompilerAdapter::WrapCompile(
+  _In_ BOOL bPreprocess,                        // Preprocess mode
+  _In_ IDxcBlob *pSource,                       // Source text to compile
+  _In_opt_ LPCWSTR pSourceName,                 // Optional file name for pSource. Used in errors and include handlers.
+  _In_ LPCWSTR pEntryPoint,                     // Entry point name
+  _In_ LPCWSTR pTargetProfile,                  // Shader profile to compile
+  _In_count_(argCount) LPCWSTR *pArguments,     // Array of pointers to arguments
+  _In_ UINT32 argCount,                         // Number of arguments
+  _In_count_(defineCount) const DxcDefine *pDefines,  // Array of defines
+  _In_ UINT32 defineCount,                      // Number of defines
+  _In_opt_ IDxcIncludeHandler *pIncludeHandler, // user-provided interface to handle #include directives (optional)
+  _COM_Outptr_ IDxcOperationResult **ppResult,  // Compiler output status, buffer, and errors
+  _Outptr_opt_result_z_ LPWSTR *ppDebugBlobName,// Suggested file name for debug blob.
+  _COM_Outptr_opt_ IDxcBlob **ppDebugBlob       // Debug blob
+) {
+  HRESULT hr = S_OK;
+  DxcThreadMalloc TM(m_pMalloc);
+
+  try {
+    CComPtr<IDxcUtils> pUtils;
+    IFT(CreateDxcUtils(IID_PPV_ARGS(&pUtils)));
+    CComPtr<IDxcCompilerArgs> pArgs;
+    IFR(pUtils->BuildArguments(
+      pSourceName, pEntryPoint, pTargetProfile,
+      pArguments, argCount, pDefines, defineCount, &pArgs));
+
+    LPCWSTR PreprocessArgs[] = { L"-P", L"preprocessed.hlsl" };
+    if (bPreprocess) {
+      IFT(pArgs->AddArguments(PreprocessArgs, _countof(PreprocessArgs)));
+    }
+
+    DxcBuffer buffer = { pSource->GetBufferPointer(), pSource->GetBufferSize(), CP_ACP };
+    CComPtr<IDxcBlobEncoding> pSourceEncoding;
+    if (SUCCEEDED(pSource->QueryInterface(&pSourceEncoding))) {
+      BOOL sourceEncodingKnown = false;
+      IFT(pSourceEncoding->GetEncoding(&sourceEncodingKnown, &buffer.Encoding));
+    }
+
+    CComPtr<AbstractMemoryStream> pOutputStream;
+    IFT(CreateMemoryStream(m_pMalloc, &pOutputStream));
+
+    // Parse command-line options into DxcOpts
+    int argCountInt;
+    IFT(UIntToInt(pArgs->GetCount(), &argCountInt));
+    hlsl::options::MainArgs mainArgs(argCountInt, pArgs->GetArguments(), 0);
+    hlsl::options::DxcOpts opts;
+    bool finished = false;
+    CComPtr<IDxcOperationResult> pOperationResult;
+    dxcutil::ReadOptsAndValidate(mainArgs, opts, pOutputStream, &pOperationResult, finished);
+    if (finished) {
+      IFT(pOperationResult->QueryInterface(ppResult));
+      return S_OK;
+    }
+
+    if (pOutputStream->GetPosition() > 0) {
+      // Clear existing stream in case it has option spew
+      pOutputStream.Release();
+      IFT(CreateMemoryStream(m_pMalloc, &pOutputStream));
+    }
+
+    // To concat out output with compiler errors
+    raw_stream_ostream outStream(pOutputStream);
+
+    LPCWSTR EmbedDebugOpt[] = { L"-Qembed_debug" };
+    if (opts.DebugInfo && !ppDebugBlob && !opts.EmbedDebug && !opts.StripDebug) {
+// SPIRV change starts
+#if defined(ENABLE_SPIRV_CODEGEN)
+      if (!opts.GenSPIRV)
+        outStream << "warning: no output provided for debug - embedding PDB in "
+                     "shader container.  Use -Qembed_debug to silence this "
+                     "warning.\n";
+#else
+      outStream << "warning: no output provided for debug - embedding PDB in "
+                   "shader container.  Use -Qembed_debug to silence this "
+                   "warning.\n";
+#endif
+// SPIRV change ends
+      IFT(pArgs->AddArguments(EmbedDebugOpt, _countof(EmbedDebugOpt)));
+    }
+
+    CComPtr<DxcResult> pResult = DxcResult::Alloc(m_pMalloc);
+    pResult->SetEncoding(opts.DefaultTextCodePage);
+
+    CComPtr<IDxcResult> pImplResult;
+    IFR(m_pCompilerImpl->Compile(&buffer, pArgs->GetArguments(), pArgs->GetCount(), pIncludeHandler, IID_PPV_ARGS(&pImplResult)));
+    IFRBOOL(pImplResult, E_OUTOFMEMORY);
+    IFR(pImplResult->GetStatus(&hr));
+
+    pResult->CopyOutputsFromResult(pImplResult);
+    pResult->SetStatusAndPrimaryResult(hr, pImplResult->PrimaryOutput());
+
+    outStream.flush();
+
+    // Insert any warnings generated here
+    if (pOutputStream->GetPosition() > 0) {
+      CComPtr<IDxcBlobEncoding> pErrorsEncoding;
+      if (SUCCEEDED(pResult->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&pErrorsEncoding), nullptr)) &&
+          pErrorsEncoding && pErrorsEncoding->GetBufferSize()) {
+        CComPtr<IDxcBlobUtf8> pErrorsUtf8;
+        IFT(pUtils->GetBlobAsUtf8(pErrorsEncoding, &pErrorsUtf8));
+        outStream << pErrorsUtf8->GetStringPointer();
+        outStream.flush();
+      }
+      // Reconstruct result with new error buffer
+      CComPtr<IDxcBlobEncoding> pErrorBlob;
+      IFT(hlsl::DxcCreateBlob(
+        pOutputStream->GetPtr(), pOutputStream->GetPtrSize(),
+        false, true, true, DXC_CP_UTF8, nullptr, &pErrorBlob));
+      if (pErrorBlob && pErrorBlob->GetBufferSize()) {
+        pResult->Output(DXC_OUT_ERRORS)->object.Release();
+        pResult->SetOutputObject(DXC_OUT_ERRORS, pErrorBlob);
+      }
+    }
+
+    // Extract debug blob if present
+    CComHeapPtr<wchar_t> pDebugNameOnComHeap;
+    CComPtr<IDxcBlob> pDebugBlob;
+    if (SUCCEEDED(hr)) {
+      CComPtr<IDxcBlobUtf16> pDebugName;
+      hr = pResult->GetOutput(DXC_OUT_PDB, IID_PPV_ARGS(&pDebugBlob), &pDebugName);
+      if (SUCCEEDED(hr) && ppDebugBlobName && pDebugName) {
+        if (!pDebugNameOnComHeap.AllocateBytes(pDebugName->GetBufferSize()))
+          return E_OUTOFMEMORY;
+        memcpy(pDebugNameOnComHeap.m_pData, pDebugName->GetBufferPointer(), pDebugName->GetBufferSize());
+      }
+    }
+
+    if (ppDebugBlob && pDebugBlob)
+      *ppDebugBlob = pDebugBlob.Detach();
+    if (ppDebugBlobName && pDebugNameOnComHeap)
+      *ppDebugBlobName = pDebugNameOnComHeap.Detach();
+
+    IFR(pResult.QueryInterface(ppResult));
+    hr = S_OK;
+  } catch (std::bad_alloc &) {
+    hr = E_OUTOFMEMORY;
+  } catch (hlsl::Exception &e) {
+    _Analysis_assume_(DXC_FAILED(e.hr));
+    hr = DxcResult::Create(e.hr, DXC_OUT_NONE, {
+        DxcOutputObject::ErrorOutput(CP_UTF8, e.msg.c_str(), e.msg.size())
+      }, ppResult);
+  } catch (...) {
+    hr = E_FAIL;
+  }
+  return hr;
+}
+//////////////////////////////////////////////////////////////
+
 
 HRESULT CreateDxcCompiler(_In_ REFIID riid, _Out_ LPVOID* ppv) {
   *ppv = nullptr;

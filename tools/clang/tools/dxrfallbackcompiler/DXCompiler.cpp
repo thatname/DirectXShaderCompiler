@@ -44,7 +44,7 @@ static HRESULT InitMaybeFail() throw() {
   HRESULT hr;
   bool fsSetup = false, memSetup = false;
   IFC(DxcInitThreadMalloc());
-  DxcSetThreadMallocOrDefault(nullptr);
+  DxcSetThreadMallocToDefault();
   memSetup = true;
   if (::llvm::sys::fs::SetupPerThreadFileSystem()) {
     hr = E_FAIL;
@@ -78,13 +78,12 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD Reason, LPVOID reserved) {
   if (Reason == DLL_PROCESS_ATTACH) {
     EventRegisterMicrosoft_Windows_DXCompiler_API();
     DxcEtw_DXCompilerInitialization_Start();
-    DisableThreadLibraryCalls(hinstDLL);
     HRESULT hr = InitMaybeFail();
     DxcEtw_DXCompilerInitialization_Stop(hr);
     result = SUCCEEDED(hr) ? TRUE : FALSE;
   } else if (Reason == DLL_PROCESS_DETACH) {
     DxcEtw_DXCompilerShutdown_Start();
-    DxcSetThreadMallocOrDefault(nullptr);
+    DxcSetThreadMallocToDefault();
     ::hlsl::options::cleanupHlslOptTable();
     ::llvm::sys::fs::CleanupPerThreadFileSystem();
     ::llvm::llvm_shutdown();

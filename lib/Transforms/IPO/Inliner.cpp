@@ -39,7 +39,7 @@ using namespace llvm;
 STATISTIC(NumInlined, "Number of functions inlined");
 STATISTIC(NumCallsDeleted, "Number of call sites deleted, not inlined");
 STATISTIC(NumDeleted, "Number of functions deleted because all callers found");
-STATISTIC(NumMergedAllocas, "Number of allocas merged together");
+// STATISTIC(NumMergedAllocas, "Number of allocas merged together"); // HLSL Change - unused
 
 // This weirdly named statistic tracks the number of times that, when attempting
 // to inline a function A into B, we analyze the callers of B in order to see
@@ -153,6 +153,12 @@ static bool InlineCallIfPossible(CallSite CS, InlineFunctionInfo &IFI,
 
   AdjustCallerSSPLevel(Caller, Callee);
 
+  // HLSL Change Begin- not merge allocas.
+  // Merge alloca will make alloca which has one def become multi def.
+  // SROA will fail to remove the merged allocas.
+  return true;
+  // HLSL Change End.
+#if 0 // HLSL Change - disable unused code.
   // Look at all of the allocas that we inlined through this call site.  If we
   // have already inlined other allocas through other calls into this function,
   // then we know that they have disjoint lifetimes and that we can merge them.
@@ -269,6 +275,7 @@ static bool InlineCallIfPossible(CallSite CS, InlineFunctionInfo &IFI,
   }
   
   return true;
+#endif
 }
 
 unsigned Inliner::getInlineThreshold(CallSite CS) const {
@@ -661,8 +668,8 @@ bool Inliner::removeDeadFunctions(CallGraph &CG, bool AlwaysInlineOnly) {
 
   // Scan for all of the functions, looking for ones that should now be removed
   // from the program.  Insert the dead ones in the FunctionsToRemove set.
-  for (auto I : CG) {
-    CallGraphNode *CGN = I.second;
+  for (const auto &I : CG) {
+    CallGraphNode *CGN = I.second.get();
     Function *F = CGN->getFunction();
     if (!F || F->isDeclaration())
       continue;

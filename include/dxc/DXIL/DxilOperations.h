@@ -20,10 +20,11 @@ class Function;
 class Constant;
 class Value;
 class Instruction;
+class CallInst;
 }
 #include "llvm/IR/Attributes.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
 
 #include "DxilConstants.h"
 #include <unordered_map>
@@ -41,22 +42,27 @@ public:
   OP(llvm::LLVMContext &Ctx, llvm::Module *pModule);
 
   void RefreshCache();
+  void FixOverloadNames();
 
   llvm::Function *GetOpFunc(OpCode OpCode, llvm::Type *pOverloadType);
-  const llvm::SmallDenseMap<llvm::Type *, llvm::Function *, 8> &GetOpFuncList(OpCode OpCode) const;
+  const llvm::SmallMapVector<llvm::Type *, llvm::Function *, 8> &GetOpFuncList(OpCode OpCode) const;
+  bool IsDxilOpUsed(OpCode opcode) const;
   void RemoveFunction(llvm::Function *F);
-  llvm::Type *GetOverloadType(OpCode OpCode, llvm::Function *F);
   llvm::LLVMContext &GetCtx() { return m_Ctx; }
   llvm::Type *GetHandleType() const;
+  llvm::Type *GetResourcePropertiesType() const;
+  llvm::Type *GetResourceBindingType() const;
   llvm::Type *GetDimensionsType() const;
   llvm::Type *GetSamplePosType() const;
   llvm::Type *GetBinaryWithCarryType() const;
   llvm::Type *GetBinaryWithTwoOutputsType() const;
   llvm::Type *GetSplitDoubleType() const;
-  llvm::Type *GetInt4Type() const;
+  llvm::Type *GetFourI32Type() const;
+  llvm::Type *GetFourI16Type() const;
 
   llvm::Type *GetResRetType(llvm::Type *pOverloadType);
   llvm::Type *GetCBufferRetType(llvm::Type *pOverloadType);
+  llvm::Type *GetVectorType(unsigned numElements, llvm::Type *pOverloadType);
   bool IsResRetType(llvm::Type *Ty);
 
   // Try to get the opcode class for a function.
@@ -84,11 +90,13 @@ public:
   llvm::Constant *GetFloatConst(float v);
   llvm::Constant *GetDoubleConst(double v);
 
+  static llvm::Type *GetOverloadType(OpCode OpCode, llvm::Function *F);
   static OpCode GetDxilOpFuncCallInst(const llvm::Instruction *I);
   static const char *GetOpCodeName(OpCode OpCode);
   static const char *GetAtomicOpName(DXIL::AtomicBinOpCode OpCode);
   static OpCodeClass GetOpCodeClass(OpCode OpCode);
   static const char *GetOpCodeClassName(OpCode OpCode);
+  static llvm::Attribute::AttrKind GetMemAccessAttr(OpCode opCode);
   static bool IsOverloadLegal(OpCode OpCode, llvm::Type *pType);
   static bool CheckOpCodeTable();
   static bool IsDxilOpFuncName(llvm::StringRef name);
@@ -97,12 +105,17 @@ public:
   static bool IsDxilOpFuncCallInst(const llvm::Instruction *I, OpCode opcode);
   static bool IsDxilOpWave(OpCode C);
   static bool IsDxilOpGradient(OpCode C);
+  static bool IsDxilOpFeedback(OpCode C);
   static bool IsDxilOpTypeName(llvm::StringRef name);
   static bool IsDxilOpType(llvm::StructType *ST);
   static bool IsDupDxilOpType(llvm::StructType *ST);
   static llvm::StructType *GetOriginalDxilOpType(llvm::StructType *ST,
                                                  llvm::Module &M);
   static void GetMinShaderModelAndMask(OpCode C, bool bWithTranslation,
+                                       unsigned &major, unsigned &minor,
+                                       unsigned &mask);
+  static void GetMinShaderModelAndMask(const llvm::CallInst *CI, bool bWithTranslation,
+                                       unsigned valMajor, unsigned valMinor,
                                        unsigned &major, unsigned &minor,
                                        unsigned &mask);
 
@@ -112,12 +125,15 @@ private:
   llvm::Module *m_pModule;
 
   llvm::Type *m_pHandleType;
+  llvm::Type *m_pResourcePropertiesType;
+  llvm::Type *m_pResourceBindingType;
   llvm::Type *m_pDimensionsType;
   llvm::Type *m_pSamplePosType;
   llvm::Type *m_pBinaryWithCarryType;
   llvm::Type *m_pBinaryWithTwoOutputsType;
   llvm::Type *m_pSplitDoubleType;
-  llvm::Type *m_pInt4Type;
+  llvm::Type *m_pFourI32Type;
+  llvm::Type *m_pFourI16Type;
 
   DXIL::LowPrecisionMode m_LowPrecisionMode;
 
@@ -129,7 +145,7 @@ private:
   llvm::Type *m_pCBufferRetType[kNumTypeOverloads];
 
   struct OpCodeCacheItem {
-    llvm::SmallDenseMap<llvm::Type *, llvm::Function *, 8> pOverloads;
+    llvm::SmallMapVector<llvm::Type *, llvm::Function *, 8> pOverloads;
   };
   OpCodeCacheItem m_OpCodeClassCache[(unsigned)OpCodeClass::NumOpClasses];
   std::unordered_map<const llvm::Function *, OpCodeClass> m_FunctionToOpClass;
@@ -153,6 +169,8 @@ private:
   static unsigned GetTypeSlot(llvm::Type *pType);
   static const char *GetOverloadTypeName(unsigned TypeSlot);
   static llvm::StringRef GetTypeName(llvm::Type *Ty, std::string &str);
+  static llvm::StringRef ConstructOverloadName(llvm::Type *Ty, DXIL::OpCode opCode,
+                                               std::string &funcNameStorage);
 };
 
 } // namespace hlsl

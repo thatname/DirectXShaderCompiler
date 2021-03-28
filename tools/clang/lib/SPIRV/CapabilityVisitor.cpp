@@ -38,6 +38,10 @@ void CapabilityVisitor::addCapabilityForType(const SpirvType *type,
   // Integer-related capabilities
   if (const auto *intType = dyn_cast<IntegerType>(type)) {
     switch (intType->getBitwidth()) {
+    case 8: {
+      addCapability(spv::Capability::Int8);
+      break;
+    }
     case 16: {
       // Usage of a 16-bit integer type.
       addCapability(spv::Capability::Int16);
@@ -63,11 +67,7 @@ void CapabilityVisitor::addCapabilityForType(const SpirvType *type,
     switch (floatType->getBitwidth()) {
     case 16: {
       // Usage of a 16-bit float type.
-      // It looks like the validator does not approve of Float16
-      // capability even though we do use the necessary extension.
-      // TODO: Re-enable adding Float16 capability below.
-      // addCapability(spv::Capability::Float16);
-      addExtension(Extension::AMD_gpu_shader_half_float, "16-bit float", loc);
+      addCapability(spv::Capability::Float16);
 
       // Usage of a 16-bit float type as stage I/O.
       if (sc == spv::StorageClass::Input || sc == spv::StorageClass::Output) {
@@ -183,7 +183,7 @@ void CapabilityVisitor::addCapabilityForType(const SpirvType *type,
   }
   // Struct type
   else if (const auto *structType = dyn_cast<StructType>(type)) {
-    if (SpirvType::isOrContains16BitType(structType)) {
+    if (SpirvType::isOrContainsType<NumericalType, 16>(structType)) {
       addExtension(Extension::KHR_16bit_storage, "16-bit types in resource",
                    loc);
       if (sc == spv::StorageClass::PushConstant) {
@@ -198,6 +198,25 @@ void CapabilityVisitor::addCapabilityForType(const SpirvType *type,
     }
     for (auto field : structType->getFields())
       addCapabilityForType(field.type, loc, sc);
+  }
+  // AccelerationStructureTypeNV type
+  else if (isa<AccelerationStructureTypeNV>(type)) {
+    if (featureManager.isExtensionEnabled(Extension::NV_ray_tracing)) {
+      addCapability(spv::Capability::RayTracingNV);
+      addExtension(Extension::NV_ray_tracing, "SPV_NV_ray_tracing", {});
+    } else {
+      // KHR_ray_tracing extension requires Vulkan 1.1 with VK_KHR_spirv_1_4
+      // extention or Vulkan 1.2.
+      featureManager.requestTargetEnv(SPV_ENV_VULKAN_1_1_SPIRV_1_4,
+                                      "Raytracing", {});
+      addCapability(spv::Capability::RayTracingKHR);
+      addExtension(Extension::KHR_ray_tracing, "SPV_KHR_ray_tracing", {});
+    }
+  }
+  // RayQueryTypeKHR type
+  else if (isa<RayQueryTypeKHR>(type)) {
+    addCapability(spv::Capability::RayQueryKHR);
+    addExtension(Extension::KHR_ray_query, "SPV_KHR_ray_query", {});
   }
 }
 
@@ -277,8 +296,9 @@ bool CapabilityVisitor::visit(SpirvDecoration *decor) {
       break;
     }
     case spv::BuiltIn::PrimitiveId: {
-      // PrimitiveID can be used as PSIn
-      if (shaderModel == spv::ExecutionModel::Fragment)
+      // PrimitiveID can be used as PSIn or MSPOut.
+      if (shaderModel == spv::ExecutionModel::Fragment ||
+          shaderModel == spv::ExecutionModel::MeshNV)
         addCapability(spv::Capability::Geometry);
       break;
     }
@@ -289,8 +309,9 @@ bool CapabilityVisitor::visit(SpirvDecoration *decor) {
         addExtension(Extension::EXT_shader_viewport_index_layer,
                      "SV_RenderTargetArrayIndex", loc);
         addCapability(spv::Capability::ShaderViewportIndexLayerEXT);
-      } else if (shaderModel == spv::ExecutionModel::Fragment) {
-        // SV_RenderTargetArrayIndex can be used as PSIn.
+      } else if (shaderModel == spv::ExecutionModel::Fragment ||
+                 shaderModel == spv::ExecutionModel::MeshNV) {
+        // SV_RenderTargetArrayIndex can be used as PSIn or MSPOut.
         addCapability(spv::Capability::Geometry);
       }
       break;
@@ -303,8 +324,9 @@ bool CapabilityVisitor::visit(SpirvDecoration *decor) {
                      "SV_ViewPortArrayIndex", loc);
         addCapability(spv::Capability::ShaderViewportIndexLayerEXT);
       } else if (shaderModel == spv::ExecutionModel::Fragment ||
-                 shaderModel == spv::ExecutionModel::Geometry) {
-        // SV_ViewportArrayIndex can be used as PSIn.
+                 shaderModel == spv::ExecutionModel::Geometry ||
+                 shaderModel == spv::ExecutionModel::MeshNV) {
+        // SV_ViewportArrayIndex can be used as PSIn or GSOut or MSPOut.
         addCapability(spv::Capability::MultiViewport);
       }
       break;
@@ -326,6 +348,13 @@ bool CapabilityVisitor::visit(SpirvDecoration *decor) {
     case spv::BuiltIn::BaryCoordPullModelAMD: {
       addExtension(Extension::AMD_shader_explicit_vertex_parameter,
                    "SV_Barycentrics", loc);
+      break;
+    }
+    case spv::BuiltIn::FragSizeEXT: {
+      addExtension(Extension::EXT_fragment_invocation_density, "SV_ShadingRate",
+                   loc);
+      addCapability(spv::Capability::FragmentDensityEXT);
+      break;
     }
     default:
       break;
@@ -378,6 +407,7 @@ bool CapabilityVisitor::visit(SpirvImageSparseTexelsResident *instr) {
   addCapabilityForType(instr->getResultType(), instr->getSourceLocation(),
                        instr->getStorageClass());
   addCapability(spv::Capability::ImageGatherExtended);
+  addCapability(spv::Capability::SparseResidency);
   return true;
 }
 
@@ -437,6 +467,10 @@ bool CapabilityVisitor::visitInstruction(SpirvInstruction *instr) {
   case spv::Op::OpGroupNonUniformBroadcastFirst:
     addCapability(spv::Capability::GroupNonUniformBallot);
     break;
+  case spv::Op::OpGroupNonUniformShuffle:
+  case spv::Op::OpGroupNonUniformShuffleXor:
+    addCapability(spv::Capability::GroupNonUniformShuffle);
+    break;
   case spv::Op::OpGroupNonUniformIAdd:
   case spv::Op::OpGroupNonUniformFAdd:
   case spv::Op::OpGroupNonUniformIMul:
@@ -459,6 +493,25 @@ bool CapabilityVisitor::visitInstruction(SpirvInstruction *instr) {
   case spv::Op::OpGroupNonUniformQuadSwap:
     addCapability(spv::Capability::GroupNonUniformQuad);
     break;
+  case spv::Op::OpVariable: {
+    if (spvOptions.enableReflect &&
+        !cast<SpirvVariable>(instr)->getHlslUserType().empty()) {
+      addExtension(Extension::GOOGLE_user_type, "HLSL User Type", loc);
+      addExtension(Extension::GOOGLE_hlsl_functionality1, "HLSL User Type",
+                   loc);
+    }
+    break;
+  }
+  case spv::Op::OpRayQueryInitializeKHR: {
+    auto rayQueryInst = dyn_cast<SpirvRayQueryOpKHR>(instr);
+    if (rayQueryInst->hasCullFlags()) {
+      addCapability(
+          spv::Capability::RayTraversalPrimitiveCullingKHR);
+    }
+
+    break;
+  }
+
   default:
     break;
   }
@@ -487,8 +540,22 @@ bool CapabilityVisitor::visit(SpirvEntryPoint *entryPoint) {
   case spv::ExecutionModel::AnyHitNV:
   case spv::ExecutionModel::MissNV:
   case spv::ExecutionModel::CallableNV:
-    addCapability(spv::Capability::RayTracingNV);
-    addExtension(Extension::NV_ray_tracing, "SPV_NV_ray_tracing", {});
+    if (featureManager.isExtensionEnabled(Extension::NV_ray_tracing)) {
+      addCapability(spv::Capability::RayTracingNV);
+      addExtension(Extension::NV_ray_tracing, "SPV_NV_ray_tracing", {});
+    } else {
+      // KHR_ray_tracing extension requires Vulkan 1.1 with VK_KHR_spirv_1_4
+      // extention or Vulkan 1.2.
+      featureManager.requestTargetEnv(SPV_ENV_VULKAN_1_1_SPIRV_1_4,
+                                      "Raytracing", {});
+      addCapability(spv::Capability::RayTracingKHR);
+      addExtension(Extension::KHR_ray_tracing, "SPV_KHR_ray_tracing", {});
+    }
+    break;
+  case spv::ExecutionModel::MeshNV:
+  case spv::ExecutionModel::TaskNV:
+    addCapability(spv::Capability::MeshShadingNV);
+    addExtension(Extension::NV_mesh_shader, "SPV_NV_mesh_shader", {});
     break;
   default:
     llvm_unreachable("found unknown shader model");
@@ -503,6 +570,72 @@ bool CapabilityVisitor::visit(SpirvExecutionMode *execMode) {
                   execMode->getEntryPoint()->getSourceLocation());
     addExtension(Extension::KHR_post_depth_coverage,
                  "[[vk::post_depth_coverage]]", execMode->getSourceLocation());
+  }
+  return true;
+}
+
+bool CapabilityVisitor::visit(SpirvExtInstImport *instr) {
+  if (instr->getExtendedInstSetName() == "NonSemantic.DebugPrintf")
+    addExtension(Extension::KHR_non_semantic_info, "DebugPrintf",
+                 /*SourceLocation*/ {});
+  return true;
+}
+
+bool CapabilityVisitor::visit(SpirvExtInst *instr) {
+  // OpExtInst using the GLSL extended instruction allows only 32-bit types by
+  // default for interpolation instructions. The AMD_gpu_shader_half_float
+  // extension adds support for 16-bit floating-point component types for these
+  // instructions:
+  // InterpolateAtCentroid, InterpolateAtSample, InterpolateAtOffset
+  if (SpirvType::isOrContainsType<FloatType, 16>(instr->getResultType()))
+    switch (instr->getInstruction()) {
+    case GLSLstd450::GLSLstd450InterpolateAtCentroid:
+    case GLSLstd450::GLSLstd450InterpolateAtSample:
+    case GLSLstd450::GLSLstd450InterpolateAtOffset:
+      addExtension(Extension::AMD_gpu_shader_half_float, "16-bit float",
+                   instr->getSourceLocation());
+    default:
+      break;
+    }
+
+  return visitInstruction(instr);
+}
+
+bool CapabilityVisitor::visit(SpirvAtomic *instr) {
+  if (instr->hasValue() && SpirvType::isOrContainsType<IntegerType, 64>(
+                               instr->getValue()->getResultType())) {
+    addCapability(spv::Capability::Int64Atomics, instr->getSourceLocation());
+  }
+  return true;
+}
+
+bool CapabilityVisitor::visit(SpirvDemoteToHelperInvocationEXT *inst) {
+  addCapability(spv::Capability::DemoteToHelperInvocationEXT,
+                inst->getSourceLocation());
+  addExtension(Extension::EXT_demote_to_helper_invocation, "discard",
+               inst->getSourceLocation());
+  return true;
+}
+
+bool CapabilityVisitor::visit(SpirvReadClock *inst) {
+  auto loc = inst->getSourceLocation();
+  addCapabilityForType(inst->getResultType(), loc, inst->getStorageClass());
+  addCapability(spv::Capability::ShaderClockKHR, loc);
+  addExtension(Extension::KHR_shader_clock, "ReadClock", loc);
+  return true;
+}
+
+bool CapabilityVisitor::visit(SpirvModule *, Visitor::Phase phase) {
+  // If there are no entry-points in the module (hence shaderModel is not set),
+  // add the Linkage capability. This allows library shader models to use
+  // 'export' attribute on functions, and generate an "incomplete/partial"
+  // SPIR-V binary.
+  // ExecutionModel::Max means that no entrypoints exist, therefore we should
+  // add the Linkage Capability.
+  if (phase == Visitor::Phase::Done &&
+      shaderModel == spv::ExecutionModel::Max) {
+    addCapability(spv::Capability::Shader);
+    addCapability(spv::Capability::Linkage);
   }
   return true;
 }

@@ -25,7 +25,6 @@
 #include "llvm/ADT/SmallVector.h"
 
 #include "GlPerVertex.h"
-#include "SpirvEvalInfo.h"
 
 namespace clang {
 namespace spirv {
@@ -112,28 +111,34 @@ private:
 
 class ResourceVar {
 public:
-  ResourceVar(SpirvVariable *var, SourceLocation loc,
+  ResourceVar(SpirvVariable *var, const Decl *decl, SourceLocation loc,
               const hlsl::RegisterAssignment *r, const VKBindingAttr *b,
-              const VKCounterBindingAttr *cb, bool counter = false)
-      : variable(var), srcLoc(loc), reg(r), binding(b), counterBinding(cb),
-        isCounterVar(counter) {}
+              const VKCounterBindingAttr *cb, bool counter = false,
+              bool globalsBuffer = false)
+      : variable(var), declaration(decl), srcLoc(loc), reg(r), binding(b),
+        counterBinding(cb), isCounterVar(counter),
+        isGlobalsCBuffer(globalsBuffer) {}
 
   SpirvVariable *getSpirvInstr() const { return variable; }
+  const Decl *getDeclaration() const { return declaration; }
   SourceLocation getSourceLocation() const { return srcLoc; }
   const hlsl::RegisterAssignment *getRegister() const { return reg; }
   const VKBindingAttr *getBinding() const { return binding; }
   bool isCounter() const { return isCounterVar; }
+  bool isGlobalsBuffer() const { return isGlobalsCBuffer; }
   const VKCounterBindingAttr *getCounterBinding() const {
     return counterBinding;
   }
 
 private:
   SpirvVariable *variable;                    ///< The variable
+  const Decl *declaration;                    ///< The declaration
   SourceLocation srcLoc;                      ///< Source location
   const hlsl::RegisterAssignment *reg;        ///< HLSL register assignment
   const VKBindingAttr *binding;               ///< Vulkan binding assignment
   const VKCounterBindingAttr *counterBinding; ///< Vulkan counter binding
   bool isCounterVar;                          ///< Couter variable or not
+  bool isGlobalsCBuffer;                      ///< $Globals cbuffer or not
 };
 
 /// A (instruction-pointer, is-alias-or-not) pair for counter variables
@@ -295,9 +300,26 @@ public:
   SpirvVariable *createRayTracingNVStageVar(spv::StorageClass sc,
                                             const VarDecl *decl);
 
+  /// \brief Creates the taskNV stage variables for payload struct variable
+  /// and returns true on success. SPIR-V instructions will also be generated
+  /// to load/store the contents from/to *value. payloadMemOffset is incremented
+  /// based on payload struct member size, alignment and offset, and SPIR-V
+  /// decorations PerTaskNV and Offset are assigned to each member.
+  bool createPayloadStageVars(const hlsl::SigPoint *sigPoint,
+                              spv::StorageClass sc, const NamedDecl *decl,
+                              bool asInput, QualType type,
+                              const llvm::StringRef namePrefix,
+                              SpirvInstruction **value,
+                              uint32_t payloadMemOffset = 0);
+
   /// \brief Creates a function-scope paramter in the current function and
-  /// returns its instruction.
-  SpirvFunctionParameter *createFnParam(const ParmVarDecl *param);
+  /// returns its instruction. dbgArgNumber is used to specify the argument
+  /// number of param among function parameters, which will be used for the
+  /// debug information. Note that dbgArgNumber for the first function
+  /// parameter must have "1", not "0", which is what Clang generates for
+  /// LLVM debug metadata.
+  SpirvFunctionParameter *createFnParam(const ParmVarDecl *param,
+                                        uint32_t dbgArgNumber = 0);
 
   /// \brief Creates the counter variable associated with the given param.
   /// This is meant to be used for forward-declared functions and this objects
@@ -317,6 +339,24 @@ public:
 
   /// \brief Creates an external-visible variable and returns its instruction.
   SpirvVariable *createExternVar(const VarDecl *var);
+
+  /// \brief Returns an OpString instruction that represents the given VarDecl.
+  /// VarDecl must be a variable of string type.
+  ///
+  /// This function inspects the VarDecl for an initialization expression. If
+  /// initialization expression is not found, it will emit an error because the
+  /// variable cannot be deduced to an OpString literal, and string variables do
+  /// not exist in SPIR-V.
+  ///
+  /// Note: HLSL has the 'string' type which can be used for rare purposes such
+  /// as printf (SPIR-V's DebugPrintf). SPIR-V does not have a 'char' or
+  /// 'string' type, and therefore any variable of such type is never created.
+  /// The string literal is evaluated when needed and an OpString is generated
+  /// for it.
+  SpirvInstruction *createOrUpdateStringVar(const VarDecl *);
+
+  /// \brief Creates an Enum constant.
+  void createEnumConstant(const EnumConstantDecl *decl);
 
   /// \brief Creates a cbuffer/tbuffer from the given decl.
   ///
@@ -362,10 +402,34 @@ public:
   /// \brief Sets the entry function.
   void setEntryFunction(SpirvFunction *fn) { entryFunction = fn; }
 
+  /// \brief If the given decl is an implicit VarDecl that evaluates to a
+  /// constant, it evaluates the constant and registers the resulting SPIR-V
+  /// instruction in the astDecls map. Otherwise returns without doing anything.
+  ///
+  /// Note: There are many cases where the front-end might create such implicit
+  /// VarDecls (such as some ray tracing enums).
+  void tryToCreateImplicitConstVar(const ValueDecl *);
+
+  /// \brief Creates a variable for hull shader output patch with Output
+  /// storage class, and registers the SPIR-V variable for the given decl.
+  SpirvInstruction *createHullMainOutputPatch(const ParmVarDecl *param,
+                                              const QualType retType,
+                                              uint32_t numOutputControlPoints);
+
+  /// \brief An enum class for representing what the DeclContext is used for
+  enum class ContextUsageKind {
+    CBuffer,
+    TBuffer,
+    PushConstant,
+    Globals,
+    ShaderRecordBufferNV,
+    ShaderRecordBufferEXT
+  };
+
   /// Raytracing specific functions
-  /// \brief Handle specific implicit declarations present only in raytracing
-  /// stages.
-  void createRayTracingNVImplicitVar(const VarDecl *varDecl);
+  /// \brief Creates a ShaderRecordBufferEXT or ShaderRecordBufferNV block from the given decl.
+  SpirvVariable *createShaderRecordBuffer(const VarDecl *decl, ContextUsageKind kind);
+  SpirvVariable *createShaderRecordBuffer(const HLSLBufferDecl *decl, ContextUsageKind kind);
 
 private:
   /// The struct containing SPIR-V information of a AST Decl.
@@ -393,7 +457,7 @@ public:
   /// \brief Returns the information for the given decl.
   ///
   /// This method will panic if the given decl is not registered.
-  SpirvInstruction *getDeclEvalInfo(const ValueDecl *decl);
+  SpirvInstruction *getDeclEvalInfo(const ValueDecl *decl, SourceLocation loc);
 
   /// \brief Returns the instruction pointer for the given function if already
   /// registered; otherwise, treats the given function as a normal decl and
@@ -450,11 +514,13 @@ public:
                              SpirvInstruction *value);
 
   /// \brief Negates to get the additive inverse of SV_Position.y if requested.
-  SpirvInstruction *invertYIfRequested(SpirvInstruction *position);
+  SpirvInstruction *invertYIfRequested(SpirvInstruction *position,
+                                       SourceLocation loc);
 
   /// \brief Reciprocates to get the multiplicative inverse of SV_Position.w
   /// if requested.
-  SpirvInstruction *invertWIfRequested(SpirvInstruction *position);
+  SpirvInstruction *invertWIfRequested(SpirvInstruction *position,
+                                       SourceLocation loc);
 
   /// \brief Decorates all stage input and output variables with proper
   /// location and returns true on success.
@@ -470,7 +536,29 @@ public:
   /// module under construction.
   bool decorateResourceBindings();
 
+  /// \brief Decorates resource variables with Coherent decoration if they
+  /// are declared as globallycoherent.
+  bool decorateResourceCoherent();
+
+  /// \brief Returns whether the SPIR-V module requires SPIR-V legalization
+  /// passes run to make it legal.
   bool requiresLegalization() const { return needsLegalization; }
+
+  /// \brief Returns whether the SPIR-V module requires an optimization pass to
+  /// flatten array/structure of resources.
+  bool requiresFlatteningCompositeResources() const {
+    return needsFlatteningCompositeResources;
+  }
+
+  /// \brief Returns the given decl's HLSL semantic information.
+  static SemanticInfo getStageVarSemantic(const NamedDecl *decl);
+
+  /// \brief Returns SPIR-V instruction for given stage var decl.
+  SpirvInstruction *getStageVarInstruction(const DeclaratorDecl *decl) {
+    auto *value = stageVarInstructions.lookup(decl);
+    assert(value);
+    return value;
+  }
 
 private:
   /// \brief Wrapper method to create a fatal error message and report it
@@ -522,14 +610,6 @@ private:
   /// construction.
   bool finalizeStageIOLocations(bool forInput);
 
-  /// \brief An enum class for representing what the DeclContext is used for
-  enum class ContextUsageKind {
-    CBuffer,
-    TBuffer,
-    PushConstant,
-    Globals,
-  };
-
   /// Creates a variable of struct type with explicit layout decorations.
   /// The sub-Decls in the given DeclContext will be treated as the struct
   /// fields. The struct type will be named as typeName, and the variable
@@ -547,9 +627,6 @@ private:
   SpirvVariable *createStructOrStructArrayVarOfExplicitLayout(
       const DeclContext *decl, int arraySize, ContextUsageKind usageKind,
       llvm::StringRef typeName, llvm::StringRef varName);
-
-  /// Returns the given decl's HLSL semantic information.
-  static SemanticInfo getStageVarSemantic(const NamedDecl *decl);
 
   /// Creates all the stage variables mapped from semantics on the given decl.
   /// Returns true on sucess.
@@ -590,6 +667,11 @@ private:
                                      const llvm::StringRef name,
                                      SourceLocation);
 
+  // Create intermediate output variable to communicate patch constant
+  // data in hull shader since workgroup memory is not allowed there.
+  SpirvVariable *createSpirvIntermediateOutputStageVar(
+      const NamedDecl *decl, const llvm::StringRef name, QualType asType);
+
   /// Returns true if all vk:: attributes usages are valid.
   bool validateVKAttributes(const NamedDecl *decl);
 
@@ -627,8 +709,8 @@ private:
 
   /// Decorates varInstr of the given asType with proper interpolation modes
   /// considering the attributes on the given decl.
-  void decoratePSInterpolationMode(const NamedDecl *decl, QualType asType,
-                                   SpirvVariable *varInstr);
+  void decorateInterpolationMode(const NamedDecl *decl, QualType asType,
+                                 SpirvVariable *varInstr);
 
   /// Returns the proper SPIR-V storage class (Input or Output) for the given
   /// SigPoint.
@@ -636,6 +718,61 @@ private:
 
   /// Returns true if the given SPIR-V stage variable has Input storage class.
   inline bool isInputStorageClass(const StageVar &v);
+
+  /// Creates DebugGlobalVariable and returns it if rich debug information
+  /// generation is enabled. Otherwise, returns nullptr.
+  SpirvDebugGlobalVariable *createDebugGlobalVariable(SpirvVariable *var,
+                                                      const QualType &type,
+                                                      const SourceLocation &loc,
+                                                      const StringRef &name);
+
+  /// Determines the register type for a resource that does not have an
+  /// explicit register() declaration.  Returns true if it is able to
+  /// determine the register type and will set |*registerTypeOut| to
+  /// 'u', 's', 'b', or 't'. Assumes |registerTypeOut| to be non-nullptr.
+  ///
+  /// Uses the following mapping of HLSL types to register spaces:
+  /// t - for shader resource views (SRV)
+  ///    TEXTURE1D
+  ///    TEXTURE1DARRAY
+  ///    TEXTURE2D
+  ///    TEXTURE2DARRAY
+  ///    TEXTURE3D
+  ///    TEXTURECUBE
+  ///    TEXTURECUBEARRAY
+  ///    TEXTURE2DMS
+  ///    TEXTURE2DMSARRAY
+  ///    STRUCTUREDBUFFER
+  ///    BYTEADDRESSBUFFER
+  ///    BUFFER
+  ///    TBUFFER
+  ///
+  /// s - for samplers
+  ///    SAMPLER
+  ///    SAMPLER1D
+  ///    SAMPLER2D
+  ///    SAMPLER3D
+  ///    SAMPLERCUBE
+  ///    SAMPLERSTATE
+  ///    SAMPLERCOMPARISONSTATE
+  ///
+  /// u - for unordered access views (UAV)
+  ///    RWBYTEADDRESSBUFFER
+  ///    RWSTRUCTUREDBUFFER
+  ///    APPENDSTRUCTUREDBUFFER
+  ///    CONSUMESTRUCTUREDBUFFER
+  ///    RWBUFFER
+  ///    RWTEXTURE1D
+  ///    RWTEXTURE1DARRAY
+  ///    RWTEXTURE2D
+  ///    RWTEXTURE2DARRAY
+  ///    RWTEXTURE3D
+  ///
+  /// b - for constant buffer views (CBV)
+  ///    CBUFFER
+  ///    CONSTANTBUFFER
+  bool getImplicitRegisterType(const ResourceVar &var,
+                               char *registerTypeOut) const;
 
 private:
   SpirvBuilder &spvBuilder;
@@ -731,6 +868,13 @@ private:
   /// Note: legalization specific code
   bool needsLegalization;
 
+  /// Whether the translated SPIR-V binary needs flattening of composite
+  /// resources.
+  ///
+  /// If the source HLSL contains global structure of resources, we need to run
+  /// an additional SPIR-V optimization pass to flatten such structures.
+  bool needsFlatteningCompositeResources;
+
 public:
   /// The gl_PerVertex structs for both input and output
   GlPerVertex glPerVertex;
@@ -748,7 +892,8 @@ void CounterIdAliasPair::assign(const CounterIdAliasPair &srcPair,
                                 SpirvBuilder &builder,
                                 SpirvContext &context) const {
   assert(isAlias);
-  builder.createStore(counterVar, srcPair.get(builder, context));
+  builder.createStore(counterVar, srcPair.get(builder, context),
+                      /* SourceLocation */ {});
 }
 
 DeclResultIdMapper::DeclResultIdMapper(ASTContext &context,
@@ -760,12 +905,13 @@ DeclResultIdMapper::DeclResultIdMapper(ASTContext &context,
     : spvBuilder(spirvBuilder), theEmitter(emitter), spirvOptions(options),
       astContext(context), spvContext(spirvContext),
       diags(context.getDiagnostics()), entryFunction(nullptr),
-      needsLegalization(false),
+      needsLegalization(false), needsFlatteningCompositeResources(false),
       glPerVertex(context, spirvContext, spirvBuilder) {}
 
 bool DeclResultIdMapper::decorateStageIOLocations() {
-  if (spvContext.isRay()) {
-    // No location assignment for any raytracing stage variables
+  if (spvContext.isRay() || spvContext.isAS()) {
+    // No location assignment for any raytracing stage variables or
+    // amplification shader variables
     return true;
   }
   // Try both input and output even if input location assignment failed

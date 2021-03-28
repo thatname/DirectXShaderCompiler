@@ -22,6 +22,9 @@
 #include "dxc/DXIL/DxilConstants.h"
 #include "dxc/Support/WinAdapter.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/Optional.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace clang {
   class ASTContext;
@@ -73,12 +76,14 @@ enum HLSLScalarType {
   HLSLScalarType_float16,
   HLSLScalarType_float32,
   HLSLScalarType_float64,
+  HLSLScalarType_int8_4packed,
+  HLSLScalarType_uint8_4packed
 };
 
 HLSLScalarType MakeUnsigned(HLSLScalarType T);
 
 static const HLSLScalarType HLSLScalarType_minvalid = HLSLScalarType_bool;
-static const HLSLScalarType HLSLScalarType_max = HLSLScalarType_float64;
+static const HLSLScalarType HLSLScalarType_max = HLSLScalarType_uint8_4packed;
 static const size_t HLSLScalarTypeCount = static_cast<size_t>(HLSLScalarType_max) + 1;
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -194,13 +199,15 @@ public:
   enum UnusualAnnotationKind {
     UA_RegisterAssignment,
     UA_ConstantPacking,
-    UA_SemanticDecl
+    UA_SemanticDecl,
+    UA_PayloadAccessQualifier
   };
 private:
   const UnusualAnnotationKind Kind;
 public:
   UnusualAnnotation(UnusualAnnotationKind kind) : Kind(kind), Loc() { }
   UnusualAnnotation(UnusualAnnotationKind kind, clang::SourceLocation loc) : Kind(kind), Loc(loc) { }
+  UnusualAnnotation(const UnusualAnnotation& other) : Kind(other.Kind), Loc(other.Loc) {}
   UnusualAnnotationKind getKind() const { return Kind; }
 
   UnusualAnnotation* CopyToASTContext(clang::ASTContext& Context);
@@ -215,40 +222,42 @@ public:
 struct RegisterAssignment : public UnusualAnnotation
 {
   /// <summary>Initializes a new RegisterAssignment in invalid state.</summary>
-  RegisterAssignment() : UnusualAnnotation(UA_RegisterAssignment),
-    ShaderProfile(), IsValid(false),
-    RegisterType(0), RegisterNumber(0), RegisterSpace(0), RegisterOffset(0)
-  {
-  }
-
-  RegisterAssignment(const RegisterAssignment& other) : UnusualAnnotation(UA_RegisterAssignment, other.Loc),
-    ShaderProfile(other.ShaderProfile),
-    IsValid(other.IsValid),
-    RegisterType(other.RegisterType),
-    RegisterNumber(other.RegisterNumber),
-    RegisterSpace(other.RegisterSpace),
-    RegisterOffset(other.RegisterOffset)
-  {
-  }
+  RegisterAssignment() : UnusualAnnotation(UA_RegisterAssignment) { }
 
   llvm::StringRef   ShaderProfile;
-  bool              IsValid;
-  char              RegisterType; // 'x' means only space is assigned from the source code
-  uint32_t          RegisterNumber;
-  uint32_t          RegisterSpace;
-  uint32_t          RegisterOffset;
+  bool              IsValid = false;
+  char              RegisterType = 0; // Lower-case letter, 0 if not explicitly set
+  uint32_t          RegisterNumber = 0; // Iff RegisterType != 0
+  llvm::Optional<uint32_t> RegisterSpace; // Set only if explicit "spaceN" syntax
+  uint32_t          RegisterOffset = 0;
 
   void setIsValid(bool value) {
     IsValid = value;
   }
 
-  void setAsSpaceOnly() { RegisterType = 'x'; }
-  bool isSpaceOnly() const { return RegisterType == 'x'; }
+  bool isSpaceOnly() const {
+    return RegisterType == 0 && RegisterSpace.hasValue();
+  }
 
   static bool classof(const UnusualAnnotation *UA) {
     return UA->getKind() == UA_RegisterAssignment;
   }
 };
+
+// <summary>Use this structure to capture a ': in/out' definiton.</summary>
+struct PayloadAccessAnnotation: public UnusualAnnotation {
+  /// <summary>Initializes a new PayloadAccessAnnotation in invalid state.</summary>
+  PayloadAccessAnnotation() : UnusualAnnotation(UA_PayloadAccessQualifier){};
+
+  DXIL::PayloadAccessQualifier qualifier = DXIL::PayloadAccessQualifier::NoAccess;
+  
+  llvm::SmallVector<DXIL::PayloadAccessShaderStage, 4> ShaderStages;
+
+  static bool classof(const UnusualAnnotation *UA) {
+    return UA->getKind() == UA_PayloadAccessQualifier;
+  }
+};
+
 
 /// <summary>Use this structure to capture a ': packoffset' definition.</summary>
 struct ConstantPacking : public UnusualAnnotation
@@ -308,14 +317,11 @@ void AddHLSLVectorTemplate(
   clang::ASTContext& context, 
   _Outptr_ clang::ClassTemplateDecl** vectorTemplateDecl);
 
-void AddRecordTypeWithHandle(
-            clang::ASTContext& context,
-  _Outptr_  clang::CXXRecordDecl** typeDecl, 
-  _In_z_    const char* typeName);
+clang::CXXRecordDecl* DeclareRecordTypeWithHandle(
+  clang::ASTContext& context, llvm::StringRef name);
 
-void AddRayFlags(clang::ASTContext& context);
-void AddHitKinds(clang::ASTContext& context);
-void AddStateObjectFlags(clang::ASTContext& context);
+void AddRaytracingConstants(clang::ASTContext& context);
+void AddSamplerFeedbackConstants(clang::ASTContext& context);
 
 /// <summary>Adds the implementation for std::is_equal.</summary>
 void AddStdIsEqualImplementation(clang::ASTContext& context, clang::Sema& sema);
@@ -324,18 +330,22 @@ void AddStdIsEqualImplementation(clang::ASTContext& context, clang::Sema& sema);
 /// Adds a new template type in the specified context with the given name. The record type will have a handle field.
 /// </summary>
 /// <parm name="context">AST context to which template will be added.</param>
-/// <parm name="typeDecl">After execution, template declaration.</param>
-/// <parm name="recordDecl">After execution, record declaration for template.</param>
-/// <parm name="typeName">Name of template to create.</param>
 /// <parm name="templateArgCount">Number of template arguments (one or two).</param>
 /// <parm name="defaultTypeArgValue">If assigned, the default argument for the element template.</param>
-void AddTemplateTypeWithHandle(
+clang::CXXRecordDecl* DeclareTemplateTypeWithHandle(
             clang::ASTContext& context,
-  _Outptr_  clang::ClassTemplateDecl** typeDecl,
-  _Outptr_  clang::CXXRecordDecl** recordDecl,
-  _In_z_    const char* typeName,
+            llvm::StringRef name,
             uint8_t templateArgCount,
   _In_opt_  clang::TypeSourceInfo* defaultTypeArgValue);
+
+clang::CXXRecordDecl* DeclareUIntTemplatedTypeWithHandle(
+  clang::ASTContext& context, llvm::StringRef typeName, llvm::StringRef templateParamName);
+clang::CXXRecordDecl *DeclareConstantBufferViewType(clang::ASTContext& context, bool bTBuf);
+clang::CXXRecordDecl* DeclareRayQueryType(clang::ASTContext& context);
+clang::CXXRecordDecl *DeclareResourceType(clang::ASTContext &context,
+                                          bool bSampler);
+clang::VarDecl *DeclareBuiltinGlobal(llvm::StringRef name, clang::QualType Ty,
+                                     clang::ASTContext &context);
 
 /// <summary>Create a function template declaration for the specified method.</summary>
 /// <param name="context">AST context in which to work.</param>
@@ -375,6 +385,7 @@ bool HasHLSLMatOrientation(clang::QualType type, bool *pIsRowMajor = nullptr);
 bool IsHLSLMatRowMajor(clang::QualType type, bool defaultValue);
 bool IsHLSLUnsigned(clang::QualType type);
 bool HasHLSLUNormSNorm(clang::QualType type, bool *pIsSNorm = nullptr);
+bool HasHLSLGloballyCoherent(clang::QualType type);
 bool IsHLSLInputPatchType(clang::QualType type);
 bool IsHLSLOutputPatchType(clang::QualType type);
 bool IsHLSLPointStreamType(clang::QualType type);
@@ -382,9 +393,12 @@ bool IsHLSLLineStreamType(clang::QualType type);
 bool IsHLSLTriangleStreamType(clang::QualType type);
 bool IsHLSLStreamOutputType(clang::QualType type);
 bool IsHLSLResourceType(clang::QualType type);
+bool IsHLSLBufferViewType(clang::QualType type);
+bool IsHLSLNumericOrAggregateOfNumericType(clang::QualType type);
 bool IsHLSLNumericUserDefinedType(clang::QualType type);
 bool IsHLSLAggregateType(clang::QualType type);
 clang::QualType GetHLSLResourceResultType(clang::QualType type);
+unsigned GetHLSLResourceTemplateUInt(clang::QualType type);
 bool IsIncompleteHLSLResourceArrayType(clang::ASTContext& context, clang::QualType type);
 clang::QualType GetHLSLInputPatchElementType(clang::QualType type);
 unsigned GetHLSLInputPatchCount(clang::QualType type);
@@ -394,6 +408,7 @@ unsigned GetHLSLOutputPatchCount(clang::QualType type);
 bool IsHLSLSubobjectType(clang::QualType type);
 bool GetHLSLSubobjectKind(clang::QualType type, DXIL::SubobjectKind &subobjectKind, 
                           DXIL::HitGroupType &ghType);
+bool IsHLSLRayQueryType(clang::QualType type);
 
 bool IsArrayConstantStringType(const clang::QualType type);
 bool IsPointerStringType(const clang::QualType type);

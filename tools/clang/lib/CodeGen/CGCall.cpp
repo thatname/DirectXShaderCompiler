@@ -2895,6 +2895,12 @@ void CodeGenFunction::EmitCallArgs(CallArgList &Args,
     for (int I = ArgTypes.size() - 1; I >= 0; --I) {
       CallExpr::const_arg_iterator Arg = ArgBeg + I;
       EmitCallArg(Args, *Arg, ArgTypes[I]);
+      // HLSL Change begin.
+      RValue CallArg = Args.back().RV;
+      if (CallArg.isAggregate())
+        CGM.getHLSLRuntime().MarkCallArgumentTemp(*this, CallArg.getAggregateAddr(),
+                                                  ArgTypes[I]);
+      // HLSL Change end.
       EmitNonNullArgCheck(Args.back().RV, ArgTypes[I], Arg->getExprLoc(),
                           CalleeDecl, ParamsToSkip + I);
     }
@@ -2966,12 +2972,28 @@ void CodeGenFunction::EmitCallArg(CallArgList &args, const Expr *E,
     if (E->getObjectKind() == OK_VectorComponent) {
       if (const HLSLVectorElementExpr *VecElt = dyn_cast<HLSLVectorElementExpr>(E)) {
         LValue LV = EmitHLSLVectorElementExpr(VecElt);
-        llvm::Value *V = LV.getExtVectorAddr();
-        llvm::Constant *Elts = LV.getExtVectorElts();
-        // Only support scalar for atomic operations.
-        assert(Elts->getType()->getVectorNumElements() == 1);
-        llvm::Value *ch = Builder.CreateExtractElement(Elts, (uint64_t)0);
-        llvm::Value *Ptr = Builder.CreateGEP(V, {Builder.getInt32(0), ch});
+        llvm::Value *Ptr = nullptr;
+        if (LV.isSimple()) {
+          // Handle the special case when the vector component access
+          // is done on a scalar using .x or .r.
+          //
+          // Example 1:
+          // groupshared uint g;
+          // InterlockedAdd(g.x, 1);
+          //
+          // Example 2:
+          // RWBuffer<uint> buf;
+          // InterlockedAdd(buf[0].r, 1);
+          llvm::Value *V = LV.getAddress();
+          Ptr = Builder.CreateGEP(V, Builder.getInt32(0));
+        } else {
+          llvm::Value *V = LV.getExtVectorAddr();
+          llvm::Constant *Elts = LV.getExtVectorElts();
+          // Only support scalar for atomic operations.
+          assert(Elts->getType()->getVectorNumElements() == 1);
+          llvm::Value *ch = Builder.CreateExtractElement(Elts, (uint64_t)0);
+          Ptr = Builder.CreateGEP(V, { Builder.getInt32(0), ch });
+        }
         RValue RV = RValue::get(Ptr);
         return args.add(RV, type);
       } else {
@@ -3058,7 +3080,6 @@ void CodeGenFunction::EmitCallArg(CallArgList &args, const Expr *E,
     return;
   }
   // HLSL Change Ends.
-
   args.add(EmitAnyExprToTemp(E), type);
 }
 
@@ -3261,6 +3282,9 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
           UnusedReturnSize = size;
       }
     }
+    // HLSL Change begin.
+    CGM.getHLSLRuntime().MarkRetTemp(*this, SRetPtr, RetTy);
+    // HLSL Change end.
     if (IRFunctionArgs.hasSRetArg()) {
       IRCallArgs[IRFunctionArgs.getSRetArgNo()] = SRetPtr;
     } else {
@@ -3363,6 +3387,13 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
           EmitAggregateCopy(AI, Addr, I->Ty, RV.isVolatileQualified());
         } else {
           // Skip the extra memcpy call.
+          // HLSL Change Starts
+          // Generate AddrSpaceCast for shared memory.
+          if (RVAddrSpace != ArgAddrSpace) {
+            Addr = Builder.CreateAddrSpaceCast(
+                Addr, IRFuncTy->getParamType(FirstIRArg));
+          }
+          // HLSL Change Ends
           IRCallArgs[FirstIRArg] = Addr;
         }
       }
@@ -3581,6 +3612,17 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
 
   llvm::CallSite CS;
   if (!InvokeDest) {
+    // HLSL changes begin
+    // When storing a matrix to memory, make sure to change its orientation to match in-memory
+    // orientation.
+    if (getLangOpts().HLSL && CGM.getHLSLRuntime().NeedHLSLMartrixCastForStoreOp(TargetDecl, IRCallArgs)) {
+      llvm::SmallVector<clang::QualType, 16> tyList;
+      for (CallArgList::const_iterator I = CallArgs.begin(), E = CallArgs.end(); I != E; ++I) {
+        tyList.emplace_back(I->Ty);
+      }
+      CGM.getHLSLRuntime().EmitHLSLMartrixCastForStoreOp(*this, IRCallArgs, tyList);
+    }
+    // HLSL changes end
     CS = Builder.CreateCall(Callee, IRCallArgs);
   } else {
     llvm::BasicBlock *Cont = createBasicBlock("invoke.cont");

@@ -48,6 +48,7 @@ public:
     TK_Pointer,
     TK_Function,
     TK_AccelerationStructureNV,
+    TK_RayQueryKHR,
     // Order matters: all the following are hybrid types
     TK_HybridStruct,
     TK_HybridPointer,
@@ -68,7 +69,8 @@ public:
   static bool isSubpassInput(const SpirvType *);
   static bool isSubpassInputMS(const SpirvType *);
   static bool isResourceType(const SpirvType *);
-  static bool isOrContains16BitType(const SpirvType *);
+  template <class T, unsigned int Bitwidth = 0>
+  static bool isOrContainsType(const SpirvType *);
 
 protected:
   SpirvType(Kind k, llvm::StringRef name = "") : kind(k), debugName(name) {}
@@ -292,7 +294,7 @@ public:
               llvm::Optional<uint32_t> matrixStride_ = llvm::None,
               llvm::Optional<bool> isRowMajor_ = llvm::None,
               bool relaxedPrecision = false, bool precise = false)
-        : type(type_), name(name_), offset(offset_),
+        : type(type_), name(name_), offset(offset_), sizeInBytes(llvm::None),
           matrixStride(matrixStride_), isRowMajor(isRowMajor_),
           isRelaxedPrecision(relaxedPrecision), isPrecise(precise) {
       // A StructType may not contain any hybrid types.
@@ -305,8 +307,10 @@ public:
     const SpirvType *type;
     // The field's name.
     std::string name;
-    // The integer offset for this field.
+    // The integer offset in bytes for this field.
     llvm::Optional<uint32_t> offset;
+    // The integer size in bytes for this field.
+    llvm::Optional<uint32_t> sizeInBytes;
     // The matrix stride for this field (if applicable).
     llvm::Optional<uint32_t> matrixStride;
     // The majorness of this field (if applicable).
@@ -395,6 +399,16 @@ public:
 
   static bool classof(const SpirvType *t) {
     return t->getKind() == TK_AccelerationStructureNV;
+  }
+};
+
+class RayQueryTypeKHR : public SpirvType {
+public:
+  RayQueryTypeKHR()
+      : SpirvType(TK_RayQueryKHR, "rayQueryKHR") {}
+
+  static bool classof(const SpirvType *t) {
+    return t->getKind() == TK_RayQueryKHR;
   }
 };
 
@@ -502,28 +516,43 @@ private:
   QualType imageType;
 };
 
-// This class can be extended to also accept QualType vector as param types.
-class HybridFunctionType : public HybridType {
-public:
-  HybridFunctionType(QualType ret, llvm::ArrayRef<QualType> param)
-      : HybridType(TK_HybridFunction), returnType(ret),
-        paramTypes(param.begin(), param.end()) {}
+//
+// Function Definition for templated functions
+//
 
-  static bool classof(const SpirvType *t) {
-    return t->getKind() == TK_HybridFunction;
+template <class T, unsigned int Bitwidth>
+bool SpirvType::isOrContainsType(const SpirvType *type) {
+  if (isa<T>(type)) {
+    if (Bitwidth == 0)
+      // No specific bitwidth was asked for.
+      return true;
+    else
+      // We want to make sure it is a numberical type of a specific bitwidth.
+      return isa<NumericalType>(type) &&
+             llvm::cast<NumericalType>(type)->getBitwidth() == Bitwidth;
   }
 
-  bool operator==(const HybridFunctionType &that) const {
-    return returnType == that.returnType && paramTypes == that.paramTypes;
-  }
+  if (const auto *vecType = dyn_cast<VectorType>(type))
+    return isOrContainsType<T, Bitwidth>(vecType->getElementType());
+  if (const auto *matType = dyn_cast<MatrixType>(type))
+    return isOrContainsType<T, Bitwidth>(matType->getElementType());
+  if (const auto *arrType = dyn_cast<ArrayType>(type))
+    return isOrContainsType<T, Bitwidth>(arrType->getElementType());
+  if (const auto *pointerType = dyn_cast<SpirvPointerType>(type))
+    return isOrContainsType<T, Bitwidth>(pointerType->getPointeeType());
+  if (const auto *raType = dyn_cast<RuntimeArrayType>(type))
+    return isOrContainsType<T, Bitwidth>(raType->getElementType());
+  if (const auto *imgType = dyn_cast<ImageType>(type))
+    return isOrContainsType<T, Bitwidth>(imgType->getSampledType());
+  if (const auto *sampledImageType = dyn_cast<SampledImageType>(type))
+    return isOrContainsType<T, Bitwidth>(sampledImageType->getImageType());
+  if (const auto *structType = dyn_cast<StructType>(type))
+    for (auto &field : structType->getFields())
+      if (isOrContainsType<T, Bitwidth>(field.type))
+        return true;
 
-  QualType getReturnType() const { return returnType; }
-  llvm::ArrayRef<QualType> getParamTypes() const { return paramTypes; }
-
-private:
-  QualType returnType;
-  llvm::SmallVector<QualType, 8> paramTypes;
-};
+  return false;
+}
 
 } // end namespace spirv
 } // end namespace clang

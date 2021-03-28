@@ -48,26 +48,28 @@ void DxcCleanupThreadMalloc() throw();
 // Used by APIs entry points to set up per-thread/invocation allocator.
 // Setting the IMalloc on the thread increases the reference count,
 // clearing it decreases it.
+void DxcSetThreadMallocToDefault() throw();
 void DxcClearThreadMalloc() throw();
-void DxcSetThreadMalloc(IMalloc *pMalloc) throw();
-void DxcSetThreadMallocOrDefault(IMalloc *pMalloc) throw();
-
-// Swapping does not AddRef or Release new or prior. The pattern is to keep both alive,
-// either in TLS, or on the stack to restore later. The returned value is the effective
-// IMalloc also available in TLS.
-IMalloc *DxcSwapThreadMalloc(IMalloc *pMalloc, IMalloc **ppPrior) throw();
-IMalloc *DxcSwapThreadMallocOrDefault(IMalloc *pMalloc, IMalloc **ppPrior) throw();
 
 // Used to retrieve the current invocation's allocator or perform an alloc/free/realloc.
 IMalloc *DxcGetThreadMallocNoRef() throw();
 
-struct DxcThreadMalloc {
-  DxcThreadMalloc(IMalloc *pMallocOrNull) throw() {
-    p = DxcSwapThreadMallocOrDefault(pMallocOrNull, &pPrior);
-  }
-  ~DxcThreadMalloc() {
-    DxcSwapThreadMalloc(pPrior, nullptr);
-  }
+class DxcThreadMalloc {
+public:
+  explicit DxcThreadMalloc(IMalloc *pMallocOrNull) throw();
+  ~DxcThreadMalloc();
+
+  IMalloc *GetInstalledAllocator() const { return p; }
+
+private:
+  // Copy constructor and assignment are dangerous and should always be
+  // deleted...
+  DxcThreadMalloc(const DxcThreadMalloc &) = delete;
+  DxcThreadMalloc &operator =(const DxcThreadMalloc &) = delete;
+  // Move constructor and assignment should be OK to be added if needed.
+  DxcThreadMalloc(DxcThreadMalloc &&) = delete;
+  DxcThreadMalloc &operator =(DxcThreadMalloc &&) = delete;
+
   IMalloc *p;
   IMalloc *pPrior;
 };
@@ -201,6 +203,8 @@ inline void OutputDebugFormatA(_In_ _Printf_format_string_ _Null_terminated_ con
 
 #define DXASSERT_LOCALVAR(local, exp, msg) DXASSERT(exp, msg)
 
+#define DXASSERT_LOCALVAR_NOMSG(local, exp) DXASSERT_LOCALVAR(local, exp, "")
+
 #define DXASSERT_NOMSG(exp) DXASSERT(exp, "")
 
 #define DXVERIFY_NOMSG(exp) DXASSERT(exp, "")
@@ -211,6 +215,8 @@ inline void OutputDebugFormatA(_In_ _Printf_format_string_ _Null_terminated_ con
 #define DXASSERT_NOMSG assert
 
 #define DXASSERT_LOCALVAR(local, exp, msg) DXASSERT(exp, msg)
+
+#define DXASSERT_LOCALVAR_NOMSG(local, exp) DXASSERT_LOCALVAR(local, exp, "")
 
 #define DXVERIFY_NOMSG assert
 
@@ -230,6 +236,7 @@ inline void OutputDebugFormatA(_In_ _Printf_format_string_ _Null_terminated_ con
 
 // DXASSERT_LOCALVAR is disabled in free builds, but we keep the local referenced to avoid a warning.
 #define DXASSERT_LOCALVAR(local, exp, msg) do { (void)(local); _Analysis_assume_(exp); } while (0)
+#define DXASSERT_LOCALVAR_NOMSG(local, exp) DXASSERT_LOCALVAR(local, exp, "")
 
 // DXASSERT_NOMSG is disabled in free builds.
 #define DXASSERT_NOMSG(exp) _Analysis_assume_(exp)

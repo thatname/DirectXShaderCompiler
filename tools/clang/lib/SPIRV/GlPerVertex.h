@@ -83,7 +83,8 @@ public:
   bool tryToAccess(hlsl::SigPoint::Kind sigPoint, hlsl::Semantic::Kind,
                    uint32_t semanticIndex,
                    llvm::Optional<SpirvInstruction *> invocation,
-                   SpirvInstruction **value, bool noWriteBack);
+                   SpirvInstruction **value, bool noWriteBack,
+                   SpirvInstruction *vecComponent, SourceLocation loc);
 
 private:
   template <unsigned N>
@@ -101,10 +102,11 @@ private:
   /// the ClipDistance/CullDistance builtin. The data read will be transformed
   /// into the given type asType.
   SpirvInstruction *readClipCullArrayAsType(bool isClip, uint32_t offset,
-                                            QualType asType) const;
+                                            QualType asType,
+                                            SourceLocation loc) const;
   /// Creates SPIR-V instructions to read a field in gl_PerVertex.
   bool readField(hlsl::Semantic::Kind semanticKind, uint32_t semanticIndex,
-                 SpirvInstruction **value);
+                 SpirvInstruction **value, SourceLocation loc);
 
   /// Creates SPIR-V instructions for writing data into the ClipDistance/
   /// CullDistance builtin starting from offset. The value to be written is
@@ -112,12 +114,14 @@ private:
   /// generated to make sure type correctness.
   void
   writeClipCullArrayFromType(llvm::Optional<SpirvInstruction *> invocationId,
-                             bool isClip, uint32_t offset, QualType fromType,
-                             SpirvInstruction *fromValue) const;
+                             bool isClip, SpirvInstruction *offset,
+                             QualType fromType, SpirvInstruction *fromValue,
+                             SourceLocation loc) const;
   /// Creates SPIR-V instructions to write a field in gl_PerVertex.
   bool writeField(hlsl::Semantic::Kind semanticKind, uint32_t semanticIndex,
                   llvm::Optional<SpirvInstruction *> invocationId,
-                  SpirvInstruction **value);
+                  SpirvInstruction **value, SpirvInstruction *vecComponent,
+                  SourceLocation loc);
 
   /// Internal implementation for recordClipCullDistanceDecl().
   bool doGlPerVertexFacts(const DeclaratorDecl *decl, QualType type,

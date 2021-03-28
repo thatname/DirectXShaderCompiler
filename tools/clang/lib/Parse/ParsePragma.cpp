@@ -251,11 +251,10 @@ void Parser::initializePragmaHandlers() {
   } // HLSL Change, matching HLSL check to remove pragma processing
   else {
     // HLSL Change Begin - packmatrix.
-    // The pointer ownership goes to PP, which deletes it in its destructor
-    // unless it is removed & deleted via resetPragmaHandlers
-    std::unique_ptr<PragmaHandler> pHandler(new PragmaPackMatrixHandler(Actions));
-    PP.AddPragmaHandler(pHandler.get());
-    pPackMatrixHandler = pHandler.release();
+    // The pointer ownership goes to PP as soon as we do the call,
+    // which deletes it in its destructor unless it is removed & deleted via resetPragmaHandlers
+    pPackMatrixHandler = new PragmaPackMatrixHandler(Actions);
+    PP.AddPragmaHandler(pPackMatrixHandler);
     // HLSL Change End.
   }
 }
@@ -2200,7 +2199,6 @@ void PragmaPackMatrixHandler::HandlePragma(Preprocessor &PP,
                                            PragmaIntroducerKind Introducer,
                                            Token &Tok) {
   assert(PP.getLangOpts().HLSL && "only supported in HLSL");
-  Token PragmaName = Tok;
   PP.Lex(Tok);
   if (!Tok.is(tok::l_paren)) {
     PP.Diag(Tok, diag::err_expected) << tok::l_brace;

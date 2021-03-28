@@ -10,6 +10,11 @@
 // CHECK: %gl_InstanceIndex = OpVariable %_ptr_Input_int Input
 // CHECK: %out_var_SV_InstanceID = OpVariable %_ptr_Output_int Output
 
+// CHECK:                     %main = OpFunction
+// CHECK: [[gl_InstanceIndex:%\d+]] = OpLoad %int %gl_InstanceIndex
+// CHECK:                             OpStore %param_var_input [[gl_InstanceIndex]]
+// CHECK:                  {{%\d+}} = OpFunctionCall %int %src_main %param_var_input
+
 int main(int input: SV_InstanceID) : SV_InstanceID {
     return input;
 }

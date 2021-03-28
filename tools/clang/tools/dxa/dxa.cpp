@@ -53,7 +53,6 @@ class DxaContext {
 
 private:
   DxcDllSupport &m_dxcSupport;
-  HRESULT GetInjectedSourcesTable(IDxcLibrary *pLibrary, IDxcBlob *pTargetBlob, IDiaTable **ppTable);
   HRESULT FindModule(hlsl::DxilFourCC fourCC, IDxcBlob *pSource, IDxcLibrary *pLibrary, IDxcBlob **ppTarget);
 public:
   DxaContext(DxcDllSupport &dxcSupport) : m_dxcSupport(dxcSupport) {}
@@ -77,9 +76,18 @@ void DxaContext::Assemble() {
     IFT(pAssembler->AssembleToContainer(pSource, &pAssembleResult));
   }
 
+  CComPtr<IDxcBlobEncoding> pErrors;
+  CComPtr<IDxcBlobUtf8> pErrorsUtf8;
+  pAssembleResult->GetErrorBuffer(&pErrors);
+  if (pErrors && pErrors->GetBufferSize() > 1) {
+    IFT(pErrors->QueryInterface(IID_PPV_ARGS(&pErrorsUtf8)));
+    printf("Errors or warnings:\n%s", pErrorsUtf8->GetStringPointer());
+  }
+
   HRESULT status;
   IFT(pAssembleResult->GetStatus(&status));
   if (SUCCEEDED(status)) {
+    printf("Assembly succeeded.\n");
     CComPtr<IDxcBlob> pContainer;
     IFT(pAssembleResult->GetResult(&pContainer));
     if (pContainer.p != nullptr) {
@@ -95,8 +103,11 @@ void DxaContext::Assemble() {
         }
       }
 
-      WriteBlobToFile(pContainer, StringRefUtf16(OutputFilename));
+      WriteBlobToFile(pContainer, StringRefUtf16(OutputFilename), DXC_CP_UTF8); // TODO: Support DefaultTextCodePage
+      printf("Output written to \"%s\"\n", OutputFilename.c_str());
     }
+  } else {
+    printf("Assembly failed.\n");
   }
 }
 
@@ -128,110 +139,45 @@ HRESULT DxaContext::FindModule(hlsl::DxilFourCC fourCC, IDxcBlob *pSource, IDxcL
   return E_INVALIDARG;
 }
 
-HRESULT DxaContext::GetInjectedSourcesTable(IDxcLibrary *pLibrary, IDxcBlob *pTargetBlob, IDiaTable **ppTable) {
-  if (!pLibrary || !pTargetBlob || !ppTable)
-    return E_INVALIDARG;
-  CComPtr<IDiaDataSource> pDataSource;
-  CComPtr<IStream> pSourceStream;
-  CComPtr<IDiaSession> pSession;
-  CComPtr<IDiaEnumTables> pEnumTables;
-  IFT(m_dxcSupport.CreateInstance(CLSID_DxcDiaDataSource, &pDataSource));
-  IFT(pLibrary->CreateStreamFromBlobReadOnly(pTargetBlob, &pSourceStream));
-  IFT(pDataSource->loadDataFromIStream(pSourceStream));
-  IFT(pDataSource->openSession(&pSession));
-  IFT(pSession->getEnumTables(&pEnumTables));
-  CComPtr<IDiaTable> pTable;
-  for (;;) {
-    ULONG fetched;
-    pTable.Release();
-    IFT(pEnumTables->Next(1, &pTable, &fetched));
-    if (fetched == 0) {
-      pTable.Release();
-      break;
-    }
-    CComBSTR name;
-    IFT(pTable->get_name(&name));
-    if (wcscmp(name, L"InjectedSource") == 0) {
-      break;
-    }
-  }
-  *ppTable = pTable.Detach();
-  return S_OK;
-}
-
 void DxaContext::ListFiles() {
   CComPtr<IDxcBlobEncoding> pSource;
-  CComPtr<IDxcBlob> pTargetBlob;
-  CComPtr<IDxcLibrary> pLibrary;
-  CComPtr<IDiaTable> pTable;
   ReadFileIntoBlob(m_dxcSupport, StringRefUtf16(InputFilename), &pSource);
-  IFTARG(pSource->GetBufferSize() >= 4);
-  IFT(m_dxcSupport.CreateInstance(CLSID_DxcLibrary, &pLibrary));
-  IFT(FindModule(hlsl::DxilFourCC::DFCC_ShaderDebugInfoDXIL, pSource, pLibrary, &pTargetBlob));
-  IFT(GetInjectedSourcesTable(pLibrary, pTargetBlob, &pTable));
-  if (pTable == nullptr) {
-    printf("No injected sources found.\r\n");
-    return;
-  }
 
-  for (;;) {
-    CComPtr<IUnknown> pInjectedSourceUnk;
-    ULONG fetched;
-    IFT(pTable->Next(1, &pInjectedSourceUnk, &fetched));
-    if (fetched == 0) {
-      return;
-    }
+  CComPtr<IDxcPdbUtils> pPdbUtils;
+  IFT(m_dxcSupport.CreateInstance(CLSID_DxcPdbUtils, &pPdbUtils));
+  IFT(pPdbUtils->Load(pSource));
 
-    CComPtr<IDiaInjectedSource> pInjectedSource;
-    IFT(pInjectedSourceUnk.QueryInterface(&pInjectedSource));
+  UINT32 uNumSources = 0;
+  IFT(pPdbUtils->GetSourceCount(&uNumSources));
 
+  for (UINT32 i = 0; i < uNumSources; i++) {
     CComBSTR name;
-    IFT(pInjectedSource->get_filename(&name));
+    IFT(pPdbUtils->GetSourceName(i, &name));
     printf("%S\r\n", (LPWSTR)name);
   }
 }
 
 bool DxaContext::ExtractFile(const char *pName) {
   CComPtr<IDxcBlobEncoding> pSource;
-  CComPtr<IDxcBlob> pTargetBlob;
-  CComPtr<IDxcLibrary> pLibrary;
-  CComPtr<IDiaTable> pTable;
   ReadFileIntoBlob(m_dxcSupport, StringRefUtf16(InputFilename), &pSource);
-  IFTARG(pSource->GetBufferSize() >= 4);
-  IFT(m_dxcSupport.CreateInstance(CLSID_DxcLibrary, &pLibrary));
-  IFT(FindModule(hlsl::DxilFourCC::DFCC_ShaderDebugInfoDXIL, pSource, pLibrary, &pTargetBlob));
-  IFT(GetInjectedSourcesTable(pLibrary, pTargetBlob, &pTable));
+
+  CComPtr<IDxcPdbUtils> pPdbUtils;
+  IFT(m_dxcSupport.CreateInstance(CLSID_DxcPdbUtils, &pPdbUtils));
+  IFT(pPdbUtils->Load(pSource));
+
+  UINT32 uNumSources = 0;
+  IFT(pPdbUtils->GetSourceCount(&uNumSources));
   bool printedAny = false;
-  if (pTable == nullptr) {
-    printf("No injected sources found.\r\n");
-    return printedAny;
-  }
 
-  CA2W WideName(pName);
-  for (;;) {
-    CComPtr<IUnknown> pInjectedSourceUnk;
-    ULONG fetched;
-    IFT(pTable->Next(1, &pInjectedSourceUnk, &fetched));
-    if (fetched == 0) {
-      return printedAny;
-    }
-
-    CComPtr<IDiaInjectedSource> pInjectedSource;
-    IFT(pInjectedSourceUnk.QueryInterface(&pInjectedSource));
-
+  CA2W WideName(pName, CP_UTF8);
+  for (UINT32 i = 0; i < uNumSources; i++) {
     CComBSTR name;
-    IFT(pInjectedSource->get_filename(&name));
+    IFT(pPdbUtils->GetSourceName(i, &name));
     if (strcmp("*", pName) == 0 || wcscmp((LPWSTR)name, WideName) == 0) {
       printedAny = true;
-      ULONGLONG dataLenLL;
-      DWORD dataLen;
-      std::vector<BYTE> data;
-
-      IFT(pInjectedSource->get_length(&dataLenLL));
-      IFT(ULongLongToDWord(dataLenLL, &dataLen));
-      data.resize(dataLen);
-      IFT(pInjectedSource->get_source(dataLen, &dataLen, data.data()));
-      printf("%.*s", dataLen, (char *)data.data());
+      CComPtr<IDxcBlobEncoding> pFileContent;
+      IFT(pPdbUtils->GetSource(i, &pFileContent));
+      printf("%.*s", (int)pFileContent->GetBufferSize(), (char *)pFileContent->GetBufferPointer());
     }
   }
 
@@ -298,7 +244,7 @@ bool DxaContext::ExtractPart(const char *pName) {
         std::swap(pModuleBlob, pContent);
       }
 
-      WriteBlobToFile(pContent, StringRefUtf16(OutputFilename));
+      WriteBlobToFile(pContent, StringRefUtf16(OutputFilename), DXC_CP_UTF8); // TODO: Support DefaultTextCodePage
       printf("%Iu bytes written to %s\n", pContent->GetBufferSize(), OutputFilename.c_str());
       return true;
     }
@@ -307,22 +253,28 @@ bool DxaContext::ExtractPart(const char *pName) {
 }
 
 void DxaContext::ListParts() {
-  CComPtr<IDxcContainerReflection> pReflection;
   CComPtr<IDxcBlobEncoding> pSource;
-  UINT32 partCount;
-
   ReadFileIntoBlob(m_dxcSupport, StringRefUtf16(InputFilename), &pSource);
+
+  CComPtr<IDxcContainerReflection> pReflection;
   IFT(m_dxcSupport.CreateInstance(CLSID_DxcContainerReflection, &pReflection));
   IFT(pReflection->Load(pSource));
+
+  UINT32 partCount;
   IFT(pReflection->GetPartCount(&partCount));
   printf("Part count: %u\n", partCount);
+
   for (UINT32 i = 0; i < partCount; ++i) {
     UINT32 partKind;
     IFT(pReflection->GetPartKind(i, &partKind));
     // Part kind is typically four characters.
     char kindText[5];
     hlsl::PartKindToCharArray(partKind, kindText);
-    printf("#%u - %s\n", i, kindText);
+
+    CComPtr<IDxcBlob> partContent;
+    IFT(pReflection->GetPartContent(i, &partContent));
+
+    printf("#%u - %s (%u bytes)\n", i, kindText, (unsigned)partContent->GetBufferSize());
   }
 }
 

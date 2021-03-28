@@ -47,7 +47,7 @@ bool FileTest::parseInputFile() {
     const auto runCmdEndPos = checkCommands.find('\n', runCmdStartPos);
     const auto runCommand = checkCommands.substr(runCmdStartPos, runCmdEndPos);
     if (!utils::processRunCommandArgs(runCommand, &targetProfile, &entryPoint,
-                                      &restArgs)) {
+                                      &targetEnv, &restArgs)) {
       // An error has occured when parsing the Run command.
       return false;
     }
@@ -62,7 +62,7 @@ bool FileTest::parseInputFile() {
 
 void FileTest::runFileTest(llvm::StringRef filename, Expect expect,
                            bool runValidation) {
-  if (relaxLogicalPointer)
+  if (beforeHLSLLegalization)
     assert(runValidation);
 
   inputFilePath = utils::getAbsPathOfInputDataFile(filename);
@@ -103,7 +103,7 @@ void FileTest::runFileTest(llvm::StringRef filename, Expect expect,
 
     if (runValidation)
       EXPECT_TRUE(utils::validateSpirvBinary(targetEnv, generatedBinary,
-                                             relaxLogicalPointer, glLayout,
+                                             beforeHLSLLegalization, glLayout,
                                              dxLayout, scalarLayout));
   } else if (expect == Expect::Warning) {
     ASSERT_TRUE(compileOk);
@@ -129,7 +129,7 @@ void FileTest::runFileTest(llvm::StringRef filename, Expect expect,
 
     if (runValidation)
       EXPECT_TRUE(utils::validateSpirvBinary(targetEnv, generatedBinary,
-                                             relaxLogicalPointer, glLayout,
+                                             beforeHLSLLegalization, glLayout,
                                              dxLayout, scalarLayout));
   } else if (expect == Expect::Failure) {
     ASSERT_FALSE(compileOk);
@@ -157,7 +157,7 @@ void FileTest::runFileTest(llvm::StringRef filename, Expect expect,
 
     std::string valMessages;
     EXPECT_FALSE(utils::validateSpirvBinary(
-        targetEnv, generatedBinary, relaxLogicalPointer, glLayout, dxLayout,
+        targetEnv, generatedBinary, beforeHLSLLegalization, glLayout, dxLayout,
         scalarLayout, &valMessages));
     auto options = effcee::Options()
                        .SetChecksName(filename.str())

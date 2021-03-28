@@ -382,9 +382,11 @@ def err_thread_unsupported : Error<
 
 def warn_maybe_falloff_nonvoid_function : Warning<
   "control may reach end of non-void function">,
+  DefaultError,   // HLSL Change: DefaultError
   InGroup<ReturnType>;
 def warn_falloff_nonvoid_function : Warning<
   "control reaches end of non-void function">,
+  DefaultError,   // HLSL Change: DefaultError
   InGroup<ReturnType>;
 def err_maybe_falloff_nonvoid_block : Error<
   "control may reach end of non-void block">;
@@ -2330,8 +2332,10 @@ def warn_attribute_wrong_decl_type : Warning<
   "global variables of scalar type|"
   "global variables of struct type|"
   "global variables, cbuffers, and tbuffers|"
+  "RWTextures, Buffers and RWBuffers|"
   "RWStructuredBuffers, AppendStructuredBuffers, and ConsumeStructuredBuffers|"
   "SubpassInput, SubpassInputMS|"
+  "cbuffer or ConstantBuffer|"
   // SPIRV Change Ends
   // HLSL Change Starts - add 3 more enum values
   "variables and parameters|functions, parameters, and fields|"
@@ -5709,9 +5713,11 @@ let CategoryName = "Lambda Issue" in {
     "lambda declared 'noreturn' should not return">;
   def warn_maybe_falloff_nonvoid_lambda : Warning<
     "control may reach end of non-void lambda">,
+    DefaultError,   // HLSL Change: DefaultError
     InGroup<ReturnType>;
   def warn_falloff_nonvoid_lambda : Warning<
     "control reaches end of non-void lambda">,
+    DefaultError,   // HLSL Change: DefaultError
     InGroup<ReturnType>;
   def err_access_lambda_capture : Error<
     // The ERRORs represent other special members that aren't constructors, in
@@ -7506,6 +7512,10 @@ def err_hlsl_requires_non_aggregate : Error<
   "scalar, vector, or matrix expected">;
 def err_hlsl_require_numeric_base_for_ctor : Error<
   "constructors only defined for numeric base types">;
+def err_hlsl_sizeof_literal : Error<
+  "invalid application of 'sizeof' to literal type %0">;
+def err_hlsl_sizeof_nonnumeric : Error<
+  "invalid application of 'sizeof' to non-numeric type %0">;
 def err_hlsl_typecheck_duplicate_matrix_components_not_mlvalue : Error< // Patterned after err_typecheck_duplicate_matrix_components_not_mlvalue
   "matrix is not assignable (contains duplicate components)">;
 def err_hlsl_typecheck_subscript_value : Error< // Patterned after err_typecheck_subscript_value
@@ -7520,8 +7530,6 @@ def err_hlsl_type_mismatch : Error<
   "type mismatch">;
 def err_hlsl_unsupported_array_equality_op: Error<
   "equality operators cannot be used with array types">;
-def err_hlsl_unsupported_array_size: Error<
-  "array dimension must be between 1 and 65536">;
 def err_hlsl_unsupported_incomplete_array: Error<
   "array dimensions of struct/class members must be explicit">;
 def err_hlsl_unsupported_bool_lvalue_op : Error<
@@ -7530,12 +7538,44 @@ def err_hlsl_unsupported_lvalue_cast_op : Error<
   "cannot truncate lvalue vector/matrix">;
 def err_hlsl_unsupported_buffer_packoffset : Error<
   "packoffset is only allowed within a constant buffer, not on the constant buffer declaration">;
-def err_hlsl_unsupported_cbuffer_register : Error<
-  "invalid register specification, expected 'b' binding">;
-def err_hlsl_unsupported_tbuffer_register : Error<
-  "invalid register specification, expected 't' binding">;
 def err_hlsl_unsupported_buffer_slot_target_specific : Error<
   "user defined constant buffer slots cannot be target specific">;
+def err_hlsl_unsupported_payload_access_qualifier : Error<
+  "payload access qualifiers are only allowed for member variables of a payload structure">;
+def err_hlsl_unsupported_payload_access_qualifier_struct : Error<
+  "payload access qualifiers are not supported on struct types.">;
+def err_hlsl_payload_access_qualifier_unsupported_shader : Error<
+  "payload access qualifiers are only defined for raytracing shader stages closesthit, miss, anyhit and for special keyword: caller. '%0' is not supported">;
+def err_hlsl_payload_access_qualifier_invalid_combination : Error<
+  "field %0 is qualified '%1' for shader stage '%2' but has no valid %3">;
+def err_hlsl_payload_access_qualifier_multiple_defined : Error<
+  "payload access qualifier '%0' has already been defined">;
+def warn_hlsl_payload_access_data_loss : Warning<
+  "potential loss of data for payload field '%0'. Field is qualified 'write' in earlier stages and 'write' only for stage '%1' but never unconditionally written.">, InGroup<HLSLPayloadAccessQualiferShader>;
+def warn_hlsl_payload_access_undef_read : Warning<
+  "reading undefined value ('%0' is not qualified 'read' for shader stage '%1')">, InGroup<HLSLPayloadAccessQualiferShader>;
+def warn_hlsl_payload_access_write_loss : Warning<
+  "write will be dropped ('%0' is not qualified 'write' for shader stage '%1')">, InGroup<HLSLPayloadAccessQualiferShader>;
+def warn_hlsl_payload_access_no_write_for_trace_payload : Warning<
+  "field '%0' is 'write' for 'caller' stage but field is never written for TraceRay call">, InGroup<HLSLPayloadAccessQualiferTrace>;
+def warn_hlsl_payload_access_write_but_no_write_for_trace_payload : Warning<
+  "value will be undefined inside TraceRay ('%0' is not qualified 'write' for 'caller')">, InGroup<HLSLPayloadAccessQualiferTrace>;
+def warn_hlsl_payload_access_read_of_undef_after_trace : Warning<
+  "reading undefined value ('%0' is returned from TraceRay but not qualified 'read' for 'caller')">, InGroup<HLSLPayloadAccessQualiferTrace>;
+def warn_hlsl_payload_access_read_but_no_read_after_trace : Warning<
+  "'%0' is qualified 'read' for 'caller' but the field is never read after TraceCall (possible performance issue)">, InGroup<HLSLPayloadAccessQualiferPerf>;
+def warn_qualified_payload_passed_to_extern_function : Warning<
+  "passing a qualified payload to an extern function can cause undefined behavior if payload qualifiers mismatch">, InGroup<HLSLPayloadAccessQualiferCall>;
+def err_not_all_payload_fields_qualified : Error<
+  "payload type '%0' requires that all fields carry payload access qualifiers.">;
+def err_payload_requires_attribute : Error<
+  "type '%0' used as payload requires that it is annotated with the [raypayload] attribute">;
+def err_payload_fields_not_qualified : Error<
+  "payload field '%0' has no payload access qualifiers.">;
+def err_payload_fields_is_payload_and_overqualified : Error<
+  "payload field '%0' is a payload struct. Payload access qualifiers are not allowed on payload types.">;
+def warn_hlsl_payload_qualifer_dropped : Warning<
+  "payload access qualifieres are only supported for target lib_6_6 and beyond. You can opt-in for lib_6_6 with the -enable-payload-qualifiers flag. Qualifiers will be dropped.">, InGroup<HLSLPayloadAccessQualifer>;
 def err_hlsl_unsupported_builtin_op: Error<
   "operator cannot be used with built-in type %0">;
 def err_hlsl_unsupported_char_literal : Error<
@@ -7601,11 +7641,13 @@ def err_hlsl_conditional_result_comptype_mismatch : Error<
   "conditional operator result component types mismatch.">;
 def note_field_type_usage : Note<"usage of %0 found in field %1 of type %2">;
 def warn_hlsl_attribute_expects_uint_literal : Warning<
-  "attribute %0 must have a uint literal argument">;
+  "attribute %0 must have a uint literal argument">,
+  InGroup<HLSLAttributeType>;
 def err_hlsl_attribute_expects_float_literal : Error<
   "attribute %0 must have a float literal argument">;
 def warn_hlsl_comma_in_init : Warning<
-  "comma expression used where a constructor list may have been intended">;
+  "comma expression used where a constructor list may have been intended">,
+  InGroup<HLSLCommaInInit>;
 def warn_hlsl_incorrect_bind_semantic: Warning< // Is an error in fxc in some cases, but is sometimes ignored
   "invalid register specification, expected %0 binding">;
 def err_hlsl_incorrect_bind_semantic: Error< // Is an error in fxc in some cases, but is sometimes ignored
@@ -7619,6 +7661,9 @@ def warn_hlsl_narrowing : Warning<
 def warn_hlsl_sema_minprecision_promotion : Warning <
   "%0 is promoted to %1">,
   InGroup<Conversion>, DefaultWarn;
+def warn_hlsl_ambiguous_literal_shift : Warning <
+  "ambiguous type for bit shift; use a type suffix on literal values, like 'L' or 'U', or a cast">,
+  InGroup<HLSLAmbigLitShift>, DefaultWarn;
 def warn_hlsl_implicit_vector_truncation  : Warning<
   "implicit truncation of vector type">,
   InGroup<Conversion>, DefaultWarn;
@@ -7633,19 +7678,26 @@ def err_hlsl_invalid_resource_type_on_intrinsic : Error<
     "cannot %0 from resource containing %1">;
 def err_hlsl_usage_not_on_parameter : Error<
     "HLSL usage %0 is only valid on a parameter">;
-def warn_hlsl_for_redefinition : Warning<"redefinition of %0 shadows declaration in the outer scope; most recent declaration will be used">;
+def warn_hlsl_for_redefinition : Warning<"redefinition of %0 shadows declaration in the outer scope; most recent declaration will be used">,
+  InGroup<HLSLForRedefinition>;
 def warn_hlsl_for_redefinition_different_type : Warning<
-  "redefinition of %0 with a different type%diff{: $ vs $|}1,2 shadows declaration in the outer scope; most recent declaration will be used">;
+  "redefinition of %0 with a different type%diff{: $ vs $|}1,2 shadows declaration in the outer scope; most recent declaration will be used">,
+  InGroup<HLSLForRedefinition>;
 def warn_hlsl_specifier_overridden : Warning<
-  "%0 will be overridden by %1">;
+  "%0 will be overridden by %1">,
+  InGroup<HLSLSpecifierOverride>;
 def warn_hlsl_packoffset_overridden : Warning<
-  "packoffset is overridden by another packoffset annotation">;
+  "packoffset is overridden by another packoffset annotation">,
+  InGroup<HLSLPackOffsetOverride>;
 def warn_hlsl_unsupported_statement_for_if_switch_attribute : Warning<
-  "attribute %0 can only be applied to 'if' and 'switch' statements">;
+  "attribute %0 can only be applied to 'if' and 'switch' statements">,
+  InGroup<HLSLAttributeStatement>;
 def warn_hlsl_unsupported_statement_for_switch_attribute : Warning<
-  "attribute %0 can only be applied to 'switch' statements">;
+  "attribute %0 can only be applied to 'switch' statements">,
+  InGroup<HLSLAttributeStatement>;
 def warn_hlsl_unsupported_statement_for_loop_attribute : Warning<
-  "attribute %0 can only be applied to 'for', 'while' and 'do' loop statements">;
+  "attribute %0 can only be applied to 'for', 'while' and 'do' loop statements">,
+  InGroup<HLSLAttributeStatement>;
 def err_hlsl_matrix_layout_wrong_type : Error<
   "%0 can only be used with a matrix type">;
 def warn_hlsl_effect_object : Warning <
@@ -7669,24 +7721,30 @@ def err_hlsl_unsupported_for_version_lower : Error<
 def err_hlsl_unsupported_keyword_for_min_precision : Error<
    "%0 is only supported with -enable-16bit-types option">;
 def err_hlsl_intrinsic_template_arg_unsupported: Error<
-   "Explicit template arguments on intrinsic %0 are not supported.">;
+   "Explicit template arguments on intrinsic %0 are not supported">;
 def err_hlsl_intrinsic_template_arg_requires_2018: Error<
-   "Explicit template arguments on intrinsic %0 requires HLSL version 2018 or above.">;
-def err_hlsl_intrinsic_template_arg_scalar_vector: Error<
-   "Explicit template arguments on intrinsic %0 are limited one to scalar or vector type.">;
+   "Explicit template arguments on intrinsic %0 requires HLSL version 2018 or above">;
+def err_hlsl_intrinsic_template_arg_numeric: Error<
+   "Explicit template arguments on intrinsic %0 must be a single numeric type">;
 }
 def err_hlsl_no_struct_user_defined_type: Error<
    "User defined type intrinsic arg must be struct">;
 def err_hlsl_ray_desc_required: Error<
    "Argument type must be struct RayDesc.">;
-def err_hlsl_missing_maxvertexcount_attr: Error<
-   "GS entry point must have the maxvertexcount attribute">;
-def err_hlsl_missing_patchconstantfunc_attr: Error<
-   "HS entry point must have the patchconstantfunc attribute">;
+def err_hlsl_missing_attr: Error<
+   "%0 entry point must have the %1 attribute">;
 def err_hlsl_missing_inout_attr: Error<
    "stream-output object must be an inout parameter">;
 def err_hlsl_unsupported_string_decl: Error<
    "%select{array|parameter|return value}0 of type string is not supported">;
+def err_hlsl_missing_out_attr: Error<
+   "%0 object must be an out parameter">;
+def err_hlsl_missing_in_attr: Error<
+   "%0 object must be an in parameter">;
+def err_hlsl_load_from_mesh_out_arrays: Error<
+   "output arrays of a mesh shader can not be read from">;
+def err_hlsl_out_indices_array_incorrect_access: Error<
+   "a vector in out indices array must be accessed as a whole">;
 // HLSL Change Ends
 
 // SPIRV Change Starts

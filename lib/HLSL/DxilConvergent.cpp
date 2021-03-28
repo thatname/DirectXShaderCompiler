@@ -22,13 +22,23 @@
 #include "dxc/HLSL/DxilGenerationPass.h"
 #include "dxc/HLSL/HLOperations.h"
 #include "dxc/HLSL/HLModule.h"
+#include "dxc/HLSL/DxilConvergent.h"
 #include "dxc/HlslIntrinsicOp.h"
+#include "dxc/HLSL/DxilConvergentName.h"
 
 using namespace llvm;
 using namespace hlsl;
 
-namespace {
-const StringRef kConvergentFunctionPrefix = "dxil.convergent.marker.";
+bool hlsl::IsConvergentMarker(Value *V) {
+  CallInst *CI = dyn_cast<CallInst>(V);
+  if (!CI)
+    return false;
+  Function *F = CI->getCalledFunction();
+  return F->getName().startswith(kConvergentFunctionPrefix);
+}
+
+Value *hlsl::GetConvergentSource(Value *V) {
+  return cast<CallInst>(V)->getOperand(0);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -179,21 +189,12 @@ Value *DxilConvergentMark::FindConvergentOperand(Instruction *I) {
       case IntrinsicOp::MOP_Sample:
       case IntrinsicOp::MOP_SampleBias:
       case IntrinsicOp::MOP_SampleCmp:
-      case IntrinsicOp::MOP_SampleCmpLevelZero:
       case IntrinsicOp::MOP_CalculateLevelOfDetail:
       case IntrinsicOp::MOP_CalculateLevelOfDetailUnclamped:
         return CI->getArgOperand(HLOperandIndex::kSampleCoordArgIndex);
-      case IntrinsicOp::MOP_Gather:
-      case IntrinsicOp::MOP_GatherAlpha:
-      case IntrinsicOp::MOP_GatherBlue:
-      case IntrinsicOp::MOP_GatherCmp:
-      case IntrinsicOp::MOP_GatherCmpAlpha:
-      case IntrinsicOp::MOP_GatherCmpBlue:
-      case IntrinsicOp::MOP_GatherCmpGreen:
-      case IntrinsicOp::MOP_GatherCmpRed:
-      case IntrinsicOp::MOP_GatherGreen:
-      case IntrinsicOp::MOP_GatherRed:
-        return CI->getArgOperand(HLOperandIndex::kGatherCoordArgIndex);
+      case IntrinsicOp::MOP_WriteSamplerFeedback:
+      case IntrinsicOp::MOP_WriteSamplerFeedbackBias:
+        return CI->getArgOperand(HLOperandIndex::kWriteSamplerFeedbackCoordArgIndex);
       default:
         // No other ops have convergent operands.
         break;

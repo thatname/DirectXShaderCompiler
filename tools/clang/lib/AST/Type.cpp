@@ -1577,6 +1577,10 @@ AutoType *Type::getContainedAutoType() const {
 bool Type::hasIntegerRepresentation() const {
   if (const VectorType *VT = dyn_cast<VectorType>(CanonicalType))
     return VT->getElementType()->isIntegerType();
+  // HLSL Change Begins
+  else if (hlsl::IsHLSLVecType(CanonicalType))
+    return hlsl::GetHLSLVecElementType(CanonicalType)->isIntegerType();
+  // HLSL Change Ends
   else
     return isIntegerType();
 }
@@ -1714,6 +1718,10 @@ bool Type::isSignedIntegerOrEnumerationType() const {
 bool Type::hasSignedIntegerRepresentation() const {
   if (const VectorType *VT = dyn_cast<VectorType>(CanonicalType))
     return VT->getElementType()->isSignedIntegerOrEnumerationType();
+  // HLSL Change Begins
+  else if (hlsl::IsHLSLVecType(CanonicalType))
+    return hlsl::GetHLSLVecElementType(CanonicalType)->isSignedIntegerOrEnumerationType();
+  // HLSL Change Ends
   else
     return isSignedIntegerOrEnumerationType();
 }
@@ -1754,6 +1762,10 @@ bool Type::isUnsignedIntegerOrEnumerationType() const {
 bool Type::hasUnsignedIntegerRepresentation() const {
   if (const VectorType *VT = dyn_cast<VectorType>(CanonicalType))
     return VT->getElementType()->isUnsignedIntegerOrEnumerationType();
+  // HLSL Change Begins
+  else if (hlsl::IsHLSLVecType(CanonicalType))
+    return hlsl::GetHLSLVecElementType(CanonicalType)->isUnsignedIntegerOrEnumerationType();
+  // HLSL Change Ends
   else
     return isUnsignedIntegerOrEnumerationType();
 }
@@ -1770,6 +1782,10 @@ bool Type::isFloatingType() const {
 bool Type::hasFloatingRepresentation() const {
   if (const VectorType *VT = dyn_cast<VectorType>(CanonicalType))
     return VT->getElementType()->isFloatingType();
+  // HLSL Change Begins
+  else if (hlsl::IsHLSLVecType(CanonicalType))
+    return hlsl::GetHLSLVecElementType(CanonicalType)->isFloatingType();
+  // HLSL Change Ends
   else
     return isFloatingType();
 }
@@ -2530,6 +2546,8 @@ StringRef BuiltinType::getName(const PrintingPolicy &Policy) const {
   case Min12Int:          return "min12int";
   case LitFloat:          return "literal float";
   case LitInt:            return "literal int";
+  case Int8_4Packed:      return "int8_t4_packed";
+  case UInt8_4Packed:     return "uint8_t4_packed";
   // HLSL Change Ends
   }
   
@@ -2926,6 +2944,7 @@ bool AttributedType::isHLSLTypeSpec() const {
   case attr_hlsl_column_major:
   case attr_hlsl_snorm:
   case attr_hlsl_unorm:
+  case attr_hlsl_globallycoherent:
     return true;
   }
   llvm_unreachable("invalid attr kind");
@@ -2955,6 +2974,7 @@ bool AttributedType::isCallingConv() const {
   case attr_hlsl_column_major:
   case attr_hlsl_snorm:
   case attr_hlsl_unorm:
+  case attr_hlsl_globallycoherent:
   // HLSL Change Ends
     return false;
 

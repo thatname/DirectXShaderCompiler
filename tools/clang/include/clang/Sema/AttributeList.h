@@ -854,17 +854,19 @@ enum AttributeDeclKind {
   ExpectedStructOrUnionOrTypedef,
   ExpectedStructOrTypedef,
   ExpectedObjectiveCInterfaceOrProtocol,
-  ExpectedKernelFunction
+  ExpectedKernelFunction,
   // SPIRV Change Begins
-  ,ExpectedField
-  ,ExpectedScalarGlobalVar
-  ,ExpectedStructGlobalVar
-  ,ExpectedGlobalVarOrCTBuffer
-  ,ExpectedCounterStructuredBuffer
-  ,ExpectedSubpassInput
+  ExpectedField,
+  ExpectedScalarGlobalVar,
+  ExpectedStructGlobalVar,
+  ExpectedGlobalVarOrCTBuffer,
+  ExpectedRWTextureOrBuffer,
+  ExpectedCounterStructuredBuffer,
+  ExpectedSubpassInput,
+  ExpectedCTBuffer,
   // SPIRV Change Ends
   // HLSL Change Begins - add attribute decl combinations
-  ,ExpectedVariableOrParam,
+  ExpectedVariableOrParam,
   ExpectedFunctionOrParamOrField,
   ExpectedFunctionOrVariableOrParamOrFieldOrType
   // HLSL Change Ends

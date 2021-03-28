@@ -994,6 +994,8 @@ void ASTDumper::dumpHLSLUnusualAnnotations(const ArrayRef<hlsl::UnusualAnnotatio
             OS << "RegisterAssignment"; break;
           case hlsl::UnusualAnnotation::UA_SemanticDecl:
             OS << "SemanticDecl"; break;
+          case hlsl::UnusualAnnotation::UA_PayloadAccessQualifier:
+            OS << "PayloadAccessQualifier"; break;
         }
       }
       dumpPointer(It);
@@ -1021,13 +1023,19 @@ void ASTDumper::dumpHLSLUnusualAnnotations(const ArrayRef<hlsl::UnusualAnnotatio
           OS << " register(";
           if (!registerAssignment->ShaderProfile.empty())
             OS << registerAssignment->ShaderProfile << ", ";
-          if (!registerAssignment->RegisterType)
-            OS << "invalid";
-          else
-            OS << std::string(&(registerAssignment->RegisterType), 1);
-          OS << registerAssignment->RegisterNumber + registerAssignment->RegisterOffset;
-          if (registerAssignment->RegisterSpace)
-            OS << ", space" << registerAssignment->RegisterSpace;
+          bool needsComma = false;
+          if (!registerAssignment->isSpaceOnly()) {
+            if (!registerAssignment->RegisterType)
+              OS << "invalid";
+            else
+              OS << StringRef(&registerAssignment->RegisterType, 1);
+            OS << registerAssignment->RegisterNumber + registerAssignment->RegisterOffset;
+            needsComma = true;
+          }
+          if (registerAssignment->RegisterSpace.hasValue()) {
+            if (needsComma) OS << ", ";
+            OS << "space" << registerAssignment->RegisterSpace.getValue();
+          }
           OS << ")";
           if (!registerAssignment->IsValid)
             OS << " invalid";
@@ -1037,7 +1045,25 @@ void ASTDumper::dumpHLSLUnusualAnnotations(const ArrayRef<hlsl::UnusualAnnotatio
           const hlsl::SemanticDecl* semanticDecl = cast<hlsl::SemanticDecl>(*It);
           OS << " \"" << semanticDecl->SemanticName << "\"";
           break;
+        }      
+      case hlsl::UnusualAnnotation::UA_PayloadAccessQualifier: {
+        const hlsl::PayloadAccessAnnotation *annotation =
+            cast<hlsl::PayloadAccessAnnotation>(*It);
+        OS << " "
+           << (annotation->qualifier == hlsl::DXIL::PayloadAccessQualifier::Read
+                   ? "read"
+                   : "write")
+           << "(";
+        StringRef shaderStageNames[] = {"caller", "closesthit", "miss", "anyhit"};
+        for (unsigned i = 0; i < annotation->ShaderStages.size(); ++i) {
+          OS << shaderStageNames[static_cast<unsigned>(
+              annotation->ShaderStages[i])];
+          if (i < annotation->ShaderStages.size() - 1)
+            OS << ", ";
         }
+        OS << ")";
+        break;
+      }
       }
     });
   }

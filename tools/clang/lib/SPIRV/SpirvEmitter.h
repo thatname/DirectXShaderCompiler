@@ -34,7 +34,6 @@
 #include "llvm/ADT/STLExtras.h"
 
 #include "DeclResultIdMapper.h"
-#include "SpirvEvalInfo.h"
 
 namespace clang {
 namespace spirv {
@@ -52,6 +51,13 @@ public:
   ASTContext &getASTContext() { return astContext; }
   SpirvBuilder &getSpirvBuilder() { return spvBuilder; }
   DiagnosticsEngine &getDiagnosticsEngine() { return diags; }
+  CompilerInstance &getCompilerInstance() { return theCompilerInstance; }
+  SpirvCodeGenOptions &getSpirvOptions() { return spirvOptions; }
+
+  /// \brief If DebugSource and DebugCompilationUnit for loc are already
+  /// created, we just return RichDebugInfo containing it. Otherwise,
+  /// create DebugSource and DebugCompilationUnit for loc and return it.
+  RichDebugInfo *getOrCreateRichDebugInfo(const SourceLocation &loc);
 
   void doDecl(const Decl *decl);
   void doStmt(const Stmt *stmt, llvm::ArrayRef<const Attr *> attrs = {});
@@ -76,6 +82,7 @@ private:
   void doFunctionDecl(const FunctionDecl *decl);
   void doVarDecl(const VarDecl *decl);
   void doRecordDecl(const RecordDecl *decl);
+  void doEnumDecl(const EnumDecl *decl);
   void doHLSLBufferDecl(const HLSLBufferDecl *decl);
   void doImplicitDecl(const Decl *decl);
 
@@ -104,6 +111,8 @@ private:
   SpirvInstruction *doInitListExpr(const InitListExpr *expr);
   SpirvInstruction *doMemberExpr(const MemberExpr *expr);
   SpirvInstruction *doUnaryOperator(const UnaryOperator *expr);
+  SpirvInstruction *
+  doUnaryExprOrTypeTraitExpr(const UnaryExprOrTypeTraitExpr *expr);
 
   /// Overload with pre computed SpirvEvalInfo.
   ///
@@ -147,12 +156,12 @@ private:
   /// recursive if lhsValType is a composite type. rhsExpr will be used as a
   /// reference to adjust the CodeGen if not nullptr.
   void storeValue(SpirvInstruction *lhsPtr, SpirvInstruction *rhsVal,
-                  QualType lhsValType);
+                  QualType lhsValType, SourceLocation loc);
 
   /// Decomposes and reconstructs the given srcVal of the given valType to meet
   /// the requirements of the dstLR layout rule.
   SpirvInstruction *reconstructValue(SpirvInstruction *srcVal, QualType valType,
-                                     SpirvLayoutRule dstLR);
+                                     SpirvLayoutRule dstLR, SourceLocation loc);
 
   /// Generates the necessary instructions for conducting the given binary
   /// operation on lhs and rhs.
@@ -166,12 +175,11 @@ private:
   /// process will be written into it. If mandateGenOpcode is not spv::Op::Max,
   /// it will used as the SPIR-V opcode instead of deducing from Clang frontend
   /// opcode.
-  SpirvInstruction *processBinaryOp(const Expr *lhs, const Expr *rhs,
-                                    BinaryOperatorKind opcode,
-                                    QualType computationType,
-                                    QualType resultType, SourceRange,
-                                    SpirvInstruction **lhsInfo = nullptr,
-                                    spv::Op mandateGenOpcode = spv::Op::Max);
+  SpirvInstruction *
+  processBinaryOp(const Expr *lhs, const Expr *rhs, BinaryOperatorKind opcode,
+                  QualType computationType, QualType resultType, SourceRange,
+                  SourceLocation, SpirvInstruction **lhsInfo = nullptr,
+                  spv::Op mandateGenOpcode = spv::Op::Max);
 
   /// Generates SPIR-V instructions to initialize the given variable once.
   void initOnce(QualType varType, std::string varName, SpirvVariable *,
@@ -222,7 +230,7 @@ private:
   /// vector).
   void splitVecLastElement(QualType vecType, SpirvInstruction *vec,
                            SpirvInstruction **residual,
-                           SpirvInstruction **lastElement);
+                           SpirvInstruction **lastElement, SourceLocation loc);
 
   /// Converts a vector value into the given struct type with its element type's
   /// <result-id> as elemTypeId.
@@ -231,7 +239,8 @@ private:
   /// otherwise.
   SpirvInstruction *convertVectorToStruct(QualType structType,
                                           QualType elemType,
-                                          SpirvInstruction *vector);
+                                          SpirvInstruction *vector,
+                                          SourceLocation loc);
 
   /// Translates a floatN * float multiplication into SPIR-V instructions and
   /// returns the <result-id>. Returns 0 if the given binary operation is not
@@ -260,6 +269,24 @@ private:
   SpirvInstruction *tryToAssignToRWBufferRWTexture(const Expr *lhs,
                                                    SpirvInstruction *rhs);
 
+  /// Tries to emit instructions for assigning to the given mesh out attribute
+  /// or indices object. Returns 0 if the trial fails and no instructions are
+  /// generated.
+  SpirvInstruction *
+  tryToAssignToMSOutAttrsOrIndices(const Expr *lhs, SpirvInstruction *rhs,
+                                   SpirvInstruction *vecComponent = nullptr,
+                                   bool noWriteBack = false);
+
+  /// Emit instructions for assigning to the given mesh out attribute.
+  void assignToMSOutAttribute(
+      const DeclaratorDecl *decl, SpirvInstruction *value,
+      const llvm::SmallVector<SpirvInstruction *, 4> &indices);
+
+  /// Emit instructions for assigning to the given mesh out indices object.
+  void
+  assignToMSOutIndices(const DeclaratorDecl *decl, SpirvInstruction *value,
+                       const llvm::SmallVector<SpirvInstruction *, 4> &indices);
+
   /// Processes each vector within the given matrix by calling actOnEachVector.
   /// matrixVal should be the loaded value of the matrix. actOnEachVector takes
   /// three parameters for the current vector: the index, the <type-id>, and
@@ -268,7 +295,8 @@ private:
       const Expr *matrix, SpirvInstruction *matrixVal,
       llvm::function_ref<SpirvInstruction *(uint32_t, QualType,
                                             SpirvInstruction *)>
-          actOnEachVector);
+          actOnEachVector,
+      SourceLocation loc = {});
 
   /// Translates the given varDecl into a spec constant.
   void createSpecConstant(const VarDecl *varDecl);
@@ -279,27 +307,32 @@ private:
   /// This method expects that both lhs and rhs are SPIR-V acceptable matrices.
   SpirvInstruction *processMatrixBinaryOp(const Expr *lhs, const Expr *rhs,
                                           const BinaryOperatorKind opcode,
-                                          SourceRange);
+                                          SourceRange, SourceLocation);
 
   /// Creates a temporary local variable in the current function of the given
   /// varType and varName. Initializes the variable with the given initValue.
   /// Returns the instruction pointer for the variable.
   SpirvVariable *createTemporaryVar(QualType varType, llvm::StringRef varName,
-                                    SpirvInstruction *initValue);
+                                    SpirvInstruction *initValue,
+                                    SourceLocation loc);
 
-  /// Collects all indices from consecutive MemberExprs
-  /// TODO: Update method description here.
+  /// Collects all indices from consecutive MemberExprs, ArraySubscriptExprs and
+  /// CXXOperatorCallExprs. Also special handles all mesh shader out attributes
+  /// to return the entire expression in order for caller to extract the member
+  /// expression.
   const Expr *
   collectArrayStructIndices(const Expr *expr, bool rawIndex,
                             llvm::SmallVectorImpl<uint32_t> *rawIndices,
-                            llvm::SmallVectorImpl<SpirvInstruction *> *indices);
+                            llvm::SmallVectorImpl<SpirvInstruction *> *indices,
+                            bool *isMSOutAttribute = nullptr);
 
   /// Creates an access chain to index into the given SPIR-V evaluation result
   /// and returns the new SPIR-V evaluation result.
   SpirvInstruction *
   turnIntoElementPtr(QualType baseType, SpirvInstruction *base,
                      QualType elemType,
-                     const llvm::SmallVector<SpirvInstruction *, 4> &indices);
+                     const llvm::SmallVector<SpirvInstruction *, 4> &indices,
+                     SourceLocation loc);
 
 private:
   /// Validates that vk::* attributes are used correctly and returns false if
@@ -312,14 +345,14 @@ private:
   /// If resultType is not nullptr, the resulting value's type will be written
   /// to resultType. Panics if the given types are not scalar or vector of
   /// float/integer type.
-  SpirvInstruction *convertBitwidth(SpirvInstruction *value, QualType fromType,
-                                    QualType toType,
+  SpirvInstruction *convertBitwidth(SpirvInstruction *value, SourceLocation loc,
+                                    QualType fromType, QualType toType,
                                     QualType *resultType = nullptr);
 
   /// Processes the given expr, casts the result into the given bool (vector)
   /// type and returns the <result-id> of the casted value.
   SpirvInstruction *castToBool(SpirvInstruction *value, QualType fromType,
-                               QualType toType);
+                               QualType toType, SourceLocation loc);
 
   /// Processes the given expr, casts the result into the given integer (vector)
   /// type and returns the <result-id> of the casted value.
@@ -377,24 +410,29 @@ private:
   /// Processes the 'mul' intrinsic function.
   SpirvInstruction *processIntrinsicMul(const CallExpr *);
 
+  /// Processes the 'printf' intrinsic function.
+  SpirvInstruction *processIntrinsicPrintf(const CallExpr *);
+
   /// Transposes a non-floating point matrix and returns the result-id of the
   /// transpose.
   SpirvInstruction *processNonFpMatrixTranspose(QualType matType,
-                                                SpirvInstruction *matrix);
+                                                SpirvInstruction *matrix,
+                                                SourceLocation loc);
 
   /// Processes the dot product of two non-floating point vectors. The SPIR-V
   /// OpDot only accepts float vectors. Assumes that the two vectors are of the
   /// same size and have the same element type (elemType).
   SpirvInstruction *processNonFpDot(SpirvInstruction *vec1Id,
                                     SpirvInstruction *vec2Id, uint32_t vecSize,
-                                    QualType elemType);
+                                    QualType elemType, SourceLocation loc);
 
   /// Processes the multiplication of a *non-floating point* matrix by a scalar.
   /// Assumes that the matrix element type and the scalar type are the same.
   SpirvInstruction *processNonFpScalarTimesMatrix(QualType scalarType,
                                                   SpirvInstruction *scalar,
                                                   QualType matType,
-                                                  SpirvInstruction *matrix);
+                                                  SpirvInstruction *matrix,
+                                                  SourceLocation loc);
 
   /// Processes the multiplication of a *non-floating point* matrix by a vector.
   /// Assumes the matrix element type and the vector element type are the same.
@@ -406,6 +444,7 @@ private:
   SpirvInstruction *
   processNonFpVectorTimesMatrix(QualType vecType, SpirvInstruction *vector,
                                 QualType matType, SpirvInstruction *matrix,
+                                SourceLocation loc,
                                 SpirvInstruction *matrixTranspose = nullptr);
 
   /// Processes the multiplication of a vector by a *non-floating point* matrix.
@@ -413,7 +452,8 @@ private:
   SpirvInstruction *processNonFpMatrixTimesVector(QualType matType,
                                                   SpirvInstruction *matrix,
                                                   QualType vecType,
-                                                  SpirvInstruction *vector);
+                                                  SpirvInstruction *vector,
+                                                  SourceLocation loc);
 
   /// Processes a non-floating point matrix multiplication. Assumes that the
   /// number of columns in lhs matrix is the same as number of rows in the rhs
@@ -421,7 +461,8 @@ private:
   SpirvInstruction *processNonFpMatrixTimesMatrix(QualType lhsType,
                                                   SpirvInstruction *lhs,
                                                   QualType rhsType,
-                                                  SpirvInstruction *rhs);
+                                                  SpirvInstruction *rhs,
+                                                  SourceLocation loc);
 
   /// Processes the 'dot' intrinsic function.
   SpirvInstruction *processIntrinsicDot(const CallExpr *);
@@ -446,6 +487,9 @@ private:
 
   /// Processes the 'rcp' intrinsic function.
   SpirvInstruction *processIntrinsicRcp(const CallExpr *);
+
+  /// Processes the 'ReadClock' intrinsic function.
+  SpirvInstruction *processIntrinsicReadClock(const CallExpr *);
 
   /// Processes the 'sign' intrinsic function for float types.
   /// The FSign instruction in the GLSL instruction set returns a floating point
@@ -505,6 +549,15 @@ private:
   /// Processes the NonUniformResourceIndex intrinsic function.
   SpirvInstruction *processIntrinsicNonUniformResourceIndex(const CallExpr *);
 
+  /// Processes the SM 6.6 pack_{s|u}8 and pack_clamp_{s|u}8 intrinsic
+  /// functions.
+  SpirvInstruction *processIntrinsic8BitPack(const CallExpr *,
+                                             hlsl::IntrinsicOp);
+
+  /// Processes the SM 6.6 unpack_{s|u}8{s|u}{16|32} intrinsic functions.
+  SpirvInstruction *processIntrinsic8BitUnpack(const CallExpr *,
+                                               hlsl::IntrinsicOp);
+
   /// Process builtins specific to raytracing.
   SpirvInstruction *processRayBuiltins(const CallExpr *, hlsl::IntrinsicOp op);
 
@@ -512,6 +565,19 @@ private:
   SpirvInstruction *processReportHit(const CallExpr *);
   void processCallShader(const CallExpr *callExpr);
   void processTraceRay(const CallExpr *callExpr);
+
+  /// Process amplification shader intrinsics.
+  void processDispatchMesh(const CallExpr *callExpr);
+
+  /// Process mesh shader intrinsics.
+  void processMeshOutputCounts(const CallExpr *callExpr);
+
+  /// Process ray query traceinline intrinsics.
+  SpirvInstruction *processTraceRayInline(const CXXMemberCallExpr *expr);
+
+  /// Process ray query intrinsics
+  SpirvInstruction *processRayQueryIntrinsics(const CXXMemberCallExpr *expr,
+                                              hlsl::IntrinsicOp opcode);
 
 private:
   /// Returns the <result-id> for constant value 0 of the given type.
@@ -617,6 +683,12 @@ private:
   /// HLSL attributes of the entry point function.
   void processComputeShaderAttributes(const FunctionDecl *entryFunction);
 
+  /// \brief Adds necessary execution modes for the mesh/amplification shader
+  /// based on the HLSL attributes of the entry point function.
+  bool
+  processMeshOrAmplificationShaderAttributes(const FunctionDecl *decl,
+                                             uint32_t *outVerticesArraySize);
+
   /// \brief Emits a wrapper function for the entry function and returns true
   /// on success.
   ///
@@ -640,6 +712,7 @@ private:
   /// variables for some cases.
   bool emitEntryFunctionWrapperForRayTracing(const FunctionDecl *entryFunction,
                                              SpirvFunction *entryFuncId);
+
   /// \brief Performs the following operations for the Hull shader:
   /// * Creates an output variable which is an Array containing results for all
   /// control points.
@@ -768,12 +841,11 @@ private:
   /// declaration for the Buffer/Texture object.
   /// If residencyCodeId is not zero,  the SPIR-V instruction for storing the
   /// resulting residency code will also be emitted.
-  SpirvInstruction *processBufferTextureLoad(const Expr *object,
-                                             SpirvInstruction *location,
-                                             SpirvInstruction *constOffset,
-                                             SpirvInstruction *varOffset,
-                                             SpirvInstruction *lod,
-                                             SpirvInstruction *residencyCode);
+  SpirvInstruction *
+  processBufferTextureLoad(const Expr *object, SpirvInstruction *location,
+                           SpirvInstruction *constOffset,
+                           SpirvInstruction *varOffset, SpirvInstruction *lod,
+                           SpirvInstruction *residencyCode, SourceLocation loc);
 
   /// \brief Processes .Sample() and .Gather() method calls for texture objects.
   SpirvInstruction *processTextureSampleGather(const CXXMemberCallExpr *expr,
@@ -900,7 +972,8 @@ private:
   /// \brief Emulates GetSamplePosition() for standard sample settings, i.e.,
   /// with 1, 2, 4, 8, or 16 samples. Returns float2(0) for other cases.
   SpirvInstruction *emitGetSamplePosition(SpirvInstruction *sampleCount,
-                                          SpirvInstruction *sampleIndex);
+                                          SpirvInstruction *sampleIndex,
+                                          SourceLocation loc);
 
 private:
   /// \brief Takes a vector of size 4, and returns a vector of size 1 or 2 or 3
@@ -910,7 +983,8 @@ private:
   /// Panics if the target vector size is not 1, 2, 3, or 4.
   SpirvInstruction *extractVecFromVec4(SpirvInstruction *fromInstr,
                                        uint32_t targetVecSize,
-                                       QualType targetElemType);
+                                       QualType targetElemType,
+                                       SourceLocation loc);
 
   /// \brief Creates SPIR-V instructions for sampling the given image.
   /// It utilizes the ModuleBuilder's createImageSample and it ensures that the
@@ -926,11 +1000,8 @@ private:
                     std::pair<SpirvInstruction *, SpirvInstruction *> grad,
                     SpirvInstruction *constOffset, SpirvInstruction *varOffset,
                     SpirvInstruction *constOffsets, SpirvInstruction *sample,
-                    SpirvInstruction *minLod,
-                    SpirvInstruction *residencyCodeId);
-
-  /// \brief Emit an OpLine instruction for the given source location.
-  void emitDebugLine(SourceLocation);
+                    SpirvInstruction *minLod, SpirvInstruction *residencyCodeId,
+                    SourceLocation loc);
 
 private:
   /// \brief If the given FunctionDecl is not already in the workQueue, creates
@@ -940,7 +1011,25 @@ private:
                               const clang::FunctionDecl *,
                               bool isEntryFunction);
 
-private:
+  /// \brief Helper function to run SPIRV-Tools optimizer's performance passes.
+  /// Runs the SPIRV-Tools optimizer on the given SPIR-V module |mod|, and
+  /// gets the info/warning/error messages via |messages|.
+  /// Returns true on success and false otherwise.
+  bool spirvToolsOptimize(std::vector<uint32_t> *mod, std::string *messages);
+
+  /// \brief Helper function to run SPIRV-Tools optimizer's legalization passes.
+  /// Runs the SPIRV-Tools legalization on the given SPIR-V module |mod|, and
+  /// gets the info/warning/error messages via |messages|.
+  /// Returns true on success and false otherwise.
+  bool spirvToolsLegalize(std::vector<uint32_t> *mod, std::string *messages);
+
+  /// \brief Helper function to run the SPIRV-Tools validator.
+  /// Runs the SPIRV-Tools validator on the given SPIR-V module |mod|, and
+  /// gets the info/warning/error messages via |messages|.
+  /// Returns true on success and false otherwise.
+  bool spirvToolsValidate(std::vector<uint32_t> *mod, std::string *messages);
+
+public:
   /// \brief Wrapper method to create a fatal error message and report it
   /// in the diagnostic engine associated with this consumer.
   template <unsigned N>
@@ -1049,6 +1138,10 @@ private:
   /// Note: legalization specific code
   bool needsLegalization;
 
+  /// Whether the translated SPIR-V binary passes --before-hlsl-legalization
+  /// option to spirv-val because of illegal function parameter scope.
+  bool beforeHlslLegalization;
+
   /// Mapping from methods to the decls to represent their implicit object
   /// parameters
   ///
@@ -1095,11 +1188,16 @@ private:
   /// HitAttributeNV.
   llvm::SmallDenseMap<QualType,
                       std::pair<SpirvInstruction *, SpirvInstruction *>, 4>
-      payloadMap;
+      rayPayloadMap;
   llvm::SmallDenseMap<QualType, SpirvInstruction *, 4> hitAttributeMap;
   llvm::SmallDenseMap<QualType,
                       std::pair<SpirvInstruction *, SpirvInstruction *>, 4>
       callDataMap;
+
+  /// Incoming ray payload for current entry function being translated.
+  /// Only valid for any-hit/closest-hit ray tracing shaders.
+  SpirvInstruction *currentRayPayload;
+
   /// This is the Patch Constant Function. This function is not explicitly
   /// called from the entry point function.
   FunctionDecl *patchConstFunc;
