@@ -90,7 +90,7 @@ public:
   }
   void addVariable(SpirvVariable *);
   void addBasicBlock(SpirvBasicBlock *);
-
+  bool isDeclaration() const { return basicBlocks.empty(); }
   /// Legalization-specific code
   ///
   /// Note: the following methods are used for properly handling aliasing.

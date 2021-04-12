@@ -316,8 +316,8 @@ inline const FunctionDecl *getCalleeDefinition(const CallExpr *expr) {
     return callee;
 
   // We need to update callee to the actual definition here
-  if (!callee->isDefined(callee))
-    return nullptr;
+  // if (!callee->isDefined(callee))
+  //  return nullptr;
 
   return callee;
 }
@@ -572,7 +572,7 @@ void SpirvEmitter::HandleTranslationUnit(ASTContext &context) {
           addFunctionToWorkQueue(getShaderModelKind(shaderAttr->getStage()),
                                  funcDecl, /*isEntryFunction*/ true);
           numEntryPoints++;
-        } else if (funcDecl->getAttr<HLSLExportAttr>()) {
+        } else /*if (funcDecl->getAttr<HLSLExportAttr>())*/ {
           addFunctionToWorkQueue(spvContext.getCurrentShaderModelKind(),
                                  funcDecl, /*isEntryFunction*/ false);
         }
@@ -611,7 +611,7 @@ void SpirvEmitter::HandleTranslationUnit(ASTContext &context) {
   // 'shader' attribute, and must therefore be entry functions.
   assert(numEntryPoints <= workQueue.size());
 
-  for (uint32_t i = 0; i < numEntryPoints; ++i) {
+  for (uint32_t i = 0; i < workQueue.size(); ++i) if(workQueue[i]->isEntryFunction) {
     // TODO: assign specific StageVars w.r.t. to entry point
     const FunctionInfo *entryInfo = workQueue[i];
     assert(entryInfo->isEntryFunction);
@@ -708,7 +708,7 @@ void SpirvEmitter::doDecl(const Decl *decl) {
       // Note: We only emit functions as they are discovered through the call
       // graph starting from the entry-point. We should not emit unused
       // functions inside namespaces.
-      if (!isa<FunctionDecl>(subDecl))
+      // if (!isa<FunctionDecl>(subDecl))
         doDecl(subDecl);
   } else if (const auto *funcDecl = dyn_cast<FunctionDecl>(decl)) {
     doFunctionDecl(funcDecl);
@@ -1031,11 +1031,11 @@ SpirvInstruction *SpirvEmitter::castToType(SpirvInstruction *value,
 
 void SpirvEmitter::doFunctionDecl(const FunctionDecl *decl) {
   // Forward declaration of a function inside another.
-  if(!decl->isThisDeclarationADefinition()) {
-    addFunctionToWorkQueue(spvContext.getCurrentShaderModelKind(), decl,
-                           /*isEntryFunction*/ false);
-    return;
-  }
+  // if(!decl->isThisDeclarationADefinition()) {
+  //   addFunctionToWorkQueue(spvContext.getCurrentShaderModelKind(), decl,
+  //                          /*isEntryFunction*/ false);
+  //   return;
+  // }
 
   // A RAII class for maintaining the current function under traversal.
   class FnEnvRAII {
