@@ -23,17 +23,21 @@
 #include "dxc/DXIL/DxilOperations.h"
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/DiagnosticPrinter.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/AssemblyAnnotationWriter.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/Support/FormattedStream.h"
 #include "llvm/Support/Format.h"
+#include <assert.h> // Needed for DxilPipelineStateValidation.h
 #include "dxc/DxilContainer/DxilPipelineStateValidation.h"
 #include "dxc/DxilContainer/DxilContainer.h"
 #include "dxc/DxilContainer/DxilRuntimeReflection.h"
-#include "dxc/DxilContainer/DxilContainerReader.h"
 #include "dxc/HLSL/ComputeViewIdState.h"
 #include "dxc/Support/FileIOHelper.h"
 #include "dxc/DXIL/DxilUtil.h"
 #include "dxcutil.h"
+#include "dxc/DXIL/DxilInstructions.h"
+#include "dxc/DXIL/DxilResourceProperties.h"
 
 using namespace llvm;
 using namespace hlsl;
@@ -335,7 +339,14 @@ PCSTR g_pFeatureInfoNames[] = {
     "Use native low precision",
     "Shading Rate",
     "Raytracing tier 1.1 features",
-    "Sampler feedback"
+    "Sampler feedback",
+    "64-bit Atomics on Typed Resources",
+    "64-bit Atomics on Group Shared",
+    "Derivatives in mesh and amplification shaders",
+    "Resource descriptor heap indexing",
+    "Sampler descriptor heap indexing",
+    "<RESERVED>",
+    "64-bit Atomics on Heap Resources",
 };
 static_assert(_countof(g_pFeatureInfoNames) == ShaderFeatureInfoCount, "g_pFeatureInfoNames needs to be updated");
 
@@ -412,7 +423,7 @@ void PrintResourceDim(DxilResourceBase &res, unsigned alignment,
       DxilResource *pRes = static_cast<DxilResource *>(&res);
       std::string dimName = res.GetResDimName();
       if (pRes->GetSampleCount())
-        dimName += pRes->GetSampleCount();
+        dimName += std::to_string(pRes->GetSampleCount());
       OS << right_justify(dimName, alignment);
     } break;
     default:
@@ -947,7 +958,7 @@ void PrintStructBufferDefinition(DxilResource *buf,
   llvm::Type *RetTy = buf->GetRetType();
   // Skip none struct type.
   if (!RetTy->isStructTy() || HLMatrixType::isa(RetTy)) {
-    llvm::Type *Ty = buf->GetGlobalSymbol()->getType()->getPointerElementType();
+    llvm::Type *Ty = buf->GetHLSLType()->getPointerElementType();
     // For resource array, use element type.
     if (Ty->isArrayTy())
       Ty = Ty->getArrayElementType();
@@ -986,7 +997,7 @@ void PrintStructBufferDefinition(DxilResource *buf,
 void PrintTBufferDefinition(DxilResource *buf, DxilTypeSystem &typeSys,
                                    raw_string_ostream &OS, StringRef comment) {
   const unsigned offsetIndent = 50;
-  llvm::Type *Ty = buf->GetGlobalSymbol()->getType()->getPointerElementType();
+  llvm::Type *Ty = buf->GetHLSLType()->getPointerElementType();
   // For TextureBuffer<> buf[2], the array size is in Resource binding count
   // part.
   if (Ty->isArrayTy())
@@ -1012,7 +1023,7 @@ void PrintTBufferDefinition(DxilResource *buf, DxilTypeSystem &typeSys,
 void PrintCBufferDefinition(DxilCBuffer *buf, DxilTypeSystem &typeSys,
                                    raw_string_ostream &OS, StringRef comment) {
   const unsigned offsetIndent = 50;
-  llvm::Type *Ty = buf->GetGlobalSymbol()->getType()->getPointerElementType();
+  llvm::Type *Ty = buf->GetHLSLType()->getPointerElementType();
   // For ConstantBuffer<> buf[2], the array size is in Resource binding count
   // part.
   if (Ty->isArrayTy())
@@ -1276,14 +1287,175 @@ static const char *OpCodeSignatures[] = {
   "(rayQueryHandle,component)",  // RayQuery_CommittedObjectRayDirection
   "()",  // GeometryIndex
   "(rayQueryHandle)",  // RayQuery_CandidateInstanceContributionToHitGroupIndex
-  "(rayQueryHandle)"  // RayQuery_CommittedInstanceContributionToHitGroupIndex
+  "(rayQueryHandle)",  // RayQuery_CommittedInstanceContributionToHitGroupIndex
+  "(res,props)",  // AnnotateHandle
+  "(bind,index,nonUniformIndex)",  // CreateHandleFromBinding
+  "(index,samplerHeap,nonUniformIndex)",  // CreateHandleFromHeap
+  "(unpackMode,pk)",  // Unpack4x8
+  "(packMode,x,y,z,w)",  // Pack4x8
+  "()",  // IsHelperLane
+  "(srv,sampler,coord0,coord1,coord2,coord3,offset0,offset1,channel)",  // TextureGatherImm
+  "(srv,sampler,coord0,coord1,coord2,coord3,offset0,offset1,channel,compareVale)"  // TextureGatherCmpImm
 };
 // OPCODE-SIGS:END
+
+LPCSTR ResourceKindToString(DXIL::ResourceKind RK) {
+  switch (RK)
+  {
+  case DXIL::ResourceKind::Texture1D: return "Texture1D";
+  case DXIL::ResourceKind::Texture2D: return "Texture2D";
+  case DXIL::ResourceKind::Texture2DMS: return "Texture2DMS";
+  case DXIL::ResourceKind::Texture3D: return "Texture3D";
+  case DXIL::ResourceKind::TextureCube: return "TextureCube";
+  case DXIL::ResourceKind::Texture1DArray: return "Texture1DArray";
+  case DXIL::ResourceKind::Texture2DArray: return "Texture2DArray";
+  case DXIL::ResourceKind::Texture2DMSArray: return "Texture2DMSArray";
+  case DXIL::ResourceKind::TextureCubeArray: return "TextureCubeArray";
+  case DXIL::ResourceKind::TypedBuffer: return "TypedBuffer";
+  case DXIL::ResourceKind::RawBuffer: return "ByteAddressBuffer";
+  case DXIL::ResourceKind::StructuredBuffer: return "StructuredBuffer";
+  case DXIL::ResourceKind::CBuffer: return "CBuffer";
+  case DXIL::ResourceKind::Sampler: return "Sampler";
+  case DXIL::ResourceKind::TBuffer: return "TBuffer";
+  case DXIL::ResourceKind::RTAccelerationStructure: return "RTAccelerationStructure";
+  case DXIL::ResourceKind::FeedbackTexture2D: return "FeedbackTexture2D";
+  case DXIL::ResourceKind::FeedbackTexture2DArray: return "FeedbackTexture2DArray";
+  default:
+    return "<invalid ResourceKind>";
+  }
+}
+
+LPCSTR CompTypeToString(DXIL::ComponentType CompType) {
+  switch (CompType) {
+  case DXIL::ComponentType::I1: return "I1";
+  case DXIL::ComponentType::I16: return "I16";
+  case DXIL::ComponentType::U16: return "U16";
+  case DXIL::ComponentType::I32: return "I32";
+  case DXIL::ComponentType::U32: return "U32";
+  case DXIL::ComponentType::I64: return "I64";
+  case DXIL::ComponentType::U64: return "U64";
+  case DXIL::ComponentType::F16: return "F16";
+  case DXIL::ComponentType::F32: return "F32";
+  case DXIL::ComponentType::F64: return "F64";
+  case DXIL::ComponentType::SNormF16: return "SNormF16";
+  case DXIL::ComponentType::UNormF16: return "UNormF16";
+  case DXIL::ComponentType::SNormF32: return "SNormF32";
+  case DXIL::ComponentType::UNormF32: return "UNormF32";
+  case DXIL::ComponentType::SNormF64: return "SNormF64";
+  case DXIL::ComponentType::UNormF64: return "UNormF64";
+  default:
+    return "<invalid CompType>";
+  }
+}
+
+LPCSTR SamplerFeedbackTypeToString(DXIL::SamplerFeedbackType SFT) {
+  switch(SFT) {
+  case DXIL::SamplerFeedbackType::MinMip: return "MinMip";
+  case DXIL::SamplerFeedbackType::MipRegionUsed: return "MipRegionUsed";
+  default:
+    return "<invalid sampler feedback type>";
+  }
+}
+
+void PrintResourceProperties(DxilResourceProperties &RP,
+                             formatted_raw_ostream &OS) {
+  OS << "  resource: ";
+
+  if (RP.getResourceClass() == DXIL::ResourceClass::CBuffer) {
+    OS << "CBuffer";
+    return;
+  } else if (RP.getResourceClass() == DXIL::ResourceClass::SRV &&
+             RP.getResourceKind() == DXIL::ResourceKind::TBuffer) {
+    OS << "TBuffer";
+    return;
+  }
+
+  if (RP.getResourceClass() == DXIL::ResourceClass::Sampler) {
+    if (!RP.Basic.SamplerCmpOrHasCounter)
+      OS << "SamplerState";
+    else
+      OS << "SamplerComparisonState";
+    return;
+  }
+
+  bool bUAV = RP.isUAV();
+  LPCSTR RW = bUAV ? (RP.Basic.IsROV ? "ROV" : "RW") : "";
+  LPCSTR GC = bUAV && RP.Basic.IsGloballyCoherent ? "globallycoherent " : "";
+  LPCSTR COUNTER = bUAV && RP.Basic.SamplerCmpOrHasCounter ? ", counter" : "";
+
+  switch (RP.getResourceKind())
+  {
+  case DXIL::ResourceKind::Texture1D:
+  case DXIL::ResourceKind::Texture2D:
+  case DXIL::ResourceKind::Texture3D:
+  case DXIL::ResourceKind::TextureCube:
+  case DXIL::ResourceKind::Texture1DArray:
+  case DXIL::ResourceKind::Texture2DArray:
+  case DXIL::ResourceKind::TextureCubeArray:
+  case DXIL::ResourceKind::TypedBuffer:
+  case DXIL::ResourceKind::Texture2DMS:
+  case DXIL::ResourceKind::Texture2DMSArray:
+    OS << GC << RW << ResourceKindToString(RP.getResourceKind());
+    OS << "<";
+    if (RP.Typed.CompCount > 1)
+      OS << std::to_string(RP.Typed.CompCount) << "x";
+    OS << CompTypeToString(RP.getCompType())
+       << ">";
+    break;
+
+  case DXIL::ResourceKind::RawBuffer:
+    OS << GC << RW << ResourceKindToString(RP.getResourceKind());
+    break;
+
+  case DXIL::ResourceKind::StructuredBuffer:
+    OS << GC << RW << ResourceKindToString(RP.getResourceKind());
+    OS << "<stride=" << RP.StructStrideInBytes << COUNTER << ">";
+    break;
+
+  case DXIL::ResourceKind::RTAccelerationStructure:
+    OS << ResourceKindToString(RP.getResourceKind());
+    break;
+
+  case DXIL::ResourceKind::FeedbackTexture2D:
+  case DXIL::ResourceKind::FeedbackTexture2DArray:
+    OS << ResourceKindToString(RP.getResourceKind());
+    OS << "<" << SamplerFeedbackTypeToString(RP.SamplerFeedbackType) << ">";
+    break;
+
+  default:
+    OS << "<invalid resource properties>";
+    break;
+  }
+}
 
 class DxcAssemblyAnnotationWriter : public llvm::AssemblyAnnotationWriter {
 public:
   ~DxcAssemblyAnnotationWriter() {}
   void printInfoComment(const Value &V, formatted_raw_ostream &OS) override {
+    if (const Instruction *I = dyn_cast<Instruction>(&V)) {
+      if (isa<DbgInfoIntrinsic>(I)) {
+        DILocalVariable *Var = nullptr;
+        DIExpression *Expr = nullptr;
+        if (const DbgDeclareInst *DI = dyn_cast<DbgDeclareInst>(I)) {
+          Var = DI->getVariable();
+          Expr = DI->getExpression();
+        }
+        else if (const DbgValueInst *DI = dyn_cast<DbgValueInst>(I)) {
+          Var = DI->getVariable();
+          Expr = DI->getExpression();
+        }
+
+        if (Var && Expr) {
+          OS << " ; var:\"" << Var->getName() << "\"" << " ";
+          Expr->printAsBody(OS);
+        }
+      }
+      else {
+        DebugLoc Loc = I->getDebugLoc();
+        if (Loc && Loc.getLine() != 0)
+          OS << " ; line:" << Loc.getLine() << " col:" << Loc.getCol();
+      }
+    }
     const CallInst *CI = dyn_cast<const CallInst>(&V);
     if (!CI) {
       return;
@@ -1310,6 +1482,20 @@ public:
     DXIL::OpCode opcode = (DXIL::OpCode)opcodeVal;
     OS << "  ; " << hlsl::OP::GetOpCodeName(opcode)
        << OpCodeSignatures[opcodeVal];
+
+    // Add extra decoding for certain ops
+    switch (opcode) {
+    case DXIL::OpCode::AnnotateHandle: {
+      // Decode resource properties
+      DxilInst_AnnotateHandle AH(const_cast<CallInst*>(CI));
+      if (Constant *Props = dyn_cast<Constant>(AH.get_props())) {
+        DxilResourceProperties RP = resource_helper::loadPropsFromConstant(*Props);
+        PrintResourceProperties(RP, OS);
+      }
+    } break;
+    default:
+      break;
+    }
   }
 };
 
@@ -1541,6 +1727,10 @@ void PrintPipelineStateValidationRuntimeInfo(const char *pBuffer,
   case DXIL::ShaderKind::Invalid:
     // Nothing to print for these shader kinds.
     break;
+  }
+
+  if (pInfo->MinimumExpectedWaveLaneCount == pInfo->MaximumExpectedWaveLaneCount) {
+    OS << comment << " WaveSize=" << pInfo->MinimumExpectedWaveLaneCount << "\n";
   }
 
   OS << comment << "\n";

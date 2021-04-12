@@ -510,6 +510,10 @@ void DeclPrinter::VisitFunctionDecl(FunctionDecl *D) {
       llvm::raw_string_ostream POut(Proto);
       DeclPrinter ParamPrinter(POut, SubPolicy, Indentation);
       for (unsigned i = 0, e = D->getNumParams(); i != e; ++i) {
+        if (Policy.HLSLSuppressUniformParameters &&
+            Policy.LangOpts.HLSL &&
+            D->getParamDecl(i)->hasAttr<HLSLUniformAttr>())  // HLSL Change
+          continue;
         if (i) POut << ", ";
         ParamPrinter.VisitParmVarDecl(D->getParamDecl(i));
       }
@@ -1465,6 +1469,9 @@ void DeclPrinter::VisitHLSLUnusualAnnotation(const hlsl::UnusualAnnotation *UA) 
       if (ra->RegisterOffset) {
         Out << "[" << ra->RegisterOffset << "]";
       }
+      if (ra->RegisterSpace.hasValue() != 0) {
+        Out << ", space" << ra->RegisterSpace.getValue();
+      }
       Out << ")";
     }
     break;
@@ -1484,6 +1491,23 @@ void DeclPrinter::VisitHLSLUnusualAnnotation(const hlsl::UnusualAnnotation *UA) 
         Out << ".w";
         break;
       }
+    }
+    Out << ")";
+    break;
+  }
+  case hlsl::UnusualAnnotation::UA_PayloadAccessQualifier: {
+    const hlsl::PayloadAccessAnnotation *annotation =
+        cast<hlsl::PayloadAccessAnnotation>(UA);
+    Out << " : "
+        << (annotation->qualifier == hlsl::DXIL::PayloadAccessQualifier::Read
+                ? "read"
+                : "write")
+        << "(";
+    StringRef shaderStageNames[] = { "caller", "closesthit", "miss", "anyhit"};
+    for (unsigned i = 0; i < annotation->ShaderStages.size(); ++i) {
+      Out << shaderStageNames[static_cast<unsigned>(annotation->ShaderStages[i])];
+      if (i < annotation->ShaderStages.size() - 1)
+        Out << ", ";
     }
     Out << ")";
     break;

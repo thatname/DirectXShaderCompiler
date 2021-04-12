@@ -2739,8 +2739,17 @@ bool Sema::UseArgumentDependentLookup(const CXXScopeSpec &SS,
     return false;
 
   // Never if a scope specifier was provided.
-  if (SS.isSet())
-    return false;
+  if (SS.isSet()) {
+    // HLSL Change begins
+    // We want to be able to have intrinsics inside the "vk" namespace.
+    const bool isVkNamespace =
+        SS.getScopeRep() && SS.getScopeRep()->getAsNamespace() &&
+        SS.getScopeRep()->getAsNamespace()->getName() == "vk";
+
+    if (!isVkNamespace)
+    // HLSL Change ends
+      return false;
+  }
 
   // Only in C++ or ObjC++.
   if (!getLangOpts().CPlusPlus)
@@ -4116,6 +4125,16 @@ Sema::ActOnArraySubscriptExpr(Scope *S, Expr *base, SourceLocation lbLoc,
     if (result.isInvalid()) return ExprError();
     idx = result.get();
   }
+
+  // HLSL Change Starts - Check for subscript access of out indices
+  // Disallow component access for out indices for DXIL path. We still allow
+  // this in SPIR-V path.
+  if (getLangOpts().HLSL && !getLangOpts().SPIRV &&
+      base->getType()->isRecordType() && IsExprAccessingOutIndicesArray(base)) {
+    Diag(lbLoc, diag::err_hlsl_out_indices_array_incorrect_access);
+    return ExprError();
+  }
+  // HLSL Change Ends
 
   // Build an unanalyzed expression if either operand is type-dependent.
   if (getLangOpts().CPlusPlus &&
@@ -9441,7 +9460,10 @@ bool CheckForModifiableLvalue(Expr *E, SourceLocation Loc, Sema &S) { // HLSL Ch
   assert(!E->hasPlaceholderType(BuiltinType::PseudoObject));
   // HLSL Change Starts - check const for array subscript operator for HLSL vector/matrix
   if (S.Context.getLangOpts().HLSL && E->getStmtClass() == Stmt::CXXOperatorCallExprClass) {
-      // check if it's a vector or matrix
+    // check if it's a vector or matrix
+    const CXXOperatorCallExpr *expr = cast<CXXOperatorCallExpr>(E);
+    QualType qt = expr->getArg(0)->getType();
+    if ((hlsl::IsMatrixType(&S, qt) || hlsl::IsVectorType(&S, qt)))
       return HLSLCheckForModifiableLValue(E, Loc, S);
   }
   // HLSL Change Ends

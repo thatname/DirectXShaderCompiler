@@ -2895,6 +2895,12 @@ void CodeGenFunction::EmitCallArgs(CallArgList &Args,
     for (int I = ArgTypes.size() - 1; I >= 0; --I) {
       CallExpr::const_arg_iterator Arg = ArgBeg + I;
       EmitCallArg(Args, *Arg, ArgTypes[I]);
+      // HLSL Change begin.
+      RValue CallArg = Args.back().RV;
+      if (CallArg.isAggregate())
+        CGM.getHLSLRuntime().MarkCallArgumentTemp(*this, CallArg.getAggregateAddr(),
+                                                  ArgTypes[I]);
+      // HLSL Change end.
       EmitNonNullArgCheck(Args.back().RV, ArgTypes[I], Arg->getExprLoc(),
                           CalleeDecl, ParamsToSkip + I);
     }
@@ -2979,7 +2985,7 @@ void CodeGenFunction::EmitCallArg(CallArgList &args, const Expr *E,
           // RWBuffer<uint> buf;
           // InterlockedAdd(buf[0].r, 1);
           llvm::Value *V = LV.getAddress();
-          Ptr = Builder.CreateGEP(V, { Builder.getInt32(0) });
+          Ptr = Builder.CreateGEP(V, Builder.getInt32(0));
         } else {
           llvm::Value *V = LV.getExtVectorAddr();
           llvm::Constant *Elts = LV.getExtVectorElts();
@@ -3074,7 +3080,6 @@ void CodeGenFunction::EmitCallArg(CallArgList &args, const Expr *E,
     return;
   }
   // HLSL Change Ends.
-
   args.add(EmitAnyExprToTemp(E), type);
 }
 
@@ -3277,6 +3282,9 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
           UnusedReturnSize = size;
       }
     }
+    // HLSL Change begin.
+    CGM.getHLSLRuntime().MarkRetTemp(*this, SRetPtr, RetTy);
+    // HLSL Change end.
     if (IRFunctionArgs.hasSRetArg()) {
       IRCallArgs[IRFunctionArgs.getSRetArgNo()] = SRetPtr;
     } else {
@@ -3604,6 +3612,17 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
 
   llvm::CallSite CS;
   if (!InvokeDest) {
+    // HLSL changes begin
+    // When storing a matrix to memory, make sure to change its orientation to match in-memory
+    // orientation.
+    if (getLangOpts().HLSL && CGM.getHLSLRuntime().NeedHLSLMartrixCastForStoreOp(TargetDecl, IRCallArgs)) {
+      llvm::SmallVector<clang::QualType, 16> tyList;
+      for (CallArgList::const_iterator I = CallArgs.begin(), E = CallArgs.end(); I != E; ++I) {
+        tyList.emplace_back(I->Ty);
+      }
+      CGM.getHLSLRuntime().EmitHLSLMartrixCastForStoreOp(*this, IRCallArgs, tyList);
+    }
+    // HLSL changes end
     CS = Builder.CreateCall(Callee, IRCallArgs);
   } else {
     llvm::BasicBlock *Cont = createBasicBlock("invoke.cont");

@@ -87,8 +87,12 @@ STDMETHODIMP dxil_dia::DataSource::loadDataFromIStream(_In_ IStream *pInputIStre
     CComPtr<IStream> pIStream = pInputIStream;
     CComPtr<IDxcBlob> pContainer;
     if (SUCCEEDED(hlsl::pdb::LoadDataFromStream(m_pMalloc, pInputIStream, &pContainer))) {
-      hlsl::DxilPartHeader *PartHeader =
-        hlsl::GetDxilPartByType((hlsl::DxilContainerHeader *)pContainer->GetBufferPointer(), hlsl::DFCC_ShaderDebugInfoDXIL);
+      const hlsl::DxilContainerHeader *pContainerHeader = 
+        hlsl::IsDxilContainerLike(pContainer->GetBufferPointer(), pContainer->GetBufferSize());
+      if (!hlsl::IsValidDxilContainer(pContainerHeader, pContainer->GetBufferSize()))
+        return E_FAIL;
+      const hlsl::DxilPartHeader *PartHeader =
+        hlsl::GetDxilPartByType(pContainerHeader, hlsl::DFCC_ShaderDebugInfoDXIL);
       if (!PartHeader)
         return E_FAIL;
       CComPtr<IDxcBlobEncoding> pPinnedBlob;
@@ -152,6 +156,14 @@ STDMETHODIMP dxil_dia::DataSource::openSession(_COM_Outptr_ IDiaSession **ppSess
   *ppSession = nullptr;
   if (m_module.get() == nullptr)
     return E_FAIL;
+
+  ::llvm::sys::fs::MSFileSystem *msfPtr;
+  IFT(CreateMSFileSystemForDisk(&msfPtr));
+  std::unique_ptr<::llvm::sys::fs::MSFileSystem> msf(msfPtr);
+
+  ::llvm::sys::fs::AutoPerThreadSystem pts(msf.get());
+  IFTLLVM(pts.error_code());
+
   CComPtr<Session> pSession = Session::Alloc(DxcGetThreadMallocNoRef());
   IFROOM(pSession.p);
   pSession->Init(m_context, m_module, m_finder);

@@ -423,7 +423,7 @@ DxilResourceBase &GetResourceFromID(DxilModule &DM, DXIL::ResourceClass resClass
         break;
     default:
         ThrowFailure();
-        return *(DxilResourceBase*)nullptr;
+        llvm_unreachable("invalid resource class");
     }
 }
 
@@ -457,7 +457,7 @@ llvm::Value *DxilPatchShaderRecordBindings::GetAliasedDescriptorHeapHandle(Modul
     
     ViewKey key = {};
     key.ViewType = (unsigned int)resKind;
-    if (resKind == DXIL::ResourceKind::StructuredBuffer)
+    if (DXIL::IsStructuredBuffer(resKind))
     {
       key.StructuredStride = type->getPrimitiveSizeInBits();
     } else if (resKind != DXIL::ResourceKind::RawBuffer)
@@ -777,7 +777,7 @@ bool DxilPatchShaderRecordBindings::GetHandleInfo(
     shaderRegister = Resource->GetLowerBound();
     kind = Resource->GetKind();
     resClass = Resource->GetClass();
-    resType = Resource->GetGlobalSymbol()->getType()->getPointerElementType();
+    resType = Resource->GetHLSLType()->getPointerElementType();
   }
   return Resource != nullptr;
 }

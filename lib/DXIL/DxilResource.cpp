@@ -28,7 +28,8 @@ DxilResource::DxilResource()
 , m_SamplerFeedbackType((DXIL::SamplerFeedbackType)0)
 , m_bGloballyCoherent(false)
 , m_bHasCounter(false)
-, m_bROV(false) {
+, m_bROV(false)
+, m_bHasAtomic64Use(false) {
 }
 
 CompType DxilResource::GetCompType() const {
@@ -36,11 +37,20 @@ CompType DxilResource::GetCompType() const {
 }
 
 void DxilResource::SetCompType(const CompType CT) {
-  m_CompType = CT;
+  // Translate packed types to u32
+  switch(CT.GetKind()) {
+    case CompType::Kind::PackedS8x32:
+    case CompType::Kind::PackedU8x32:
+      m_CompType = CompType::getU32();
+      break;
+    default:
+      m_CompType = CT;
+      break;
+  }
 }
 
 Type *DxilResource::GetRetType() const {
-  Type *Ty = GetGlobalSymbol()->getType()->getPointerElementType();
+  Type *Ty = GetHLSLType()->getPointerElementType();
   // For resource array, use element type.
   while (Ty->isArrayTy())
     Ty = Ty->getArrayElementType();
@@ -138,6 +148,14 @@ bool DxilResource::IsTBuffer() const {
 
 bool DxilResource::IsFeedbackTexture() const {
   return GetKind() == Kind::FeedbackTexture2D || GetKind() == Kind::FeedbackTexture2DArray;
+}
+
+bool DxilResource::HasAtomic64Use() const {
+  return m_bHasAtomic64Use;
+}
+
+void DxilResource::SetHasAtomic64Use(bool b) {
+  m_bHasAtomic64Use = b;
 }
 
 unsigned DxilResource::GetNumCoords(Kind ResourceKind) {

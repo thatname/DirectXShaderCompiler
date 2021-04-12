@@ -22,6 +22,8 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Module.h"
 
+#include "PixPassHelpers.h"
+
 using namespace llvm;
 using namespace hlsl;
 
@@ -84,9 +86,13 @@ using namespace hlsl;
 // caller will than allocate a UAV that is twice the size and try again, up to a
 // predefined maximum.
 
-// Keep this in sync with the same-named value in the debugger application's
+// Keep these in sync with the same-named value in the debugger application's
 // WinPixShaderUtils.h
+
 constexpr uint64_t DebugBufferDumpingGroundSize = 64 * 1024;
+// The actual max size per record is much smaller than this, but it never
+// hurts to be generous.
+constexpr size_t CounterOffsetBeyondUsefulData = DebugBufferDumpingGroundSize / 2;
 
 // These definitions echo those in the debugger application's
 // debugshaderrecord.h file
@@ -222,6 +228,8 @@ private:
 
   Constant *m_OffsetMask = nullptr;
 
+  Constant *m_CounterOffset = nullptr;
+
   struct BuilderContext {
     Module &M;
     DxilModule &DM;
@@ -244,7 +252,6 @@ public:
 
 private:
   SystemValueIndices addRequiredSystemValues(BuilderContext &BC);
-  void addUAV(BuilderContext &BC);
   void addInvocationSelectionProlog(BuilderContext &BC,
                                     SystemValueIndices SVIndices);
   Value *addPixelShaderProlog(BuilderContext &BC, SystemValueIndices SVIndices);
@@ -257,7 +264,7 @@ private:
   void addInvocationStartMarker(BuilderContext &BC);
   void reserveDebugEntrySpace(BuilderContext &BC, uint32_t SpaceInDwords);
   void addStoreStepDebugEntry(BuilderContext &BC, StoreInst *Inst);
-  void addStepDebugEntry(BuilderContext &BC, Instruction *Inst);
+  void addStepDebugEntry(BuilderContext& BC, Instruction* Inst);
   void addStepDebugEntryValue(BuilderContext &BC, std::uint32_t InstNum,
                               Value *V, std::uint32_t ValueOrdinal,
                               Value *ValueOrdinalIndex);
@@ -540,52 +547,6 @@ DxilDebugInstrumentation::addPixelShaderProlog(BuilderContext &BC,
   return ComparePos;
 }
 
-void DxilDebugInstrumentation::addUAV(BuilderContext &BC) {
-  // Set up a UAV with structure of a single int
-  unsigned int UAVResourceHandle =
-      static_cast<unsigned int>(BC.DM.GetUAVs().size());
-  SmallVector<llvm::Type *, 1> Elements{Type::getInt32Ty(BC.Ctx)};
-  llvm::StructType *UAVStructTy =
-      llvm::StructType::create(Elements, "PIX_DebugUAV_Type");
-  std::unique_ptr<DxilResource> pUAV = llvm::make_unique<DxilResource>();
-  pUAV->SetGlobalName("PIX_DebugUAVName");
-  pUAV->SetGlobalSymbol(UndefValue::get(UAVStructTy->getPointerTo()));
-  pUAV->SetID(UAVResourceHandle);
-  pUAV->SetSpaceID(
-      (unsigned int)-2); // This is the reserved-for-tools register space
-  pUAV->SetSampleCount(1);
-  pUAV->SetGloballyCoherent(false);
-  pUAV->SetHasCounter(false);
-  pUAV->SetCompType(CompType::getI32());
-  pUAV->SetLowerBound(0);
-  pUAV->SetRangeSize(1);
-  pUAV->SetKind(DXIL::ResourceKind::RawBuffer);
-  pUAV->SetRW(true);
-
-  auto ID = BC.DM.AddUAV(std::move(pUAV));
-  assert(ID == UAVResourceHandle);
-
-  BC.DM.m_ShaderFlags.SetEnableRawAndStructuredBuffers(true);
-
-  // Create handle for the newly-added UAV
-  Function *CreateHandleOpFunc =
-      BC.HlslOP->GetOpFunc(DXIL::OpCode::CreateHandle, Type::getVoidTy(BC.Ctx));
-  Constant *CreateHandleOpcodeArg =
-      BC.HlslOP->GetU32Const((unsigned)DXIL::OpCode::CreateHandle);
-  Constant *UAVVArg = BC.HlslOP->GetI8Const(
-      static_cast<std::underlying_type<DxilResourceBase::Class>::type>(
-          DXIL::ResourceClass::UAV));
-  Constant *MetaDataArg = BC.HlslOP->GetU32Const(
-      ID); // position of the metadata record in the corresponding metadata list
-  Constant *IndexArg = BC.HlslOP->GetU32Const(0); //
-  Constant *FalseArg =
-      BC.HlslOP->GetI1Const(0); // non-uniform resource index: false
-  m_HandleForUAV = BC.Builder.CreateCall(
-      CreateHandleOpFunc,
-      {CreateHandleOpcodeArg, UAVVArg, MetaDataArg, IndexArg, FalseArg},
-      "PIX_DebugUAV_Handle");
-}
-
 void DxilDebugInstrumentation::addInvocationSelectionProlog(
     BuilderContext &BC, SystemValueIndices SVIndices) {
   auto ShaderModel = BC.DM.GetShaderModel();
@@ -623,6 +584,8 @@ void DxilDebugInstrumentation::addInvocationSelectionProlog(
                            InverseOffsetMultiplicand, "OffsetAddend");
   m_OffsetMask = BC.HlslOP->GetU32Const(UAVDumpingGroundOffset() - 1);
 
+  m_CounterOffset = BC.HlslOP->GetU32Const(UAVDumpingGroundOffset() + CounterOffsetBeyondUsefulData);
+
   m_SelectionCriterion = ParameterTestResult;
 }
 
@@ -640,7 +603,6 @@ void DxilDebugInstrumentation::reserveDebugEntrySpace(BuilderContext &BC,
       BC.HlslOP->GetU32Const((unsigned)OP::OpCode::AtomicBinOp);
   Constant *AtomicAdd =
       BC.HlslOP->GetU32Const((unsigned)DXIL::AtomicBinOpCode::Add);
-  Constant *Zero32Arg = BC.HlslOP->GetU32Const(0);
   UndefValue *UndefArg = UndefValue::get(Type::getInt32Ty(BC.Ctx));
 
   // so inc will be zero for uninteresting invocations:
@@ -651,13 +613,13 @@ void DxilDebugInstrumentation::reserveDebugEntrySpace(BuilderContext &BC,
   auto PreviousValue = BC.Builder.CreateCall(
       AtomicOpFunc,
       {
-          AtomicBinOpcode, // i32, ; opcode
-          m_HandleForUAV,  // %dx.types.Handle, ; resource handle
-          AtomicAdd, // i32, ; binary operation code : EXCHANGE, IADD, AND, OR,
-                     // XOR, IMIN, IMAX, UMIN, UMAX
-          Zero32Arg, // i32, ; coordinate c0: index in bytes
-          UndefArg,  // i32, ; coordinate c1 (unused)
-          UndefArg,  // i32, ; coordinate c2 (unused)
+          AtomicBinOpcode,  // i32, ; opcode
+          m_HandleForUAV,   // %dx.types.Handle, ; resource handle
+          AtomicAdd,        // i32, ; binary operation code : EXCHANGE, IADD, AND, OR,
+                            // XOR, IMIN, IMAX, UMIN, UMAX
+          m_CounterOffset,  // i32, ; coordinate c0: index in bytes
+          UndefArg,         // i32, ; coordinate c1 (unused)
+          UndefArg,         // i32, ; coordinate c2 (unused)
           IncrementForThisInvocation, // i32); increment value
       },
       "UAVIncResult");
@@ -800,30 +762,37 @@ void DxilDebugInstrumentation::addStepEntryForType(
   }
 }
 
-void DxilDebugInstrumentation::addStoreStepDebugEntry(BuilderContext &BC,
-                                                      StoreInst *Inst) {
-  std::uint32_t ValueOrdinalBase;
-  std::uint32_t UnusedValueOrdinalSize;
-  llvm::Value *ValueOrdinalIndex;
-  if (!pix_dxil::PixAllocaRegWrite::FromInst(Inst, &ValueOrdinalBase,
-                                             &UnusedValueOrdinalSize,
-                                             &ValueOrdinalIndex)) {
-    return;
-  }
+void DxilDebugInstrumentation::addStoreStepDebugEntry(BuilderContext& BC,
+    StoreInst* Inst) {
+    std::uint32_t ValueOrdinalBase;
+    std::uint32_t UnusedValueOrdinalSize;
+    llvm::Value* ValueOrdinalIndex;
+    if (!pix_dxil::PixAllocaRegWrite::FromInst(Inst, &ValueOrdinalBase,
+        &UnusedValueOrdinalSize,
+        &ValueOrdinalIndex)) {
+        return;
+    }
 
-  std::uint32_t InstNum;
-  if (!pix_dxil::PixDxilInstNum::FromInst(Inst, &InstNum)) {
-    return;
-  }
+    std::uint32_t InstNum;
+    if (!pix_dxil::PixDxilInstNum::FromInst(Inst, &InstNum)) {
+        return;
+    }
 
-  addStepDebugEntryValue(BC, InstNum, Inst->getValueOperand(), ValueOrdinalBase,
-                         ValueOrdinalIndex);
+    if (PIXPassHelpers::IsAllocateRayQueryInstruction(Inst->getValueOperand())) {
+        return;
+    }
+
+    addStepDebugEntryValue(BC, InstNum, Inst->getValueOperand(), ValueOrdinalBase,
+        ValueOrdinalIndex);
 }
 
 void DxilDebugInstrumentation::addStepDebugEntry(BuilderContext &BC,
                                                  Instruction *Inst) {
   if (Inst->getOpcode() == Instruction::OtherOps::PHI) {
     return;
+  }
+  if (PIXPassHelpers::IsAllocateRayQueryInstruction(Inst)) {
+      return;
   }
 
   if (auto *St = llvm::dyn_cast<llvm::StoreInst>(Inst)) {
@@ -943,7 +912,8 @@ bool DxilDebugInstrumentation::runOnModule(Module &M) {
 
   BuilderContext BC{M, DM, Ctx, HlslOP, Builder};
 
-  addUAV(BC);
+  m_HandleForUAV = PIXPassHelpers::CreateUAV(BC.DM, BC.Builder, 0, "PIX_DebugUAV_Handle");
+
   auto SystemValues = addRequiredSystemValues(BC);
   addInvocationSelectionProlog(BC, SystemValues);
   addInvocationStartMarker(BC);
@@ -961,7 +931,6 @@ bool DxilDebugInstrumentation::runOnModule(Module &M) {
     };
 
     std::map<BasicBlock *, std::vector<ValueAndPhi>> InsertableEdges;
-
     auto &Is = CurrentBlock.getInstList();
     for (auto &Inst : Is) {
       if (Inst.getOpcode() != Instruction::OtherOps::PHI) {

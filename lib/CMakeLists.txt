@@ -18,7 +18,8 @@ add_subdirectory(AsmParser)
 # add_subdirectory(LineEditor) # HLSL Change
 add_subdirectory(ProfileData)
 # add_subdirectory(Fuzzer) # HLSL Change
-# add_subdirectory(Passes) # HLSL Change
+add_subdirectory(Passes) # HLSL Change
+add_subdirectory(PassPrinters) # HLSL Change
 # add_subdirectory(LibDriver) # HLSL Change
 add_subdirectory(DxcSupport) # HLSL Change
 add_subdirectory(HLSL) # HLSL Change
@@ -30,3 +31,4 @@ if(WIN32) # HLSL Change
 endif(WIN32) # HLSL Change
 add_subdirectory(DxilRootSignature) # HLSL Change
 add_subdirectory(DxrFallback) # HLSL Change
+add_subdirectory(Miniz) # HLSL Change

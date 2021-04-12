@@ -29,6 +29,7 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Type.h"
 #include "CGHLSLRuntime.h" // HLSL Change
+#include "dxc/DXIL/DxilMetadataHelper.h" // HLSL Change
 using namespace clang;
 using namespace CodeGen;
 
@@ -142,9 +143,8 @@ void CodeGenFunction::EmitVarDecl(const VarDecl &D) {
   // HLSL Change Begin - treat local constant as static.
   // Global variable will be generated instead of alloca.
   if (D.getType().isConstQualified() && D.isLocalVarDecl()) {
-    llvm::Constant *Init = CGM.EmitConstantInit(D, this);
     // Only create global when has constant init.
-    if (Init) {
+    if (!isTrivialInitializer(D.getInit()) && CGM.EmitConstantInit(D, this)) {
       llvm::GlobalValue::LinkageTypes Linkage =
           CGM.getLLVMLinkageVarDefinition(&D, /*isConstant=*/false);
       return EmitStaticVarDecl(D, Linkage);
@@ -872,11 +872,10 @@ llvm::Value *CodeGenFunction::EmitLifetimeStart(uint64_t Size,
   // For now, only in optimized builds.
   if (CGM.getCodeGenOpts().OptimizationLevel == 0)
     return nullptr;
+
   // HLSL Change Begins
-  // Don't emit the intrinsic for hlsl for now.
-  // Enable this will require SROA_HLSL to support the intrinsic.
-  // Will do it later when support lifetime marker in HLSL.
-  if (CGM.getLangOpts().HLSL)
+  // Don't emit the intrinsic for hlsl for now unless it is explicitly enabled
+  if (!CGM.getCodeGenOpts().HLSLEnableLifetimeMarkers)
     return nullptr;
   // HLSL Change Ends
 
@@ -1788,6 +1787,7 @@ void CodeGenFunction::EmitParmDecl(const VarDecl &D, llvm::Value *Arg,
       // Otherwise, create a temporary to hold the value.
       llvm::AllocaInst *Alloc =
           CreateTempAlloca(ConvertTypeForMem(Ty), D.getName() + ".addr");
+      Alloc->setMetadata(hlsl::DxilMDHelper::kDxilTempAllocaMDName, llvm::MDTuple::get(Alloc->getContext(), {})); // HLSL Change
       Alloc->setAlignment(Align.getQuantity());
       DeclPtr = Alloc;
       DoStore = true;

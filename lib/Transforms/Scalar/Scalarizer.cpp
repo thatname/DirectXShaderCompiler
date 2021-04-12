@@ -316,7 +316,7 @@ Scatterer Scalarizer::scatter(Instruction *Point, Value *V) {
     auto InsertPoint = BB->begin();
     while (InsertPoint != BB->end() && isa<DbgInfoIntrinsic>(InsertPoint))
       InsertPoint++;
-    Scatterer(BB, InsertPoint, V, AllowFolding, &Scattered[V]);
+    return Scatterer(BB, InsertPoint, V, AllowFolding, &Scattered[V]);
     // HLSL Change - End
   }
   if (Instruction *VOp = dyn_cast<Instruction>(V)) {
@@ -331,6 +331,16 @@ Scatterer Scalarizer::scatter(Instruction *Point, Value *V) {
                      V, AllowFolding, &Scattered[V]);
 #endif // HLSL Change
   }
+  // HLSL Change - Begin
+  // Allow constant folding for Constant cases, so we don't
+  // put an instruction before a PHI node.
+  if (Constant *C = dyn_cast<Constant>(V)) {
+    if (isa<PHINode>(Point)) {
+      return Scatterer(Point->getParent(), Point,
+                    V, /* allowFolding */ true, &Scattered[V]);
+    }
+  }
+  // HLSL Change - End
   // In the fallback case, just put the scattered before Point and
   // keep the result local to Point.
   // return Scatterer(Point->getParent(), Point, V); // HLSL Change
@@ -393,7 +403,7 @@ void Scalarizer::transferMetadata(Instruction *Op, const ValueVector &CV) {
            MI != ME; ++MI)
         if (canTransferMetadata(MI->first))
           New->setMetadata(MI->first, MI->second);
-      New->setDebugLoc(Op->getDebugLoc());
+      //New->setDebugLoc(Op->getDebugLoc()); // HLSL Change
     }
   }
 }
@@ -719,7 +729,7 @@ bool Scalarizer::finish() {
   Module &M = *Gathered.front().first->getModule();
   LLVMContext &Ctx = M.getContext();
   const DataLayout &DL = M.getDataLayout();
-  bool HasDbgInfo = getDebugMetadataVersionFromModule(M) != 0;
+  bool HasDbgInfo = hasDebugInfo(M);
   // Map from an extract element inst to a Value which replaced it.
   DenseMap<Instruction *, Value*> EltMap;
   // HLSL Change Ends.

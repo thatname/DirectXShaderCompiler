@@ -54,6 +54,11 @@ public:
   CompilerInstance &getCompilerInstance() { return theCompilerInstance; }
   SpirvCodeGenOptions &getSpirvOptions() { return spirvOptions; }
 
+  /// \brief If DebugSource and DebugCompilationUnit for loc are already
+  /// created, we just return RichDebugInfo containing it. Otherwise,
+  /// create DebugSource and DebugCompilationUnit for loc and return it.
+  RichDebugInfo *getOrCreateRichDebugInfo(const SourceLocation &loc);
+
   void doDecl(const Decl *decl);
   void doStmt(const Stmt *stmt, llvm::ArrayRef<const Attr *> attrs = {});
   SpirvInstruction *doExpr(const Expr *expr);
@@ -106,6 +111,8 @@ private:
   SpirvInstruction *doInitListExpr(const InitListExpr *expr);
   SpirvInstruction *doMemberExpr(const MemberExpr *expr);
   SpirvInstruction *doUnaryOperator(const UnaryOperator *expr);
+  SpirvInstruction *
+  doUnaryExprOrTypeTraitExpr(const UnaryExprOrTypeTraitExpr *expr);
 
   /// Overload with pre computed SpirvEvalInfo.
   ///
@@ -403,6 +410,9 @@ private:
   /// Processes the 'mul' intrinsic function.
   SpirvInstruction *processIntrinsicMul(const CallExpr *);
 
+  /// Processes the 'printf' intrinsic function.
+  SpirvInstruction *processIntrinsicPrintf(const CallExpr *);
+
   /// Transposes a non-floating point matrix and returns the result-id of the
   /// transpose.
   SpirvInstruction *processNonFpMatrixTranspose(QualType matType,
@@ -478,6 +488,9 @@ private:
   /// Processes the 'rcp' intrinsic function.
   SpirvInstruction *processIntrinsicRcp(const CallExpr *);
 
+  /// Processes the 'ReadClock' intrinsic function.
+  SpirvInstruction *processIntrinsicReadClock(const CallExpr *);
+
   /// Processes the 'sign' intrinsic function for float types.
   /// The FSign instruction in the GLSL instruction set returns a floating point
   /// result. The HLSL sign function, however, returns an integer. An extra
@@ -536,6 +549,15 @@ private:
   /// Processes the NonUniformResourceIndex intrinsic function.
   SpirvInstruction *processIntrinsicNonUniformResourceIndex(const CallExpr *);
 
+  /// Processes the SM 6.6 pack_{s|u}8 and pack_clamp_{s|u}8 intrinsic
+  /// functions.
+  SpirvInstruction *processIntrinsic8BitPack(const CallExpr *,
+                                             hlsl::IntrinsicOp);
+
+  /// Processes the SM 6.6 unpack_{s|u}8{s|u}{16|32} intrinsic functions.
+  SpirvInstruction *processIntrinsic8BitUnpack(const CallExpr *,
+                                               hlsl::IntrinsicOp);
+
   /// Process builtins specific to raytracing.
   SpirvInstruction *processRayBuiltins(const CallExpr *, hlsl::IntrinsicOp op);
 
@@ -549,6 +571,13 @@ private:
 
   /// Process mesh shader intrinsics.
   void processMeshOutputCounts(const CallExpr *callExpr);
+
+  /// Process ray query traceinline intrinsics.
+  SpirvInstruction *processTraceRayInline(const CXXMemberCallExpr *expr);
+
+  /// Process ray query intrinsics
+  SpirvInstruction *processRayQueryIntrinsics(const CXXMemberCallExpr *expr,
+                                              hlsl::IntrinsicOp opcode);
 
 private:
   /// Returns the <result-id> for constant value 0 of the given type.
@@ -683,6 +712,7 @@ private:
   /// variables for some cases.
   bool emitEntryFunctionWrapperForRayTracing(const FunctionDecl *entryFunction,
                                              SpirvFunction *entryFuncId);
+
   /// \brief Performs the following operations for the Hull shader:
   /// * Creates an output variable which is an Array containing results for all
   /// control points.
@@ -980,6 +1010,24 @@ private:
   void addFunctionToWorkQueue(hlsl::DXIL::ShaderKind,
                               const clang::FunctionDecl *,
                               bool isEntryFunction);
+
+  /// \brief Helper function to run SPIRV-Tools optimizer's performance passes.
+  /// Runs the SPIRV-Tools optimizer on the given SPIR-V module |mod|, and
+  /// gets the info/warning/error messages via |messages|.
+  /// Returns true on success and false otherwise.
+  bool spirvToolsOptimize(std::vector<uint32_t> *mod, std::string *messages);
+
+  /// \brief Helper function to run SPIRV-Tools optimizer's legalization passes.
+  /// Runs the SPIRV-Tools legalization on the given SPIR-V module |mod|, and
+  /// gets the info/warning/error messages via |messages|.
+  /// Returns true on success and false otherwise.
+  bool spirvToolsLegalize(std::vector<uint32_t> *mod, std::string *messages);
+
+  /// \brief Helper function to run the SPIRV-Tools validator.
+  /// Runs the SPIRV-Tools validator on the given SPIR-V module |mod|, and
+  /// gets the info/warning/error messages via |messages|.
+  /// Returns true on success and false otherwise.
+  bool spirvToolsValidate(std::vector<uint32_t> *mod, std::string *messages);
 
 public:
   /// \brief Wrapper method to create a fatal error message and report it

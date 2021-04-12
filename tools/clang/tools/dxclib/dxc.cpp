@@ -41,6 +41,7 @@
 #include "dxc/Support/Unicode.h"
 #include "dxc/Support/WinIncludes.h"
 #include "dxc/Support/WinFunctions.h"
+#include "dxc/dxcerrors.h"
 #include "dxc.h"
 #include <vector>
 #include <string>
@@ -59,6 +60,7 @@
 #include "llvm/Option/ArgList.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
 #ifdef _WIN32
 #include <dia2.h>
 #include <comdef.h>
@@ -66,7 +68,9 @@
 #include <algorithm>
 #include <unordered_map>
 
+#ifdef _WIN32
 #pragma comment(lib, "version.lib")
+#endif
 
 // SPIRV Change Starts
 #ifdef ENABLE_SPIRV_CODEGEN
@@ -155,6 +159,7 @@ public:
                  std::wstring &outputPDBPath, CComPtr<IDxcBlob> &pDebugBlob,
                  IDxcOperationResult **pCompileResult);
   int DumpBinary();
+  int Link();
   void Preprocess();
   void GetCompilerVersionInfo(llvm::raw_string_ostream &OS);
 };
@@ -201,6 +206,64 @@ static void WriteDxcOutputToFile(DXC_OUT_KIND kind, IDxcResult *pResult, UINT32 
   }
 }
 
+static bool StringBlobEqualUtf16(IDxcBlobUtf16 *pBlob, const WCHAR *pStr) {
+  size_t uSize = wcslen(pStr);
+  if (pBlob && pBlob->GetStringLength() == uSize) {
+    return 0 == memcmp(pBlob->GetBufferPointer(), pStr, pBlob->GetBufferSize());
+  }
+  return false;
+}
+
+static void WriteDxcExtraOuputs(IDxcResult *pResult) {
+  DXC_OUT_KIND kind = DXC_OUT_EXTRA_OUTPUTS;
+  if (!pResult->HasOutput(kind)) {
+    return;
+  }
+
+  CComPtr<IDxcExtraOutputs> pOutputs;
+  CComPtr<IDxcBlobUtf16> pName;
+  IFT(pResult->GetOutput(kind, IID_PPV_ARGS(&pOutputs), &pName));
+
+  UINT32 uOutputCount = pOutputs->GetOutputCount();
+  for (UINT32 i = 0; i < uOutputCount; i++) {
+    CComPtr<IDxcBlobUtf16> pFileName;
+    CComPtr<IDxcBlobUtf16> pType;
+    CComPtr<IDxcBlob> pBlob;
+    IFT(pOutputs->GetOutput(i, IID_PPV_ARGS(&pBlob), &pType, &pFileName));
+
+    // Not a blob
+    if (!pBlob)
+      continue;
+
+    UINT32 uCodePage = CP_ACP;
+    CComPtr<IDxcBlobEncoding> pBlobEncoding;
+    if (SUCCEEDED(pBlob.QueryInterface(&pBlobEncoding))) {
+      BOOL bKnown = FALSE;
+      UINT32 uKnownCodePage = CP_ACP;
+      IFT(pBlobEncoding->GetEncoding(&bKnown, &uKnownCodePage));
+      if (bKnown) {
+        uCodePage = uKnownCodePage;
+      }
+    }
+
+    if (pFileName && pFileName->GetStringLength() > 0) {
+      if (StringBlobEqualUtf16(pFileName, DXC_EXTRA_OUTPUT_NAME_STDOUT)) {
+        if (uCodePage != CP_ACP) {
+          WriteBlobToConsole(pBlob, STD_OUTPUT_HANDLE);
+        }
+      }
+      else if (StringBlobEqualUtf16(pFileName, DXC_EXTRA_OUTPUT_NAME_STDERR)) {
+        if (uCodePage != CP_ACP) {
+          WriteBlobToConsole(pBlob, STD_ERROR_HANDLE);
+        }
+      }
+      else {
+        WriteBlobToFile(pBlob, pFileName->GetStringPointer(), uCodePage);
+      }
+    }
+  }
+}
+
 // This function is called either after the compilation is done or /dumpbin option is provided
 // Performing options that are used to process dxil container.
 int DxcContext::ActOnBlob(IDxcBlob *pBlob) {
@@ -232,9 +295,9 @@ int DxcContext::ActOnBlob(IDxcBlob *pBlob, IDxcBlob *pDebugBlob, LPCWSTR pDebugB
 
   // Extract and write the PDB/debug information.
   if (!m_Opts.DebugFile.empty()) {
-    IFTBOOLMSG(m_Opts.DebugInfo, E_INVALIDARG, "/Fd specified, but no Debug Info was "
+    IFTBOOLMSG(m_Opts.GeneratePDB(), E_INVALIDARG, "/Fd specified, but no Debug Info was "
       "found in the shader, please use the "
-      "/Zi switch to generate debug "
+      "/Zi or /Zs switch to generate debug "
       "information compiling this shader.");
     if (pDebugBlob != nullptr) {
       IFTBOOLMSG(pDebugBlobName && *pDebugBlobName, E_INVALIDARG,
@@ -302,15 +365,22 @@ int DxcContext::ActOnBlob(IDxcBlob *pBlob, IDxcBlob *pDebugBlob, LPCWSTR pDebugB
 #endif // ENABLE_SPIRV_CODEGEN
   // SPIRV Change Ends
 
+  bool disassemblyWritten = false;
   if (!m_Opts.OutputHeader.empty()) {
     llvm::Twine varName = m_Opts.VariableName.empty()
                               ? llvm::Twine("g_", m_Opts.EntryPoint)
                               : m_Opts.VariableName;
     WriteHeader(pDisassembleResult, pBlob, varName,
                 StringRefUtf16(m_Opts.OutputHeader));
-  } else if (!m_Opts.AssemblyCode.empty()) {
+    disassemblyWritten = true;
+  }
+
+  if (!m_Opts.AssemblyCode.empty()) {
     WriteBlobToFile(pDisassembleResult, m_Opts.AssemblyCode, m_Opts.DefaultTextCodePage);
-  } else {
+    disassemblyWritten = true;
+  }
+
+  if (!disassemblyWritten) {
     WriteBlobToConsole(pDisassembleResult);
   }
   return retVal;
@@ -413,8 +483,8 @@ HRESULT DxcContext::ReadFileIntoPartContent(hlsl::DxilFourCC fourCC, LPCWSTR fil
     DWORD dataSize;
     hlsl::ReadBinaryFile(fileName, (void**)&pData, &dataSize);
     DXASSERT(pData != nullptr, "otherwise ReadBinaryFile should throw an exception");
-    hlsl::DxilContainerHeader *pHeader = (hlsl::DxilContainerHeader*) pData.m_pData;
-    IFRBOOL(hlsl::IsDxilContainerLike(pHeader, pHeader->ContainerSizeInBytes), E_INVALIDARG);
+    hlsl::DxilContainerHeader *pHeader = hlsl::IsDxilContainerLike(pData.m_pData, dataSize);
+    IFRBOOL(hlsl::IsValidDxilContainer(pHeader, dataSize), E_INVALIDARG);
     hlsl::DxilPartHeader *pPartHeader = hlsl::GetDxilPartByType(pHeader, hlsl::DxilFourCC::DFCC_RootSignature);
     IFRBOOL(pPartHeader != nullptr, E_INVALIDARG);
     hlsl::DxcCreateBlobOnHeapCopy(hlsl::GetDxilPartData(pPartHeader), pPartHeader->PartSize, &pResult);
@@ -546,7 +616,12 @@ public:
     _COM_Outptr_result_maybenull_ IDxcBlob **ppIncludeSource
   ) override {
     try {
-      *ppIncludeSource = includeFiles.at(std::wstring(pFilename));
+      // Convert pFilename into native form for indexing as is done when the MD is created
+      std::string FilenameStr8 = Unicode::UTF16ToUTF8StringOrThrow(pFilename);
+      llvm::SmallString<128> NormalizedPath;
+      llvm::sys::path::native(FilenameStr8, NormalizedPath);
+      std::wstring FilenameStr16 = Unicode::UTF8ToUTF16StringOrThrow(NormalizedPath.c_str());
+      *ppIncludeSource = includeFiles.at(FilenameStr16);
       (*ppIncludeSource)->AddRef();
     }
     CATCH_CPP_RETURN_HRESULT()
@@ -561,147 +636,68 @@ void DxcContext::Recompile(IDxcBlob *pSource, IDxcLibrary *pLibrary,
                            IDxcOperationResult **ppCompileResult) {
 // Recompile currently only supported on Windows
 #ifdef _WIN32
-  CComPtr<IDxcBlob> pTargetBlob;
-  IFT(FindModuleBlob(hlsl::DxilFourCC::DFCC_ShaderDebugInfoDXIL, pSource, pLibrary, &pTargetBlob));
-  // Retrieve necessary data from DIA symbols for recompiling
-  CComPtr<IDiaTable> pSymbolTable;
-  IFT(GetDxcDiaTable(pLibrary, pTargetBlob, &pSymbolTable, L"Symbols"));
-  IFTARG(pSymbolTable != nullptr);
-  std::wstring Arguments;   // Backing storage for blob arguments
-  std::wstring BlobDefines; // Backing storage for blob defines
-  std::string EntryPoint = m_Opts.EntryPoint;
-  std::string TargetProfile = m_Opts.TargetProfile;
-  std::vector<LPCWSTR> ConcatArgs;      // Blob arguments + command-line arguments
-  std::vector<DxcDefine> ConcatDefines; // Blob defines + command-line defines
-  CComBSTR pMainFileName;
-  ULONG fetched;
-  for (;;) {
-    CComPtr<IUnknown> pSymbolUnk;
-    CComPtr<IDiaSymbol> pSymbol;
-    DWORD symTag;
-    IFT(pSymbolTable->Next(1, &pSymbolUnk, &fetched));
-    if (fetched == 0) {
-      break;
-    }
-    IFT(pSymbolUnk->QueryInterface(&pSymbol));
-    IFT(pSymbol->get_symTag(&symTag));
+  CComPtr<IDxcPdbUtils> pPdbUtils;
+  IFT(CreateInstance(CLSID_DxcPdbUtils, &pPdbUtils));
+  IFT(pPdbUtils->Load(pSource));
 
-    CComBSTR pName;
-    pSymbol->get_name(&pName);
+  UINT32 uNumFlags = 0;
+  IFT(pPdbUtils->GetFlagCount(&uNumFlags));
+  std::vector<const WCHAR *> NewArgs;
+  std::vector<std::wstring> NewArgsStorage;
+  for (UINT32 i = 0; i < uNumFlags; i++) {
+    CComBSTR pFlag;
+    IFT(pPdbUtils->GetFlag(i, &pFlag));
+    NewArgsStorage.push_back(std::wstring(pFlag));
+  }
+  for (const std::wstring &flag : NewArgsStorage)
+    NewArgs.push_back(flag.c_str());
 
-    if (symTag == SymTagCompiland && wcseq(pName, L"main")) {
-      pMainFileName.Empty();
-      IFT(pSymbol->get_sourceFileName(&pMainFileName));
-      continue;
-    }
+  UINT32 uNumDefines = 0;
+  IFT(pPdbUtils->GetDefineCount(&uNumDefines));
+  std::vector<std::wstring> NewDefinesStorage;
+  std::vector<DxcDefine> NewDefines;
+  for (UINT32 i = 0; i < uNumDefines; i++) {
+    CComBSTR pDefine;
+    IFT(pPdbUtils->GetDefine(i, &pDefine));
+    NewDefinesStorage.push_back(std::wstring(pDefine));
+  }
+  for (std::wstring &Define : NewDefinesStorage) {
+    wchar_t *pDefineStart = &Define[0];
+    wchar_t *pDefineEnd = pDefineStart + Define.size();
 
-    // Check for well-known compiland environment values (name/value pairs).
-    if (symTag != SymTagCompilandEnv) {
-      continue;
-    }
-
-    CComVariant pVariant;
-    IFT(pSymbol->get_value(&pVariant));
-    if (EntryPoint.empty() && wcseq(pName, L"hlslEntry")) {
-      IFTARG(VARENUM::VT_BSTR == pVariant.vt);
-      EntryPoint = Unicode::UTF16ToUTF8StringOrThrow(pVariant.bstrVal);
-      continue;
-    }
-    if (TargetProfile.empty() && wcseq(pName, L"hlslTarget")) {
-      IFTARG(VARENUM::VT_BSTR == pVariant.vt);
-      TargetProfile = Unicode::UTF16ToUTF8StringOrThrow(pVariant.bstrVal);
-      continue;
-    }
-    if (wcseq(pName, L"hlslArguments")) {
-      IFTARG(VARENUM::VT_BSTR == pVariant.vt);
-      Arguments = pVariant.bstrVal;
-      continue;
-    }
-
-    if (wcseq(pName, L"hlslDefines")) {
-      IFTARG(VARENUM::VT_BSTR == pVariant.vt);
-      // Parsing double null terminated string of defines into ConcatDefines.
-      BlobDefines = std::wstring(pVariant.bstrVal, SysStringLen(pVariant.bstrVal));
-      ConcatDefines.clear();
-      LPWSTR Defines = const_cast<wchar_t *>(BlobDefines.data());
-      UINT32 begin = 0;
-      for (UINT32 i = 0;; ++i) {
-        if (Defines[i] != L'\0') {
-          continue;
-        }
-        if (begin != i) {
-          wchar_t *pDefineStart = Defines + begin;
-          wchar_t *pDefineEnd = Defines + i;
-          DxcDefine D;
-          D.Name = Defines + begin;
-          D.Value = nullptr;
-          for (wchar_t *pCursor = pDefineStart; pCursor < pDefineEnd+ i; ++pCursor) {
-            if (*pCursor == L'=') {
-              *pCursor = L'\0';
-              D.Value = (pCursor + 1);
-              break;
-            }
-          }
-          ConcatDefines.push_back(D);
-        }
-        if (Defines[i + 1] == L'\0') {
-          break;
-        }
-        begin = i + 1;
+    DxcDefine D = {};
+    D.Name = pDefineStart;
+    D.Value = nullptr;
+    for (wchar_t *pCursor = pDefineStart; pCursor < pDefineEnd; ++pCursor) {
+      if (*pCursor == L'=') {
+        *pCursor = L'\0';
+        D.Value = (pCursor + 1);
+        break;
       }
     }
+    NewDefines.push_back(D);
   }
 
-  // Extracting file content from the blob
-  CComPtr<IDiaTable> pInjectedSourceTable;
-  IFT(GetDxcDiaTable(pLibrary, pTargetBlob, &pInjectedSourceTable, L"InjectedSource"));
-  IFTARG(pInjectedSourceTable != nullptr);
+  CComBSTR pMainFileName;
+  CComBSTR pTargetProfile;
+  CComBSTR pEntryPoint;
+  IFT(pPdbUtils->GetMainFileName(&pMainFileName));
+  IFT(pPdbUtils->GetTargetProfile(&pTargetProfile));
+  IFT(pPdbUtils->GetEntryPoint(&pEntryPoint));
+
   CComPtr<IDxcBlobEncoding> pCompileSource;
   CComPtr<DxcIncludeHandlerForInjectedSources> pIncludeHandler = new DxcIncludeHandlerForInjectedSources();
-  for (;;) {
-    CComPtr<IUnknown> pInjectedSourcesUnk;
-    ULONG fetched;
-    IFT(pInjectedSourceTable->Next(1, &pInjectedSourcesUnk, &fetched));
-    if (fetched == 0) {
-      break;
-    }
-    CComPtr<IDiaInjectedSource> pInjectedSource;
-    IFT(pInjectedSourcesUnk->QueryInterface(&pInjectedSource));
-
-    // Retrieve source from InjectedSource
-    ULONGLONG dataLenLL;
-    DWORD dataLen;
-    IFT(pInjectedSource->get_length(&dataLenLL));
-    IFT(ULongLongToDWord(dataLenLL, &dataLen));
-
-    CComHeapPtr<BYTE> heapCopy;
-    if (!heapCopy.AllocateBytes(dataLen)) {
-      throw ::hlsl::Exception(E_OUTOFMEMORY);
-    }
-    CComPtr<IMalloc> pIMalloc;
-    IFT(CoGetMalloc(1, &pIMalloc));
-    IFT(pInjectedSource->get_source(dataLen, &dataLen, heapCopy.m_pData));
-
-    // Get file name for this injected source
+  UINT32 uSourceCount = 0;
+  IFT(pPdbUtils->GetSourceCount(&uSourceCount));
+  for (UINT32 i = 0; i < uSourceCount; i++) {
+    CComPtr<IDxcBlobEncoding> pSourceFile;
     CComBSTR pFileName;
-    IFT(pInjectedSource->get_filename(&pFileName));
-    IFTARG(pFileName);
-
-    CComPtr<IDxcBlobEncoding> pBlobEncoding;
-    IFT(pLibrary->CreateBlobWithEncodingOnMalloc(heapCopy.Detach(), pIMalloc, dataLen, CP_UTF8, &pBlobEncoding));
-    IFT(pIncludeHandler->insertIncludeFile(pFileName, pBlobEncoding, dataLen));
-    // Check if this file is the main file or included file
-    if (wcscmp(pFileName, pMainFileName) == 0) {
-      pCompileSource.Attach(pBlobEncoding.Detach());
+    IFT(pPdbUtils->GetSource(i, &pSourceFile));
+    IFT(pPdbUtils->GetSourceName(i, &pFileName));
+    IFT(pIncludeHandler->insertIncludeFile(pFileName, pSourceFile, 0));
+    if (pMainFileName == pFileName) {
+      pCompileSource.Attach(pSourceFile);
     }
-  }
-
-  // Append arguments and defines from the command-line specification.
-  for (LPCWSTR &A : args) {
-    ConcatArgs.push_back(A);
-  }
-  for (DxcDefine &D : m_Opts.Defines.DefineVector) {
-    ConcatDefines.push_back(D);
   }
 
   CComPtr<IDxcOperationResult> pResult;
@@ -712,19 +708,18 @@ void DxcContext::Recompile(IDxcBlob *pSource, IDxcLibrary *pLibrary,
     Unicode::UTF8ToUTF16String(m_Opts.DebugFile.str().c_str(), &outputPDBPath);
     IFT(pCompiler->QueryInterface(&pCompiler2));
     IFT(pCompiler2->CompileWithDebug(
-        pCompileSource, pMainFileName, StringRefUtf16(EntryPoint),
-        StringRefUtf16(TargetProfile), ConcatArgs.data(), ConcatArgs.size(),
-        ConcatDefines.data(), ConcatDefines.size(), pIncludeHandler, &pResult,
+        pCompileSource, pMainFileName, pEntryPoint,
+        pTargetProfile, NewArgs.data(), NewArgs.size(),
+        NewDefines.data(), NewDefines.size(), pIncludeHandler, &pResult,
         &pDebugName, &pDebugBlob));
     if (pDebugName.m_pData && m_Opts.DebugFileIsDirectory()) {
       outputPDBPath += pDebugName.m_pData;
     }
   } else {
     IFT(pCompiler->Compile(pCompileSource, pMainFileName,
-      StringRefUtf16(EntryPoint),
-      StringRefUtf16(TargetProfile), ConcatArgs.data(),
-      ConcatArgs.size(), ConcatDefines.data(),
-      ConcatDefines.size(), pIncludeHandler, &pResult));
+      pEntryPoint, pTargetProfile, NewArgs.data(),
+      NewArgs.size(), NewDefines.data(),
+      NewDefines.size(), pIncludeHandler, &pResult));
   }
 
   *ppCompileResult = pResult.Detach();
@@ -831,10 +826,66 @@ int DxcContext::Compile() {
         WriteDxcOutputToFile(DXC_OUT_ROOT_SIGNATURE, pResult, m_Opts.DefaultTextCodePage);
         WriteDxcOutputToFile(DXC_OUT_SHADER_HASH, pResult, m_Opts.DefaultTextCodePage);
         WriteDxcOutputToFile(DXC_OUT_REFLECTION, pResult, m_Opts.DefaultTextCodePage);
+        WriteDxcExtraOuputs(pResult);
       }
     }
   }
   return status;
+}
+
+int DxcContext::Link() {
+  CComPtr<IDxcLinker> pLinker;
+  IFT(CreateInstance(CLSID_DxcLinker, &pLinker));
+  llvm::StringRef InputFiles = m_Opts.InputFile;
+  llvm::StringRef InputFilesRef(InputFiles);
+  llvm::SmallVector<llvm::StringRef, 2> InputFileList;
+  InputFilesRef.split(InputFileList, ";");
+
+  std::vector<std::wstring> wInputFiles;
+  wInputFiles.reserve(InputFileList.size());
+  std::vector<LPCWSTR> wpInputFiles;
+  wpInputFiles.reserve(InputFileList.size());
+  for (auto &file : InputFileList) {
+    wInputFiles.emplace_back(StringRefUtf16(file.str()));
+    wpInputFiles.emplace_back(wInputFiles.back().c_str());
+    CComPtr<IDxcBlobEncoding> pLib;
+    ReadFileIntoBlob(m_dxcSupport, wInputFiles.back().c_str(), &pLib);
+    IFT(pLinker->RegisterLibrary(wInputFiles.back().c_str(), pLib));
+  }
+
+  CComPtr<IDxcOperationResult> pLinkResult;
+
+  std::vector<std::wstring> argStrings;
+  CopyArgsToWStrings(m_Opts.Args, CoreOption, argStrings);
+
+  std::vector<LPCWSTR> args;
+  args.reserve(argStrings.size());
+  for (const std::wstring &a : argStrings)
+    args.push_back(a.data());
+
+  IFT(pLinker->Link(StringRefUtf16(m_Opts.EntryPoint),
+                    StringRefUtf16(m_Opts.TargetProfile), wpInputFiles.data(),
+                    wpInputFiles.size(), args.data(), args.size(),
+                    &pLinkResult));
+
+  HRESULT status;
+  IFT(pLinkResult->GetStatus(&status));
+  if (SUCCEEDED(status)) {
+    CComPtr<IDxcBlob> pContainer;
+    IFT(pLinkResult->GetResult(&pContainer));
+    if (pContainer.p != nullptr) {
+      ActOnBlob(pContainer.p);
+    }
+  } else {
+    CComPtr<IDxcBlobEncoding> pErrors;
+    IFT(pLinkResult->GetErrorBuffer(&pErrors));
+    if (pErrors != nullptr) {
+      printf("Link failed:\n%s",
+             static_cast<char *>(pErrors->GetBufferPointer()));
+    }
+    return 1;
+  }
+  return 0;
 }
 
 int DxcContext::DumpBinary() {
@@ -879,12 +930,6 @@ void DxcContext::Preprocess() {
     IFT(pPreprocessResult->GetResult(&pProgram));
     WriteBlobToFile(pProgram, m_Opts.Preprocess, m_Opts.DefaultTextCodePage);
   }
-}
-
-static void WriteString(HANDLE hFile, _In_z_ LPCSTR value, LPCWSTR pFileName) {
-  DWORD written;
-  if (FALSE == WriteFile(hFile, value, strlen(value) * sizeof(value[0]), &written, nullptr))
-    IFT_Data(HRESULT_FROM_WIN32(GetLastError()), pFileName);
 }
 
 void DxcContext::WriteHeader(IDxcBlobEncoding *pDisassembly, IDxcBlob *pCode,
@@ -1063,9 +1108,14 @@ bool GetDLLProductVersionInfo(const char *dllPath, std::string &productVersion) 
   return false;
 }
 
-// Collects compiler/validator version info
-void DxcContext::GetCompilerVersionInfo(llvm::raw_string_ostream &OS) {
-  if (m_dxcSupport.IsEnabled()) {
+namespace dxc {
+
+// Writes compiler version info to stream
+void WriteDxCompilerVersionInfo(llvm::raw_ostream &OS,
+                                const char *ExternalLib,
+                                const char *ExternalFn,
+                                DxcDllSupport &DxcSupport) {
+  if (DxcSupport.IsEnabled()) {
     UINT32 compilerMajor = 1;
     UINT32 compilerMinor = 0;
     CComPtr<IDxcVersionInfo> VerInfo;
@@ -1076,10 +1126,12 @@ void DxcContext::GetCompilerVersionInfo(llvm::raw_string_ostream &OS) {
     CComPtr<IDxcVersionInfo2> VerInfo2;
 #endif // SUPPORT_QUERY_GIT_COMMIT_INFO
 
-    const char *compilerName =
-      m_Opts.ExternalFn.empty() ? "dxcompiler.dll" : m_Opts.ExternalFn.data();
+    const char *dllName = !ExternalLib ? "dxcompiler.dll" : ExternalLib;
+    std::string compilerName(dllName);
+    if (ExternalFn)
+      compilerName = compilerName + "!" + ExternalFn;
 
-    if (SUCCEEDED(CreateInstance(CLSID_DxcCompiler, &VerInfo))) {
+    if (SUCCEEDED(DxcSupport.CreateInstance(CLSID_DxcCompiler, &VerInfo))) {
       VerInfo->GetVersion(&compilerMajor, &compilerMinor);
 #ifdef SUPPORT_QUERY_GIT_COMMIT_INFO
       if (SUCCEEDED(VerInfo->QueryInterface(&VerInfo2)))
@@ -1088,13 +1140,16 @@ void DxcContext::GetCompilerVersionInfo(llvm::raw_string_ostream &OS) {
       OS << compilerName << ": " << compilerMajor << "." << compilerMinor;
     }
     // compiler.dll 1.0 did not support IdxcVersionInfo
-    else if (m_Opts.ExternalFn.empty()) {
+    else if (!ExternalLib) {
       OS << compilerName << ": " << 1 << "." << 0;
+    } else {
+      // ExternalLib/ExternalFn, no version info:
+      OS << compilerName;
     }
 
 #ifdef _WIN32
     unsigned int version[4];
-    if (GetDLLFileVersionInfo(compilerName, version)) {
+    if (GetDLLFileVersionInfo(dllName, version)) {
       // back-compat - old dev buidls had version 3.7.0.0
       if (version[0] == 3 && version[1] == 7 && version[2] == 0 && version[3] == 0) {
 #endif
@@ -1108,17 +1163,18 @@ void DxcContext::GetCompilerVersionInfo(llvm::raw_string_ostream &OS) {
       }
       else {
         std::string productVersion;
-        if (GetDLLProductVersionInfo(compilerName, productVersion)) {
+        if (GetDLLProductVersionInfo(dllName, productVersion)) {
           OS << " - " << productVersion;
         }
       }
     }
 #endif
   }
+}
 
-  // Print validator if exists
-  DxcDllSupport DxilSupport;
-  DxilSupport.InitializeForDll(L"dxil.dll", "DxcCreateInstance");
+// Writes compiler version info to stream
+void WriteDXILVersionInfo(llvm::raw_ostream &OS,
+                          DxcDllSupport &DxilSupport) {
   if (DxilSupport.IsEnabled()) {
     CComPtr<IDxcVersionInfo> VerInfo;
     if (SUCCEEDED(DxilSupport.CreateInstance(CLSID_DxcValidator, &VerInfo))) {
@@ -1142,9 +1198,87 @@ void DxcContext::GetCompilerVersionInfo(llvm::raw_string_ostream &OS) {
   }
 }
 
+} // namespace dxc
+
+// Collects compiler/validator version info
+void DxcContext::GetCompilerVersionInfo(llvm::raw_string_ostream &OS) {
+  WriteDxCompilerVersionInfo(OS,
+    m_Opts.ExternalLib.empty() ? nullptr : m_Opts.ExternalLib.data(),
+    m_Opts.ExternalFn.empty() ? nullptr : m_Opts.ExternalFn.data(),
+    m_dxcSupport);
+
+  // Print validator if exists
+  DxcDllSupport DxilSupport;
+  DxilSupport.InitializeForDll(L"dxil.dll", "DxcCreateInstance");
+  WriteDXILVersionInfo(OS, DxilSupport);
+}
+
 #ifndef VERSION_STRING_SUFFIX
 #define VERSION_STRING_SUFFIX ""
 #endif
+
+#ifdef _WIN32
+// Unhandled exception filter called when an unhandled exception occurs
+// to at least print an generic error message instead of crashing silently.
+// passes exception along to allow crash dumps to be generated
+static LONG CALLBACK ExceptionFilter(PEXCEPTION_POINTERS pExceptionInfo)
+{
+  static char scratch[32];
+
+  fputs("Internal compiler error: " , stderr);
+
+  if (!pExceptionInfo || !pExceptionInfo->ExceptionRecord) {
+    // No information at all, it's not much, but it's the best we can do
+    fputs("Unknown", stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+
+  switch(pExceptionInfo->ExceptionRecord->ExceptionCode) {
+    // native exceptions
+  case EXCEPTION_ACCESS_VIOLATION: {
+    fputs("access violation. Attempted to ", stderr);
+    if (pExceptionInfo->ExceptionRecord->ExceptionInformation[0])
+      fputs("write", stderr);
+    else
+      fputs("read", stderr);
+    fputs(" from address ", stderr);
+    sprintf_s(scratch, _countof(scratch), "0x%p\n", (void*)pExceptionInfo->ExceptionRecord->ExceptionInformation[1]);
+    fputs(scratch, stderr);
+  } break;
+  case EXCEPTION_STACK_OVERFLOW:
+    fputs("stack overflow\n", stderr);
+    break;
+    // LLVM exceptions
+  case STATUS_LLVM_ASSERT:
+    fputs("LLVM Assert\n", stderr);
+    break;
+  case STATUS_LLVM_UNREACHABLE:
+    fputs("LLVM Unreachable\n", stderr);
+    break;
+  case STATUS_LLVM_FATAL:
+    fputs("LLVM Fatal Error\n", stderr);
+    break;
+  case EXCEPTION_LOAD_LIBRARY_FAILED:
+    if (pExceptionInfo->ExceptionRecord->ExceptionInformation[0]) {
+      fputs("cannot not load ", stderr);
+      fputws((const wchar_t*)pExceptionInfo->ExceptionRecord->ExceptionInformation[0], stderr);
+      fputs(" library.\n", stderr);
+    }
+    else{
+      fputs("cannot not load library.\n", stderr);
+    }
+    break;
+  default:
+    fputs("Terminal Error ", stderr);
+    sprintf_s(scratch, _countof(scratch), "0x%08x\n", pExceptionInfo->ExceptionRecord->ExceptionCode);
+    fputs(scratch, stderr);
+  }
+
+  // Continue search to pass along the exception
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
 
 #ifdef _WIN32
 int dxc::main(int argc, const wchar_t **argv_) {
@@ -1185,6 +1319,12 @@ int dxc::main(int argc, const char **argv_) {
       dxcOpts.EntryPoint = "main";
     }
 
+#ifdef _WIN32
+    // Set exception handler if enabled
+    if (dxcOpts.HandleExceptions)
+      SetUnhandledExceptionFilter(ExceptionFilter);
+#endif
+
     // Setup a helper DLL.
     {
       std::string dllErrorString;
@@ -1223,6 +1363,10 @@ int dxc::main(int argc, const char **argv_) {
     else if (dxcOpts.DumpBin) {
       pStage = "Dumping existing binary";
       retVal = context.DumpBinary();
+    }
+    else if (dxcOpts.Link) {
+      pStage = "Linking";
+      retVal = context.Link();
     }
     else {
       pStage = "Compilation";

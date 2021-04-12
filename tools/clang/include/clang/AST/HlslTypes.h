@@ -76,12 +76,14 @@ enum HLSLScalarType {
   HLSLScalarType_float16,
   HLSLScalarType_float32,
   HLSLScalarType_float64,
+  HLSLScalarType_int8_4packed,
+  HLSLScalarType_uint8_4packed
 };
 
 HLSLScalarType MakeUnsigned(HLSLScalarType T);
 
 static const HLSLScalarType HLSLScalarType_minvalid = HLSLScalarType_bool;
-static const HLSLScalarType HLSLScalarType_max = HLSLScalarType_float64;
+static const HLSLScalarType HLSLScalarType_max = HLSLScalarType_uint8_4packed;
 static const size_t HLSLScalarTypeCount = static_cast<size_t>(HLSLScalarType_max) + 1;
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -197,7 +199,8 @@ public:
   enum UnusualAnnotationKind {
     UA_RegisterAssignment,
     UA_ConstantPacking,
-    UA_SemanticDecl
+    UA_SemanticDecl,
+    UA_PayloadAccessQualifier
   };
 private:
   const UnusualAnnotationKind Kind;
@@ -240,6 +243,21 @@ struct RegisterAssignment : public UnusualAnnotation
     return UA->getKind() == UA_RegisterAssignment;
   }
 };
+
+// <summary>Use this structure to capture a ': in/out' definiton.</summary>
+struct PayloadAccessAnnotation: public UnusualAnnotation {
+  /// <summary>Initializes a new PayloadAccessAnnotation in invalid state.</summary>
+  PayloadAccessAnnotation() : UnusualAnnotation(UA_PayloadAccessQualifier){};
+
+  DXIL::PayloadAccessQualifier qualifier = DXIL::PayloadAccessQualifier::NoAccess;
+  
+  llvm::SmallVector<DXIL::PayloadAccessShaderStage, 4> ShaderStages;
+
+  static bool classof(const UnusualAnnotation *UA) {
+    return UA->getKind() == UA_PayloadAccessQualifier;
+  }
+};
+
 
 /// <summary>Use this structure to capture a ': packoffset' definition.</summary>
 struct ConstantPacking : public UnusualAnnotation
@@ -322,7 +340,12 @@ clang::CXXRecordDecl* DeclareTemplateTypeWithHandle(
 
 clang::CXXRecordDecl* DeclareUIntTemplatedTypeWithHandle(
   clang::ASTContext& context, llvm::StringRef typeName, llvm::StringRef templateParamName);
+clang::CXXRecordDecl *DeclareConstantBufferViewType(clang::ASTContext& context, bool bTBuf);
 clang::CXXRecordDecl* DeclareRayQueryType(clang::ASTContext& context);
+clang::CXXRecordDecl *DeclareResourceType(clang::ASTContext &context,
+                                          bool bSampler);
+clang::VarDecl *DeclareBuiltinGlobal(llvm::StringRef name, clang::QualType Ty,
+                                     clang::ASTContext &context);
 
 /// <summary>Create a function template declaration for the specified method.</summary>
 /// <param name="context">AST context in which to work.</param>
@@ -362,6 +385,7 @@ bool HasHLSLMatOrientation(clang::QualType type, bool *pIsRowMajor = nullptr);
 bool IsHLSLMatRowMajor(clang::QualType type, bool defaultValue);
 bool IsHLSLUnsigned(clang::QualType type);
 bool HasHLSLUNormSNorm(clang::QualType type, bool *pIsSNorm = nullptr);
+bool HasHLSLGloballyCoherent(clang::QualType type);
 bool IsHLSLInputPatchType(clang::QualType type);
 bool IsHLSLOutputPatchType(clang::QualType type);
 bool IsHLSLPointStreamType(clang::QualType type);
@@ -369,6 +393,7 @@ bool IsHLSLLineStreamType(clang::QualType type);
 bool IsHLSLTriangleStreamType(clang::QualType type);
 bool IsHLSLStreamOutputType(clang::QualType type);
 bool IsHLSLResourceType(clang::QualType type);
+bool IsHLSLBufferViewType(clang::QualType type);
 bool IsHLSLNumericOrAggregateOfNumericType(clang::QualType type);
 bool IsHLSLNumericUserDefinedType(clang::QualType type);
 bool IsHLSLAggregateType(clang::QualType type);

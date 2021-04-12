@@ -286,7 +286,7 @@ public:
         IMalloc *pMalloc = pSession->GetMallocNoRef();
         IFR(FunctionSymbol::Create(pMalloc, pSession, m_ID, m_Node, m_TypeID, m_Node->getType(), ppRet));
         (*ppRet)->SetLexicalParent(m_ParentID);
-        (*ppRet)->SetName(CA2W(m_Node->getName().str().c_str()));
+        (*ppRet)->SetName(CA2W(m_Node->getName().str().c_str(), CP_UTF8));
         return S_OK;
     }
 
@@ -378,7 +378,7 @@ public:
         IMalloc *pMalloc = pSession->GetMallocNoRef();
         IFR(TypedefTypeSymbol::Create(pMalloc, pSession, m_ParentID, m_ID, m_Node, m_BaseTypeID, ppRet));
         (*ppRet)->SetLexicalParent(m_ParentID);
-        (*ppRet)->SetName(CA2W(m_Node->getName().str().c_str()));
+        (*ppRet)->SetName(CA2W(m_Node->getName().str().c_str(), CP_UTF8));
         return S_OK;
     }
 
@@ -413,7 +413,7 @@ public:
         IMalloc *pMalloc = pSession->GetMallocNoRef();
         IFR(VectorTypeSymbol::Create(pMalloc, pSession, m_ParentID, m_ID, m_Node, m_ElemTyID, m_NumElts, ppRet));
         (*ppRet)->SetLexicalParent(m_ParentID);
-        (*ppRet)->SetName(CA2W(m_Node->getName().str().c_str()));
+        (*ppRet)->SetName(CA2W(m_Node->getName().str().c_str(), CP_UTF8));
         return S_OK;
     }
 
@@ -468,7 +468,7 @@ public:
         IMalloc *pMalloc = pSession->GetMallocNoRef();
         IFR(GlobalVariableSymbol::Create(pMalloc, pSession, m_ID, m_GV, m_TypeID, m_Type, ppRet));
         (*ppRet)->SetLexicalParent(m_ParentID);
-        (*ppRet)->SetName(CA2W(m_GV->getName().str().c_str()));
+        (*ppRet)->SetName(CA2W(m_GV->getName().str().c_str(), CP_UTF8));
         (*ppRet)->SetIsHLSLData(true);
         return S_OK;
     }
@@ -538,7 +538,7 @@ public:
         IMalloc *pMalloc = pSession->GetMallocNoRef();
         IFR(LocalVariableSymbol::Create(pMalloc, pSession, m_ID, m_Node, m_TypeID, m_Type, m_VI->GetOffsetInUDT(), m_VI->GetDxilRegister(), ppRet));
         (*ppRet)->SetLexicalParent(m_ParentID);
-        (*ppRet)->SetName(CA2W(m_Node->getName().str().c_str()));
+        (*ppRet)->SetName(CA2W(m_Node->getName().str().c_str(), CP_UTF8));
         (*ppRet)->SetDataKind(m_Node->getTag() == llvm::dwarf::DW_TAG_arg_variable ? DataIsParam : DataIsLocal);
         return S_OK;
     }
@@ -572,7 +572,7 @@ public:
         IMalloc *pMalloc = pSession->GetMallocNoRef();
         IFR(UDTFieldSymbol::Create(pMalloc, pSession, m_ID, m_Node, m_TypeID, m_Type, ppRet));
         (*ppRet)->SetLexicalParent(m_ParentID);
-        (*ppRet)->SetName(CA2W(m_Node->getName().str().c_str()));
+        (*ppRet)->SetName(CA2W(m_Node->getName().str().c_str(), CP_UTF8));
         (*ppRet)->SetDataKind(m_Node->isStaticMember() ? DataIsStaticLocal : DataIsMember);
         return S_OK;
     }
@@ -814,7 +814,45 @@ HRESULT dxil_dia::hlsl_symbols::CompilandDetailsSymbol::GetChildren(std::vector<
 HRESULT dxil_dia::hlsl_symbols::CompilandEnvSymbol::CreateFlags(IMalloc *pMalloc, Session *pSession, Symbol **ppSym) {
   IFR(AllocAndInit(pMalloc, pSession, HlslCompilandEnvFlagsId, SymTagCompilandEnv, (CompilandEnvSymbol**)ppSym));
   (*ppSym)->SetName(L"hlslFlags");
-  (*ppSym)->SetValue(pSession->DxilModuleRef().GetGlobalFlags());
+
+  const char *specialCases[] = { "/T", "-T", "-D", "/D", "-E", "/E", };
+
+  llvm::MDNode *argsNode = pSession->Arguments()->getOperand(0);
+  // Construct a double null terminated string for defines with L"\0" as a delimiter
+  CComBSTR pBSTR;
+  for (llvm::MDNode::op_iterator it = argsNode->op_begin(); it != argsNode->op_end(); ++it) {
+    llvm::StringRef strRef = llvm::dyn_cast<llvm::MDString>(*it)->getString();
+
+    bool skip = false;
+    bool skipTwice = false;
+    for (unsigned i = 0; i < _countof(specialCases); i++) {
+      if (strRef == specialCases[i]) {
+        skipTwice = true;
+        skip = true;
+        break;
+      }
+      else if (strRef.startswith(specialCases[i])) {
+        skip = true;
+        break;
+      }
+    }
+
+    if (skip) {
+      if (skipTwice)
+        ++it;
+      continue;
+    }
+
+    std::string str(strRef.begin(), strRef.size());
+    CA2W cv(str.c_str(), CP_UTF8);
+    pBSTR.Append(cv);
+    pBSTR.Append(L"\0", 1);
+  }
+  pBSTR.Append(L"\0", 1);
+  VARIANT Variant;
+  Variant.bstrVal = pBSTR;
+  Variant.vt = VARENUM::VT_BSTR;
+  (*ppSym)->SetValue(&Variant);
   return S_OK;
 }
 
@@ -841,7 +879,7 @@ HRESULT dxil_dia::hlsl_symbols::CompilandEnvSymbol::CreateDefines(IMalloc *pMall
   for (llvm::MDNode::op_iterator it = definesNode->op_begin(); it != definesNode->op_end(); ++it) {
     llvm::StringRef strRef = llvm::dyn_cast<llvm::MDString>(*it)->getString();
     std::string str(strRef.begin(), strRef.size());
-    CA2W cv(str.c_str());
+    CA2W cv(str.c_str(), CP_UTF8);
     pBSTR.Append(cv);
     pBSTR.Append(L"\0", 1);
   }
@@ -904,7 +942,7 @@ STDMETHODIMP dxil_dia::hlsl_symbols::TypeSymbol::get_name(
     DXASSERT(!this->HasName(), "Setting type name multiple times.");
     std::string Name;
     IFR(m_lazySymbolName(m_pSession, &Name));
-    this->SetName(CA2W(Name.c_str()));
+    this->SetName(CA2W(Name.c_str(), CP_UTF8));
     m_lazySymbolName = nullptr;
   }
   return Symbol::get_name(pRetVal);
@@ -1210,7 +1248,9 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateFunctionsForCU(llvm::DI
     IFR(CreateType(SubProgram->getType(), &dwSubprogramTypeID));
     IFR(AddSymbol<symbol_factory::Function>(dwParentID, &dwNewFunID, SubProgram, dwSubprogramTypeID));
     m_ScopeToSym.insert(std::make_pair(SubProgram, dwNewFunID));
+  }
 
+  for (llvm::DISubprogram* SubProgram : CU->getSubprograms()) {
     if (llvm::Function *F = SubProgram->getFunction()) {
       IFR(CreateFunctionBlocksForFunction(F));
       FoundFunctions = true;
@@ -1349,7 +1389,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateSubroutineType(DWORD dw
           if (!name) {
             OS << "???";
           } else {
-            OS << CW2A((BSTR)name);
+            OS << CW2A((BSTR)name, CP_UTF8);
           }
         }
         if (first) {
@@ -1416,7 +1456,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateCompositeType(DWORD dwP
       if (!name) {
         OS << "???";
       } else {
-        OS << CW2A((BSTR)name);
+        OS << CW2A((BSTR)name, CP_UTF8);
       }
 
       OS << "[";
@@ -1613,7 +1653,7 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::HandleDerivedType(DWORD dwPar
     if (!name) {
       OS << "???";
     } else {
-      OS << CW2A((BSTR)name);
+      OS << CW2A((BSTR)name, CP_UTF8);
     }
     OS << Qualifier;
     return S_OK;
@@ -1775,13 +1815,15 @@ HRESULT dxil_dia::hlsl_symbols::SymbolManagerInit::CreateLocalVariables() {
     auto *LS = llvm::dyn_cast_or_null<llvm::DILocalScope>(CI->getDebugLoc()->getInlinedAtScope());
     auto SymIt = m_ScopeToSym.find(LS);
     if (SymIt == m_ScopeToSym.end()) {
-      return E_FAIL;
+        continue;
     }
 
     auto *LocalNameMetadata = llvm::dyn_cast<llvm::MetadataAsValue>(CI->getArgOperand(1));
     if (auto *LV = llvm::dyn_cast<llvm::DILocalVariable>(LocalNameMetadata->getMetadata())) {
       const DWORD dwParentID = SymIt->second;
-      IFR(CreateLocalVariable(dwParentID, LV));
+      if (FAILED(CreateLocalVariable(dwParentID, LV))) {
+          continue;
+      }
     }
   }
 

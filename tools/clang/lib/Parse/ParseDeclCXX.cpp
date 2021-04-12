@@ -1101,7 +1101,7 @@ void Parser::ParseMicrosoftInheritanceClassAttributes(ParsedAttributes &attrs) {
 /// true if there's any doubt, and is appropriate for insert-';' fixits.
 bool Parser::isValidAfterTypeSpecifier(bool CouldBeBitfield) {
   // HLSL Change Starts - abridged version of the table below
-  if (getLangOpts().HLSL) {
+  /*if (getLangOpts().HLSL) {
     switch (Tok.getKind()) {
     case tok::semi:
     case tok::identifier:
@@ -1111,7 +1111,7 @@ bool Parser::isValidAfterTypeSpecifier(bool CouldBeBitfield) {
     default:
       return false;
     }
-  }
+  }*/
   // HLSL Change Ends
   // This switch enumerates the valid "follow" set for type-specifiers.
   switch (Tok.getKind()) {

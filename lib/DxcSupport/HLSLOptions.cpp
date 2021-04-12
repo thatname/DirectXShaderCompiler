@@ -138,8 +138,12 @@ bool DxcOpts::IsLibraryProfile() {
   return TargetProfile.startswith("lib_");
 }
 
-bool DxcOpts::IsDebugInfoEnabled() {
+bool DxcOpts::GenerateFullDebugInfo() {
   return DebugInfo;
+}
+
+bool DxcOpts::GeneratePDB() {
+  return DebugInfo || SourceOnlyDebug;
 }
 
 bool DxcOpts::EmbedDebugInfo() {
@@ -147,7 +151,7 @@ bool DxcOpts::EmbedDebugInfo() {
 }
 
 bool DxcOpts::EmbedPDBName() {
-  return IsDebugInfoEnabled() || !DebugFile.empty();
+  return GeneratePDB() || !DebugFile.empty();
 }
 
 bool DxcOpts::DebugFileIsDirectory() {
@@ -234,6 +238,26 @@ static bool GetTargetVersionFromString(llvm::StringRef ref, unsigned *major, uns
   return true;
 }
 
+// Copied from CompilerInvocation since we parse our own diagnostic arguments
+static void addDiagnosticArgs(ArgList &Args, OptSpecifier Group,
+                              OptSpecifier GroupWithValue,
+                              std::vector<std::string> &Diagnostics) {
+  for (Arg *A : Args.filtered(Group)) {
+    if (A->getOption().getKind() == Option::FlagClass) {
+      // The argument is a pure flag (such as OPT_Wall or OPT_Wdeprecated). Add
+      // its name (minus the "W" or "R" at the beginning) to the warning list.
+      Diagnostics.push_back(A->getOption().getName().drop_front(1));
+    } else if (A->getOption().matches(GroupWithValue)) {
+      // This is -Wfoo= or -Rfoo=, where foo is the name of the diagnostic group.
+      Diagnostics.push_back(A->getOption().getName().drop_front(1).rtrim("=-"));
+    } else {
+      // Otherwise, add its value (for OPT_W_Joined and similar).
+      for (const char *Arg : A->getValues())
+        Diagnostics.emplace_back(Arg);
+    }
+  }
+}
+
 // SPIRV Change Starts
 #ifdef ENABLE_SPIRV_CODEGEN
 /// Checks and collects the arguments for -fvk-{b|s|t|u}-shift into *shifts.
@@ -283,7 +307,7 @@ static bool handleVkShiftArgs(const InputArgList &args, OptSpecifier id,
     return false;
   }
   return true;
-};
+}
 #endif
 // SPIRV Change Ends
 
@@ -365,6 +389,8 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
   DXASSERT(opts.ExternalLib.empty() == opts.ExternalFn.empty(),
            "else flow above is incorrect");
 
+  opts.PreciseOutputs = Args.getAllArgValues(OPT_precise_output);
+
   // when no-warnings option is present, do not output warnings.
   opts.OutputWarnings = Args.hasFlag(OPT_INVALID, OPT_no_warnings, true);
   opts.EntryPoint = Args.getLastArgValue(OPT_entrypoint);
@@ -444,6 +470,7 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
   opts.OutputReflectionFile = Args.getLastArgValue(OPT_Fre);
   opts.OutputRootSigFile = Args.getLastArgValue(OPT_Frs);
   opts.OutputShaderHashFile = Args.getLastArgValue(OPT_Fsh);
+  opts.ShowOptionNames = Args.hasFlag(OPT_fdiagnostics_show_option, OPT_fno_diagnostics_show_option, true);
   opts.UseColor = Args.hasFlag(OPT_Cc, OPT_INVALID, false);
   opts.UseInstructionNumbers = Args.hasFlag(OPT_Ni, OPT_INVALID, false);
   opts.UseInstructionByteOffsets = Args.hasFlag(OPT_No, OPT_INVALID, false);
@@ -451,6 +478,7 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
   opts.Preprocess = Args.getLastArgValue(OPT_P);
   opts.AstDump = Args.hasFlag(OPT_ast_dump, OPT_INVALID, false);
   opts.CodeGenHighLevel = Args.hasFlag(OPT_fcgl, OPT_INVALID, false);
+  opts.AllowPreserveValues = Args.hasFlag(OPT_preserve_intermediate_values, OPT_INVALID, false);
   opts.DebugInfo = Args.hasFlag(OPT__SLASH_Zi, OPT_INVALID, false);
   opts.DebugNameForBinary = Args.hasFlag(OPT_Zsb, OPT_INVALID, false);
   opts.DebugNameForSource = Args.hasFlag(OPT_Zss, OPT_INVALID, false);
@@ -463,6 +491,34 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
   opts.RootSignatureSource = Args.getLastArgValue(OPT_setrootsignature);
   opts.VerifyRootSignatureSource = Args.getLastArgValue(OPT_verifyrootsignature);
   opts.RootSignatureDefine = Args.getLastArgValue(OPT_rootsig_define);
+  opts.ScanLimit = 0;
+  llvm::StringRef limit = Args.getLastArgValue(OPT_memdep_block_scan_limit);
+  if (!limit.empty())
+    opts.ScanLimit = std::stoul(std::string(limit));
+
+  for (std::string opt : Args.getAllArgValues(OPT_opt_disable))
+    opts.DxcOptimizationToggles[llvm::StringRef(opt).lower()] = false;
+
+  for (std::string opt : Args.getAllArgValues(OPT_opt_enable)) {
+    if (!opts.DxcOptimizationToggles.insert ( {llvm::StringRef(opt).lower(), true} ).second) {
+      errors << "Contradictory use of -opt-disable and -opt-enable with \""
+             << llvm::StringRef(opt).lower() << "\"";
+      return 1;
+    }
+  }
+
+  std::vector<std::string> optSelects = Args.getAllArgValues(OPT_opt_select);
+  for (unsigned i = 0; i + 1 < optSelects.size(); i+=2) {
+    std::string optimization = llvm::StringRef(optSelects[i]).lower();
+    std::string selection = optSelects[i+1];
+    if (opts.DxcOptimizationSelects.count(optimization) &&
+        selection.compare(opts.DxcOptimizationSelects[optimization])) {
+      errors << "Contradictory -opt-selects for \""
+             << optimization << "\"";
+      return 1;
+    }
+    opts.DxcOptimizationSelects[optimization] = selection;
+  }
 
   if (!opts.ForceRootSigVer.empty() && opts.ForceRootSigVer != "rootsig_1_0" &&
       opts.ForceRootSigVer != "rootsig_1_1") {
@@ -560,6 +616,7 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
   opts.DefaultRowMajor = Args.hasFlag(OPT_Zpr, OPT_INVALID, false);
   opts.DefaultColMajor = Args.hasFlag(OPT_Zpc, OPT_INVALID, false);
   opts.DumpBin = Args.hasFlag(OPT_dumpbin, OPT_INVALID, false);
+  opts.Link = Args.hasFlag(OPT_link, OPT_INVALID, false);
   opts.NotUseLegacyCBufLoad = Args.hasFlag(OPT_no_legacy_cbuf_layout, OPT_INVALID, false);
   opts.NotUseLegacyCBufLoad = Args.hasFlag(OPT_not_use_legacy_cbuf_load_, OPT_INVALID, opts.NotUseLegacyCBufLoad);
   opts.PackPrefixStable = Args.hasFlag(OPT_pack_prefix_stable, OPT_INVALID, false);
@@ -573,6 +630,9 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
   opts.RecompileFromBinary = Args.hasFlag(OPT_recompile, OPT_INVALID, false);
   opts.StripDebug = Args.hasFlag(OPT_Qstrip_debug, OPT_INVALID, false);
   opts.EmbedDebug = Args.hasFlag(OPT_Qembed_debug, OPT_INVALID, false);
+  opts.SourceInDebugModule = Args.hasFlag(OPT_Qsource_in_debug_module, OPT_INVALID, false);
+  opts.SourceOnlyDebug = Args.hasFlag(OPT_Zs, OPT_INVALID, false);
+  opts.PdbInPrivate = Args.hasFlag(OPT_Qpdb_in_private, OPT_INVALID, false);
   opts.StripRootSignature = Args.hasFlag(OPT_Qstrip_rootsignature, OPT_INVALID, false);
   opts.StripPrivate = Args.hasFlag(OPT_Qstrip_priv, OPT_INVALID, false);
   opts.StripReflection = Args.hasFlag(OPT_Qstrip_reflect, OPT_INVALID, false);
@@ -586,8 +646,25 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
   opts.LegacyMacroExpansion = Args.hasFlag(OPT_flegacy_macro_expansion, OPT_INVALID, false);
   opts.LegacyResourceReservation = Args.hasFlag(OPT_flegacy_resource_reservation, OPT_INVALID, false);
   opts.ExportShadersOnly = Args.hasFlag(OPT_export_shaders_only, OPT_INVALID, false);
+  opts.PrintAfterAll = Args.hasFlag(OPT_print_after_all, OPT_INVALID, false);
   opts.ResMayAlias = Args.hasFlag(OPT_res_may_alias, OPT_INVALID, false);
   opts.ResMayAlias = Args.hasFlag(OPT_res_may_alias_, OPT_INVALID, opts.ResMayAlias);
+  opts.ForceZeroStoreLifetimes = Args.hasFlag(OPT_force_zero_store_lifetimes, OPT_INVALID, false);
+  // Lifetime markers on by default in 6.6 unless disabled explicitly
+  opts.EnableLifetimeMarkers = Args.hasFlag(OPT_enable_lifetime_markers, OPT_INVALID,
+                                            DXIL::CompareVersions(Major, Minor, 6, 6) >= 0) &&
+                              !Args.hasFlag(OPT_disable_lifetime_markers, OPT_INVALID, false);
+  opts.EnablePayloadQualifiers = Args.hasFlag(OPT_enable_payload_qualifiers, OPT_INVALID,
+                                            DXIL::CompareVersions(Major, Minor, 6, 7) >= 0); 
+  if (DXIL::CompareVersions(Major, Minor, 6, 8) < 0) {
+     opts.EnablePayloadQualifiers &= !Args.hasFlag(OPT_disable_payload_qualifiers, OPT_INVALID, false);
+  }
+  if (opts.EnablePayloadQualifiers && DXIL::CompareVersions(Major, Minor, 6, 6) < 0) {
+    errors << "Invalid target for payload access qualifiers. Only lib_6_6 and beyond are supported.";
+    return 1;
+  }
+
+  opts.HandleExceptions = !Args.hasFlag(OPT_disable_exception_handling, OPT_INVALID, false);
 
   if (opts.DefaultColMajor && opts.DefaultRowMajor) {
     errors << "Cannot specify /Zpr and /Zpc together, use /? to get usage information";
@@ -655,7 +732,9 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
 
   // XXX TODO: Sort this out, since it's required for new API, but a separate argument for old APIs.
   if ((flagsToInclude & hlsl::options::DriverOption) &&
-      opts.TargetProfile.empty() && !opts.DumpBin && opts.Preprocess.empty() && !opts.RecompileFromBinary) {
+      !(flagsToInclude & hlsl::options::RewriteOption) &&
+      opts.TargetProfile.empty() && !opts.DumpBin && opts.Preprocess.empty() && !opts.RecompileFromBinary
+      ) {
     // Target profile is required in arguments only for drivers when compiling;
     // APIs take this through an argument.
     errors << "Target profile argument is missing";
@@ -723,11 +802,16 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
     return 1;
   }
 
+  addDiagnosticArgs(Args, OPT_W_Group, OPT_W_value_Group, opts.Warnings);
+
+
     // SPIRV Change Starts
 #ifdef ENABLE_SPIRV_CODEGEN
   opts.GenSPIRV = Args.hasFlag(OPT_spirv, OPT_INVALID, false);
   opts.SpirvOptions.invertY = Args.hasFlag(OPT_fvk_invert_y, OPT_INVALID, false);
   opts.SpirvOptions.invertW = Args.hasFlag(OPT_fvk_use_dx_position_w, OPT_INVALID, false);
+  opts.SpirvOptions.supportNonzeroBaseInstance =
+      Args.hasFlag(OPT_fvk_support_nonzero_base_instance, OPT_INVALID, false);
   opts.SpirvOptions.useGlLayout = Args.hasFlag(OPT_fvk_use_gl_layout, OPT_INVALID, false);
   opts.SpirvOptions.useDxLayout = Args.hasFlag(OPT_fvk_use_dx_layout, OPT_INVALID, false);
   opts.SpirvOptions.useScalarLayout = Args.hasFlag(OPT_fvk_use_scalar_layout, OPT_INVALID, false);
@@ -736,6 +820,7 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
   opts.SpirvOptions.noWarnEmulatedFeatures = Args.hasFlag(OPT_Wno_vk_emulated_features, OPT_INVALID, false);
   opts.SpirvOptions.flattenResourceArrays =
       Args.hasFlag(OPT_fspv_flatten_resource_arrays, OPT_INVALID, false);
+  opts.SpirvOptions.autoShiftBindings = Args.hasFlag(OPT_fvk_auto_shift_bindings, OPT_INVALID, false);
 
   if (!handleVkShiftArgs(Args, OPT_fvk_b_shift, "b", &opts.SpirvOptions.bShift, errors) ||
       !handleVkShiftArgs(Args, OPT_fvk_t_shift, "t", &opts.SpirvOptions.tShift, errors) ||
@@ -758,6 +843,7 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
 
   opts.SpirvOptions.debugInfoFile = opts.SpirvOptions.debugInfoSource = false;
   opts.SpirvOptions.debugInfoLine = opts.SpirvOptions.debugInfoTool = false;
+  opts.SpirvOptions.debugInfoRich = false;
   if (Args.hasArg(OPT_fspv_debug_EQ)) {
     opts.DebugInfo = true;
     for (const Arg *A : Args.filtered(OPT_fspv_debug_EQ)) {
@@ -773,6 +859,16 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
         opts.SpirvOptions.debugInfoLine = true;
       } else if (v == "tool") {
         opts.SpirvOptions.debugInfoTool = true;
+      } else if (v == "rich") {
+        opts.SpirvOptions.debugInfoFile = true;
+        opts.SpirvOptions.debugInfoSource = false;
+        opts.SpirvOptions.debugInfoLine = true;
+        opts.SpirvOptions.debugInfoRich = true;
+      } else if (v == "rich-with-source") {
+        opts.SpirvOptions.debugInfoFile = true;
+        opts.SpirvOptions.debugInfoSource = true;
+        opts.SpirvOptions.debugInfoLine = true;
+        opts.SpirvOptions.debugInfoRich = true;
       } else {
         errors << "unknown SPIR-V debug info control parameter: " << v;
         return 1;
@@ -807,6 +903,7 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
   if (Args.hasFlag(OPT_spirv, OPT_INVALID, false) ||
       Args.hasFlag(OPT_fvk_invert_y, OPT_INVALID, false) ||
       Args.hasFlag(OPT_fvk_use_dx_position_w, OPT_INVALID, false) ||
+      Args.hasFlag(OPT_fvk_support_nonzero_base_instance, OPT_INVALID, false) ||
       Args.hasFlag(OPT_fvk_use_gl_layout, OPT_INVALID, false) ||
       Args.hasFlag(OPT_fvk_use_dx_layout, OPT_INVALID, false) ||
       Args.hasFlag(OPT_fvk_use_scalar_layout, OPT_INVALID, false) ||
@@ -814,6 +911,7 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
       Args.hasFlag(OPT_fspv_reflect, OPT_INVALID, false) ||
       Args.hasFlag(OPT_Wno_vk_ignored_features, OPT_INVALID, false) ||
       Args.hasFlag(OPT_Wno_vk_emulated_features, OPT_INVALID, false) ||
+      Args.hasFlag(OPT_fvk_auto_shift_bindings, OPT_INVALID, false) ||
       !Args.getLastArgValue(OPT_fvk_stage_io_order_EQ).empty() ||
       !Args.getLastArgValue(OPT_fspv_debug_EQ).empty() ||
       !Args.getLastArgValue(OPT_fspv_extension_EQ).empty() ||
@@ -840,6 +938,16 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
     return 1;
   }
 
+  if (opts.DebugInfo && opts.SourceOnlyDebug) {
+    errors << "Cannot specify both /Zi and /Zs";
+    return 1;
+  }
+
+  if (opts.SourceInDebugModule && opts.SourceOnlyDebug) {
+    errors << "Cannot specify both /Qsource_in_debug_module and /Zs";
+    return 1;
+  }
+
   if (opts.DebugInfo && !opts.DebugNameForBinary && !opts.DebugNameForSource) {
     opts.DebugNameForBinary = true;
   } else if (opts.DebugNameForBinary && opts.DebugNameForSource) {
@@ -847,9 +955,28 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
     return 1;
   }
 
-  if (opts.DebugNameForSource && !opts.DebugInfo) {
-    errors << "/Zss requires debug info (/Zi)";
+  if (opts.DebugNameForSource && (!opts.DebugInfo && !opts.SourceOnlyDebug)) {
+    errors << "/Zss requires debug info (/Zi or /Zs)";
     return 1;
+  }
+
+  // Rewriter Options
+  if (flagsToInclude & hlsl::options::RewriteOption) {
+    opts.RWOpt.Unchanged = Args.hasFlag(OPT_rw_unchanged, OPT_INVALID, false);
+    opts.RWOpt.SkipFunctionBody = Args.hasFlag(OPT_rw_skip_function_body, OPT_INVALID, false);
+    opts.RWOpt.SkipStatic = Args.hasFlag(OPT_rw_skip_static, OPT_INVALID, false);
+    opts.RWOpt.GlobalExternByDefault = Args.hasFlag(OPT_rw_global_extern_by_default, OPT_INVALID, false);
+    opts.RWOpt.KeepUserMacro = Args.hasFlag(OPT_rw_keep_user_macro, OPT_INVALID, false);
+    opts.RWOpt.ExtractEntryUniforms = Args.hasFlag(OPT_rw_extract_entry_uniforms, OPT_INVALID, false);
+    opts.RWOpt.RemoveUnusedGlobals = Args.hasFlag(OPT_rw_remove_unused_globals, OPT_INVALID, false);
+    opts.RWOpt.RemoveUnusedFunctions = Args.hasFlag(OPT_rw_remove_unused_functions, OPT_INVALID, false);
+    opts.RWOpt.WithLineDirective = Args.hasFlag(OPT_rw_line_directive, OPT_INVALID, false);
+    if (opts.EntryPoint.empty() &&
+        (opts.RWOpt.RemoveUnusedGlobals || opts.RWOpt.ExtractEntryUniforms ||
+         opts.RWOpt.RemoveUnusedFunctions)) {
+      errors << "-remove-unused-globals, -remove-unused-functions and -extract-entry-uniforms requires entry point (-E) to be specified.";
+      return 1;
+    }
   }
 
   opts.Args = std::move(Args);

@@ -202,6 +202,17 @@ std::unique_ptr<llvm::Module> LoadModuleFromBitcode(llvm::MemoryBuffer *MB,
   return std::unique_ptr<llvm::Module>(pModule.get().release());
 }
 
+std::unique_ptr<llvm::Module> LoadModuleFromBitcodeLazy(std::unique_ptr<llvm::MemoryBuffer> &&MB,
+  llvm::LLVMContext &Ctx, std::string &DiagStr)
+{
+  // Note: the DiagStr is not used.
+  auto pModule = llvm::getLazyBitcodeModule(std::move(MB), Ctx, nullptr, true);
+  if (!pModule) {
+    return nullptr;
+  }
+  return std::unique_ptr<llvm::Module>(pModule.get().release());
+}
+
 std::unique_ptr<llvm::Module> LoadModuleFromBitcode(llvm::StringRef BC,
   llvm::LLVMContext &Ctx,
   std::string &DiagStr) {
@@ -210,56 +221,147 @@ std::unique_ptr<llvm::Module> LoadModuleFromBitcode(llvm::StringRef BC,
   return LoadModuleFromBitcode(pBitcodeBuf.get(), Ctx, DiagStr);
 }
 
+
+DIGlobalVariable *FindGlobalVariableDebugInfo(GlobalVariable *GV,
+                                              DebugInfoFinder &DbgInfoFinder) {
+  struct GlobalFinder {
+    GlobalVariable *GV;
+    bool operator()(llvm::DIGlobalVariable *const arg) const {
+      return arg->getVariable() == GV;
+    }
+  };
+  GlobalFinder F = {GV};
+  DebugInfoFinder::global_variable_iterator Found =
+      std::find_if(DbgInfoFinder.global_variables().begin(),
+                   DbgInfoFinder.global_variables().end(), F);
+  if (Found != DbgInfoFinder.global_variables().end()) {
+    return *Found;
+  }
+  return nullptr;
+}
+
+static void EmitWarningOrErrorOnInstruction(Instruction *I, Twine Msg,
+                                            DiagnosticSeverity severity);
+
 // If we don't have debug location and this is select/phi,
 // try recursing users to find instruction with debug info.
 // Only recurse phi/select and limit depth to prevent doing
 // too much work if no debug location found.
-static bool EmitErrorOnInstructionFollowPhiSelect(
-    Instruction *I, StringRef Msg, unsigned depth=0) {
+static bool EmitWarningOrErrorOnInstructionFollowPhiSelect(Instruction *I,
+                                                           Twine Msg,
+                                                           DiagnosticSeverity severity,
+                                                           unsigned depth = 0) {
   if (depth > 4)
     return false;
   if (I->getDebugLoc().get()) {
-    EmitErrorOnInstruction(I, Msg);
+    EmitWarningOrErrorOnInstruction(I, Msg, severity);
     return true;
   }
   if (isa<PHINode>(I) || isa<SelectInst>(I)) {
     for (auto U : I->users())
       if (Instruction *UI = dyn_cast<Instruction>(U))
-        if (EmitErrorOnInstructionFollowPhiSelect(UI, Msg, depth+1))
+        if (EmitWarningOrErrorOnInstructionFollowPhiSelect(UI, Msg, severity,
+                                                           depth + 1))
           return true;
   }
   return false;
 }
 
-std::string FormatMessageAtLocation(const DebugLoc &DL, const Twine& Msg) {
-  std::string locString;
-  raw_string_ostream os(locString);
-  DL.print(os);
-  os << ": " << Msg;
-  return os.str();
-}
-
-Twine FormatMessageWithoutLocation(const Twine& Msg) {
-  return Msg + " Use /Zi for source location.";
-}
-
-void EmitErrorOnInstruction(Instruction *I, StringRef Msg) {
+static void EmitWarningOrErrorOnInstruction(Instruction *I, Twine Msg,
+                                            DiagnosticSeverity severity) {
   const DebugLoc &DL = I->getDebugLoc();
-  if (DL.get()) {
-    I->getContext().emitError(FormatMessageAtLocation(DL, Msg));
-    return;
-  } else if (isa<PHINode>(I) || isa<SelectInst>(I)) {
-    if (EmitErrorOnInstructionFollowPhiSelect(I, Msg))
+  if (!DL.get() && (isa<PHINode>(I) || isa<SelectInst>(I))) {
+    if (EmitWarningOrErrorOnInstructionFollowPhiSelect(I, Msg, severity))
       return;
   }
 
-  I->getContext().emitError(FormatMessageWithoutLocation(Msg));
+  I->getContext().diagnose(DiagnosticInfoDxil(I->getParent()->getParent(),
+                                              DL.get(), Msg, severity));
 }
 
-const StringRef kResourceMapErrorMsg =
+void EmitErrorOnInstruction(Instruction *I, Twine Msg) {
+  EmitWarningOrErrorOnInstruction(I, Msg, DiagnosticSeverity::DS_Error);
+}
+
+void EmitWarningOnInstruction(Instruction *I, Twine Msg) {
+  EmitWarningOrErrorOnInstruction(I, Msg, DiagnosticSeverity::DS_Warning);
+}
+
+static void EmitWarningOrErrorOnFunction(llvm::LLVMContext &Ctx, Function *F, Twine Msg,
+                                         DiagnosticSeverity severity) {
+  DILocation *DLoc = nullptr;
+
+  if (DISubprogram *DISP = getDISubprogram(F)) {
+    DLoc = DILocation::get(F->getContext(), DISP->getLine(), 0,
+                           DISP, nullptr /*InlinedAt*/);
+  }
+  Ctx.diagnose(DiagnosticInfoDxil(F, DLoc, Msg, severity));
+}
+
+void EmitErrorOnFunction(llvm::LLVMContext &Ctx, Function *F, Twine Msg) {
+  EmitWarningOrErrorOnFunction(Ctx, F, Msg, DiagnosticSeverity::DS_Error);
+}
+
+void EmitWarningOnFunction(llvm::LLVMContext &Ctx, Function *F, Twine Msg) {
+  EmitWarningOrErrorOnFunction(Ctx, F, Msg, DiagnosticSeverity::DS_Warning);
+}
+
+static void EmitWarningOrErrorOnGlobalVariable(llvm::LLVMContext &Ctx, GlobalVariable *GV,
+                                               Twine Msg, DiagnosticSeverity severity) {
+  DIVariable *DIV = nullptr;
+
+  DILocation *DLoc = nullptr;
+
+  if (GV) {
+    Module &M = *GV->getParent();
+    if (hasDebugInfo(M)) {
+      DebugInfoFinder FinderObj;
+      DebugInfoFinder &Finder = FinderObj;
+      // Debug modules have no dxil modules. Use it if you got it.
+      if (M.HasDxilModule())
+        Finder = M.GetDxilModule().GetOrCreateDebugInfoFinder();
+      else
+        Finder.processModule(M);
+      DIV = FindGlobalVariableDebugInfo(GV, Finder);
+      if (DIV)
+        DLoc = DILocation::get(GV->getContext(), DIV->getLine(), 0,
+                               DIV->getScope(), nullptr /*InlinedAt*/);
+    }
+  }
+
+  Ctx.diagnose(DiagnosticInfoDxil(nullptr /*Function*/, DLoc, Msg, severity));
+}
+
+void EmitErrorOnGlobalVariable(llvm::LLVMContext &Ctx, GlobalVariable *GV, Twine Msg) {
+  EmitWarningOrErrorOnGlobalVariable(Ctx, GV, Msg, DiagnosticSeverity::DS_Error);
+}
+
+void EmitWarningOnGlobalVariable(llvm::LLVMContext &Ctx, GlobalVariable *GV, Twine Msg) {
+  EmitWarningOrErrorOnGlobalVariable(Ctx, GV, Msg, DiagnosticSeverity::DS_Warning);
+}
+
+const char *kResourceMapErrorMsg =
     "local resource not guaranteed to map to unique global resource.";
 void EmitResMappingError(Instruction *Res) {
   EmitErrorOnInstruction(Res, kResourceMapErrorMsg);
+}
+
+// Mostly just a locationless diagnostic output
+static void EmitWarningOrErrorOnContext(LLVMContext &Ctx, Twine Msg, DiagnosticSeverity severity) {
+  Ctx.diagnose(DiagnosticInfoDxil(nullptr /*Func*/, nullptr /*DLoc*/,
+                                  Msg, severity));
+}
+
+void EmitErrorOnContext(LLVMContext &Ctx, Twine Msg) {
+  EmitWarningOrErrorOnContext(Ctx, Msg, DiagnosticSeverity::DS_Error);
+}
+
+void EmitWarningOnContext(LLVMContext &Ctx, Twine Msg) {
+  EmitWarningOrErrorOnContext(Ctx, Msg, DiagnosticSeverity::DS_Warning);
+}
+
+void EmitNoteOnContext(LLVMContext &Ctx, Twine Msg) {
+  EmitWarningOrErrorOnContext(Ctx, Msg, DiagnosticSeverity::DS_Note);
 }
 
 void CollectSelect(llvm::Instruction *Inst,
@@ -327,6 +429,16 @@ bool SimplifyTrivialPHIs(BasicBlock *BB) {
     I->eraseFromParent();
 
   return Changed;
+}
+
+llvm::BasicBlock *GetSwitchSuccessorForCond(llvm::SwitchInst *Switch,llvm::ConstantInt *Cond) {
+  for (auto it = Switch->case_begin(), end = Switch->case_end(); it != end; it++) {
+    if (it.getCaseValue() == Cond) {
+      return it.getCaseSuccessor();
+      break;
+    }
+  }
+  return Switch->getDefaultDest();
 }
 
 static DbgValueInst *FindDbgValueInst(Value *Val) {
@@ -474,66 +586,150 @@ static bool ConsumePrefix(StringRef &Str, StringRef Prefix) {
   return true;
 }
 
+bool IsResourceSingleComponent(Type *Ty) {
+  if (llvm::ArrayType *arrType = llvm::dyn_cast<llvm::ArrayType>(Ty)) {
+    if (arrType->getArrayNumElements() > 1) {
+      return false;
+    }
+    return IsResourceSingleComponent(arrType->getArrayElementType());
+  } else if (llvm::StructType *structType =
+                 llvm::dyn_cast<llvm::StructType>(Ty)) {
+    if (structType->getStructNumElements() > 1) {
+      return false;
+    }
+    return IsResourceSingleComponent(structType->getStructElementType(0));
+  } else if (llvm::VectorType *vectorType =
+                 llvm::dyn_cast<llvm::VectorType>(Ty)) {
+    if (vectorType->getNumElements() > 1) {
+      return false;
+    }
+    return IsResourceSingleComponent(vectorType->getVectorElementType());
+  }
+  return true;
+}
+
+uint8_t GetResourceComponentCount(llvm::Type *Ty) {
+  if (llvm::ArrayType *arrType = llvm::dyn_cast<llvm::ArrayType>(Ty)) {
+    return arrType->getArrayNumElements() *
+           GetResourceComponentCount(arrType->getArrayElementType());
+  } else if (llvm::StructType *structType =
+                 llvm::dyn_cast<llvm::StructType>(Ty)) {
+    uint32_t Count = 0;
+    for (Type *EltTy : structType->elements())  {
+      Count += GetResourceComponentCount(EltTy);
+    }
+    DXASSERT(Count <= 4, "Component Count out of bound.");
+    return Count;
+  } else if (llvm::VectorType *vectorType =
+                 llvm::dyn_cast<llvm::VectorType>(Ty)) {
+    return vectorType->getNumElements();
+  }
+  return 1;
+}
+
 bool IsHLSLResourceType(llvm::Type *Ty) {
+  return GetHLSLResourceProperties(Ty).first;
+}
+
+static DxilResourceProperties MakeResourceProperties(hlsl::DXIL::ResourceKind Kind, bool UAV, bool ROV, bool Cmp) {
+  DxilResourceProperties Ret = {};
+  Ret.Basic.IsROV = ROV;
+  Ret.Basic.SamplerCmpOrHasCounter = Cmp;
+  Ret.Basic.IsUAV = UAV;
+  Ret.Basic.ResourceKind = (uint8_t)Kind;
+  return Ret;
+}
+
+std::pair<bool, DxilResourceProperties> GetHLSLResourceProperties(llvm::Type *Ty)
+{
+   using RetType = std::pair<bool, DxilResourceProperties>;
+   RetType FalseRet(false, DxilResourceProperties{});
+
   if (llvm::StructType *ST = dyn_cast<llvm::StructType>(Ty)) {
+    if (!ST->hasName())
+      return FalseRet;
+
     StringRef name = ST->getName();
     ConsumePrefix(name, "class.");
     ConsumePrefix(name, "struct.");
 
     if (name == "SamplerState")
-      return true;
+      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Sampler, false, false, false));
+
     if (name == "SamplerComparisonState")
-      return true;
+      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Sampler, false, false, /*cmp or counter*/true));
 
     if (name.startswith("AppendStructuredBuffer<"))
-      return true;
-    if (name.startswith("ConsumeStructuredBuffer<"))
-      return true;
+      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::StructuredBuffer, false, false, /*cmp or counter*/true));
 
-    if (name.startswith("ConstantBuffer<"))
-      return true;
+    if (name.startswith("ConsumeStructuredBuffer<"))
+      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::StructuredBuffer, false, false, /*cmp or counter*/true));
 
     if (name == "RaytracingAccelerationStructure")
-      return true;
+      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::RTAccelerationStructure, false, false, false));
+
+    if (name.startswith("ConstantBuffer<"))
+      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::CBuffer, false, false, false));
+
+    if (name.startswith("TextureBuffer<"))
+      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::TBuffer, false, false, false));
 
     if (ConsumePrefix(name, "FeedbackTexture2D")) {
-      ConsumePrefix(name, "Array");
-      return name.startswith("<");
+      hlsl::DXIL::ResourceKind kind = hlsl::DXIL::ResourceKind::Invalid;
+      if (ConsumePrefix(name, "Array"))
+        kind = hlsl::DXIL::ResourceKind::FeedbackTexture2DArray;
+      else
+        kind = hlsl::DXIL::ResourceKind::FeedbackTexture2D;
+
+      if (name.startswith("<"))
+        return RetType(true, MakeResourceProperties(kind, false, false, false));
+
+      return FalseRet;
     }
 
-    ConsumePrefix(name, "RasterizerOrdered");
-    ConsumePrefix(name, "RW");
+    bool ROV = ConsumePrefix(name, "RasterizerOrdered");
+    bool UAV = ConsumePrefix(name, "RW");
+
     if (name == "ByteAddressBuffer")
-      return true;
+      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::RawBuffer, UAV, ROV, false));
 
     if (name.startswith("Buffer<"))
-      return true;
+      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::TypedBuffer, UAV, ROV, false));
+
     if (name.startswith("StructuredBuffer<"))
-      return true;
+      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::StructuredBuffer, UAV, ROV, false));
 
     if (ConsumePrefix(name, "Texture")) {
       if (name.startswith("1D<"))
-        return true;
+        return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Texture1D, UAV, ROV, false));
+
       if (name.startswith("1DArray<"))
-        return true;
+        return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Texture1DArray, UAV, ROV, false));
+
       if (name.startswith("2D<"))
-        return true;
+        return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Texture2D, UAV, ROV, false));
+
       if (name.startswith("2DArray<"))
-        return true;
+        return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Texture2DArray, UAV, ROV, false));
+
       if (name.startswith("3D<"))
-        return true;
+        return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Texture3D, UAV, ROV, false));
+
       if (name.startswith("Cube<"))
-        return true;
+        return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::TextureCube, UAV, ROV, false));
+
       if (name.startswith("CubeArray<"))
-        return true;
+        return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::TextureCubeArray, UAV, ROV, false));
+
       if (name.startswith("2DMS<"))
-        return true;
+        return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Texture2DMS, UAV, ROV, false));
+
       if (name.startswith("2DMSArray<"))
-        return true;
-      return false;
+        return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Texture2DMSArray, UAV, ROV, false));
+      return FalseRet;
     }
   }
-  return false;
+  return FalseRet;
 }
 
 bool IsHLSLObjectType(llvm::Type *Ty) {
@@ -545,6 +741,9 @@ bool IsHLSLObjectType(llvm::Type *Ty) {
     StringRef name = ST->getName();
     // TODO: don't check names.
     if (name.startswith("dx.types.wave_t"))
+      return true;
+
+    if (name.compare("dx.types.Handle") == 0)
       return true;
 
     if (name.endswith("_slice_type"))
@@ -568,10 +767,28 @@ bool IsHLSLObjectType(llvm::Type *Ty) {
 
 bool IsHLSLRayQueryType(llvm::Type *Ty) {
   if (llvm::StructType *ST = dyn_cast<llvm::StructType>(Ty)) {
+    if (!ST->hasName())
+      return false;
     StringRef name = ST->getName();
     // TODO: don't check names.
     ConsumePrefix(name, "class.");
     if (name.startswith("RayQuery<"))
+      return true;
+  }
+  return false;
+}
+
+bool IsHLSLResourceDescType(llvm::Type *Ty) {
+  if (llvm::StructType *ST = dyn_cast<llvm::StructType>(Ty)) {
+    if (!ST->hasName())
+      return false;
+    StringRef name = ST->getName();
+
+    // TODO: don't check names.
+    if (name == ("struct..Resource"))
+      return true;
+
+    if (name == "struct..Sampler")
       return true;
   }
   return false;
