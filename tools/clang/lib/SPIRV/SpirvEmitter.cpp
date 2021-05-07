@@ -1089,7 +1089,10 @@ void SpirvEmitter::doFunctionDecl(const FunctionDecl *decl) {
       funcName = "src." + funcName;
       // Create wrapper for the entry function
       if (!emitEntryFunctionWrapper(decl, func))
+      {
+        spvBuilder.endFunction();
         return;
+      }
     }
     else
     {

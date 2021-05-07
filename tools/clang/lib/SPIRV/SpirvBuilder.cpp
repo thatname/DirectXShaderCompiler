@@ -103,7 +103,10 @@ SpirvVariable *SpirvBuilder::addFnVar(QualType valueType, SourceLocation loc,
 }
 
 void SpirvBuilder::endFunction() {
-  assert(function && "no active function");
+  // assert(function && "no active function");
+  if (!function)
+      return;
+
   mod->addFunctionToListOfSortedModuleFunctions(function);
   function = nullptr;
   insertPoint = nullptr;
