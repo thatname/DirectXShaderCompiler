@@ -6994,7 +6994,7 @@ public:
     BoolWidth = BoolAlign = 32;
 
     // using the Microsoft ABI.
-    TheCXXABI.set(TargetCXXABI::Microsoft);
+    TheCXXABI.set(TargetCXXABI::GenericItanium);
   }
   void getTargetDefines(const LangOptions &Opts,
                         MacroBuilder &Builder) const override {
