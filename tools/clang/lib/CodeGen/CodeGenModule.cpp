@@ -610,7 +610,7 @@ StringRef CodeGenModule::getMangledName(GlobalDecl GD) {
   if (!FoundStr.empty())
     return FoundStr;
 
-  const auto *ND = cast<NamedDecl>(GD.getDecl());
+  const auto *ND = cast<NamedDecl>(GD.getDecl());/*
   // HLSL Change Starts
   // Entry point doesn't get mangled
   if (ND->getKind() == Decl::Function &&
@@ -618,7 +618,7 @@ StringRef CodeGenModule::getMangledName(GlobalDecl GD) {
     ND->getNameAsString() == CodeGenOpts.HLSLEntryFunction) {
     return CodeGenOpts.HLSLEntryFunction;
   }
-  // HLSL Change Ends
+  // HLSL Change Ends*/
 
   SmallString<256> Buffer;
   StringRef Str;
