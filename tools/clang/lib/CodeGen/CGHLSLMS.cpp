@@ -2319,7 +2319,7 @@ void CGMSHLSLRuntime::AddHLSLFunctionInfo(Function *F, const FunctionDecl *FD) {
   bool isExportedEntry = profileAttributes != 0;
   if (isExportedEntry) {
     // use unmangled or mangled name depending on which is used for final entry function
-    StringRef name = isRay ? F->getName() : FD->getName();
+    StringRef name = isRay ? F->getName() : F->getName();
     if (!m_ExportMap.IsExported(name)) {
       isExportedEntry = false;
     }
@@ -2333,14 +2333,14 @@ void CGMSHLSLRuntime::AddHLSLFunctionInfo(Function *F, const FunctionDecl *FD) {
 
   // Save F to entry map.
   if (isExportedEntry) {
-    if (entryFunctionMap.count(FD->getName())) {
+    if (entryFunctionMap.count(F->getName())) {
       DiagnosticsEngine &Diags = CGM.getDiags();
       unsigned DiagID = Diags.getCustomDiagID(
           DiagnosticsEngine::Error,
           "redefinition of %0");
-      Diags.Report(FD->getLocStart(), DiagID) << FD->getName();
+      Diags.Report(FD->getLocStart(), DiagID) << F->getName();
     }
-    auto &Entry = entryFunctionMap[FD->getNameAsString()];
+    auto &Entry = entryFunctionMap[F->getName()];
     Entry.SL = FD->getLocation();
     Entry.Func= F;
   }
