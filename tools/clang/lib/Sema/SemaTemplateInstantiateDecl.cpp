@@ -1772,6 +1772,9 @@ TemplateDeclInstantiator::VisitCXXMethodDecl(CXXMethodDecl *D,
   if (D->isInlined())
     Method->setImplicitlyInline();
 
+  // Copy semantics for template instantiation.
+  Method->setUnusualAnnotations(D->getUnusualAnnotations());
+
   if (QualifierLoc)
     Method->setQualifierInfo(QualifierLoc);
 
@@ -3125,6 +3128,7 @@ static bool addInstantiatedParametersToScope(Sema &S, FunctionDecl *Function,
       assert(FParamIdx < Function->getNumParams());
       ParmVarDecl *FunctionParam = Function->getParamDecl(FParamIdx);
       FunctionParam->setDeclName(PatternParam->getDeclName());
+      FunctionParam->setUnusualAnnotations(PatternParam->getUnusualAnnotations());
       // If the parameter's type is not dependent, update it to match the type
       // in the pattern. They can differ in top-level cv-qualifiers, and we want
       // the pattern's type here. If the type is dependent, they can't differ,
@@ -3156,6 +3160,7 @@ static bool addInstantiatedParametersToScope(Sema &S, FunctionDecl *Function,
     for (unsigned Arg = 0; Arg < *NumArgumentsInExpansion; ++Arg) {
       ParmVarDecl *FunctionParam = Function->getParamDecl(FParamIdx);
       FunctionParam->setDeclName(PatternParam->getDeclName());
+      FunctionParam->setUnusualAnnotations(PatternParam->getUnusualAnnotations());
       if (!PatternDecl->getType()->isDependentType()) {
         Sema::ArgumentPackSubstitutionIndexRAII SubstIndex(S, Arg);
         QualType T = S.SubstType(PatternType, TemplateArgs,
