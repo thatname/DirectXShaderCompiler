@@ -455,6 +455,7 @@ SpirvEmitter::SpirvEmitter(CompilerInstance &ci)
                    spirvOptions),
       entryFunction(nullptr), curFunction(nullptr), curThis(nullptr),
       seenPushConstantAt(), isSpecConstantMode(false), needsLegalization(false),
+      mangle(ItaniumMangleContext::create(ci.getASTContext(), diags)),
       beforeHlslLegalization(false), mainSourceFile(nullptr) {
 
   // Get ShaderModel from command line hlsl profile option.
@@ -564,28 +565,28 @@ void SpirvEmitter::HandleTranslationUnit(ASTContext &context) {
 
   // The entry function is the seed of the queue.
   for (auto *decl : tu->decls()) {
-    if (auto *funcDecl = dyn_cast<FunctionDecl>(decl)) {
-      if (spvContext.isLib()) {
-        if (const auto *shaderAttr = funcDecl->getAttr<HLSLShaderAttr>()) {
-          // If we are compiling as a library then add everything that has a
-          // ShaderAttr.
-          addFunctionToWorkQueue(getShaderModelKind(shaderAttr->getStage()),
-                                 funcDecl, /*isEntryFunction*/ true);
-          numEntryPoints++;
-        } else /*if (funcDecl->getAttr<HLSLExportAttr>())*/ {
-          addFunctionToWorkQueue(spvContext.getCurrentShaderModelKind(),
-                                 funcDecl, /*isEntryFunction*/ false);
-        }
-      } else {
-        if (funcDecl->getName() == entryFunctionName) {
-          addFunctionToWorkQueue(spvContext.getCurrentShaderModelKind(),
-                                 funcDecl, /*isEntryFunction*/ true);
-          numEntryPoints++;
-        }
-      }
-    } else {
+    // if (auto *funcDecl = dyn_cast<FunctionDecl>(decl)) {
+    //   if (spvContext.isLib()) {
+    //     if (const auto *shaderAttr = funcDecl->getAttr<HLSLShaderAttr>()) {
+    //       // If we are compiling as a library then add everything that has a
+    //       // ShaderAttr.
+    //       addFunctionToWorkQueue(getShaderModelKind(shaderAttr->getStage()),
+    //                              funcDecl, /*isEntryFunction*/ true);
+    //       numEntryPoints++;
+    //     } else /*if (funcDecl->getAttr<HLSLExportAttr>())*/ {
+    //       addFunctionToWorkQueue(spvContext.getCurrentShaderModelKind(),
+    //                              funcDecl, /*isEntryFunction*/ false);
+    //     }
+    //   } else {
+    //     if (funcDecl->getName() == entryFunctionName) {
+    //       addFunctionToWorkQueue(spvContext.getCurrentShaderModelKind(),
+    //                              funcDecl, /*isEntryFunction*/ true);
+    //       numEntryPoints++;
+    //     }
+    //   }
+    // } else {
       doDecl(decl);
-    }
+    // }
 
     if (context.getDiagnostics().hasErrorOccurred())
       return;
@@ -594,13 +595,13 @@ void SpirvEmitter::HandleTranslationUnit(ASTContext &context) {
   // Translate all functions reachable from the entry function.
   // The queue can grow in the meanwhile; so need to keep evaluating
   // workQueue.size().
-  for (uint32_t i = 0; i < workQueue.size(); ++i) {
+  /*for (uint32_t i = 0; i < workQueue.size(); ++i) {
     const FunctionInfo *curEntryOrCallee = workQueue[i];
     spvContext.setCurrentShaderModelKind(curEntryOrCallee->shaderModelKind);
     doDecl(curEntryOrCallee->funcDecl);
     if (context.getDiagnostics().hasErrorOccurred())
       return;
-  }
+  }*/
 
   // Addressing and memory model are required in a valid SPIR-V module.
   spvBuilder.setMemoryModel(spv::AddressingModel::Logical,
@@ -615,9 +616,14 @@ void SpirvEmitter::HandleTranslationUnit(ASTContext &context) {
     // TODO: assign specific StageVars w.r.t. to entry point
     const FunctionInfo *entryInfo = workQueue[i];
     assert(entryInfo->isEntryFunction);
+    std::string funcName;
+    {
+        llvm::raw_string_ostream str(funcName);
+        mangle->mangleName(entryInfo->funcDecl, str);
+    }
     spvBuilder.addEntryPoint(
         getSpirvShaderStage(entryInfo->shaderModelKind),
-        entryInfo->entryFunction, entryInfo->funcDecl->getName(),
+        entryInfo->entryFunction, funcName,
         featureManager.isTargetEnvVulkan1p2OrAbove()
             ? spvBuilder.getModule()->getVariables()
             : llvm::ArrayRef<SpirvVariable *>(declIdMapper.collectStageVars()));
@@ -1062,21 +1068,34 @@ void SpirvEmitter::doFunctionDecl(const FunctionDecl *decl) {
 
   // This will allow the entry-point name to be something like
   // myNamespace::myEntrypointFunc.
-  std::string funcName = getFnName(decl);
+  std::string funcName;
+
+  {
+      llvm::raw_string_ostream str(funcName);
+      mangle->mangleName(decl, str);
+  }
+
   std::string debugFuncName = funcName;
 
   SpirvFunction *func = declIdMapper.getOrRegisterFn(decl);
 
-  const auto iter = functionInfoMap.find(decl);
+  /*const auto iter = functionInfoMap.find(decl);
   if (iter != functionInfoMap.end()) {
     const auto &entryInfo = iter->second;
-    if (entryInfo->isEntryFunction) {
+    if (entryInfo->isEntryFunction)*/ if (const auto* shaderAttr = decl->getAttr<HLSLShaderAttr>()) {
+      auto kind = getShaderModelKind(shaderAttr->getStage());
+      spvContext.setCurrentShaderModelKind(kind);
+      addFunctionToWorkQueue(kind, decl, /*isEntryFunction*/ true);
       funcName = "src." + funcName;
       // Create wrapper for the entry function
       if (!emitEntryFunctionWrapper(decl, func))
         return;
     }
-  }
+    else
+    {
+      addFunctionToWorkQueue(hlsl::ShaderModel::Kind::Library, decl, /*isEntryFunction*/ false);
+    }
+  /*}*/
 
   const QualType retType =
       declIdMapper.getTypeAndCreateCounterForPotentialAliasVar(decl);
@@ -1371,9 +1390,13 @@ void SpirvEmitter::doRecordDecl(const RecordDecl *recordDecl) {
   // RecordDecl. For those defined in the translation unit,
   // their VarDecls do not have initializer.
   for (auto *subDecl : recordDecl->decls())
-    if (auto *varDecl = dyn_cast<VarDecl>(subDecl))
+    if (auto *varDecl = dyn_cast<VarDecl>(subDecl)) {
       if (varDecl->isStaticDataMember() && varDecl->hasInit())
         doVarDecl(varDecl);
+    }
+    else {
+      doDecl(subDecl);
+    }
 }
 
 void SpirvEmitter::doEnumDecl(const EnumDecl *decl) {
@@ -2368,8 +2391,8 @@ SpirvInstruction *SpirvEmitter::processCall(const CallExpr *callExpr) {
   assert(vars.size() == args.size());
 
   // Push the callee into the work queue if it is not there.
-  addFunctionToWorkQueue(spvContext.getCurrentShaderModelKind(), callee,
-                         /*isEntryFunction*/ false);
+  //addFunctionToWorkQueue(spvContext.getCurrentShaderModelKind(), callee,
+  //                       /*isEntryFunction*/ false);
 
   const QualType retType =
       declIdMapper.getTypeAndCreateCounterForPotentialAliasVar(callee);
@@ -11297,12 +11320,17 @@ bool SpirvEmitter::emitEntryFunctionWrapper(const FunctionDecl *decl,
   // Used by HS/DS/GS for the additional arrayness, zero means not an array.
   uint32_t inputArraySize = 0;
   uint32_t outputArraySize = 0;
-
+  
+  std::string funcName;
+  {
+      llvm::raw_string_ostream str(funcName);
+      mangle->mangleName(decl, str);
+  }
   // The wrapper entry function surely does not have pre-assigned <result-id>
   // for it like other functions that got added to the work queue following
   // function calls. And the wrapper is the entry function.
   entryFunction = spvBuilder.beginFunction(
-      astContext.VoidTy, decl->getLocStart(), decl->getName());
+      astContext.VoidTy, decl->getLocStart(), funcName);
 
   // Specify that entryFunction is an entry function wrapper.
   entryFunction->setEntryFunctionWrapper();

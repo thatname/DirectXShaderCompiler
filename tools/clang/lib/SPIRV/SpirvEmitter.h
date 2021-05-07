@@ -32,6 +32,7 @@
 #include "clang/SPIRV/SpirvBuilder.h"
 #include "clang/SPIRV/SpirvContext.h"
 #include "llvm/ADT/STLExtras.h"
+#include "clang/AST/Mangle.h"
 
 #include "DeclResultIdMapper.h"
 
@@ -1071,7 +1072,7 @@ private:
   CompilerInstance &theCompilerInstance;
   ASTContext &astContext;
   DiagnosticsEngine &diags;
-
+  std::unique_ptr<ItaniumMangleContext> mangle;
   SpirvCodeGenOptions &spirvOptions;
 
   /// \brief Entry function name, derived from the command line
