@@ -1397,7 +1397,7 @@ void SpirvEmitter::doRecordDecl(const RecordDecl *recordDecl) {
       if (varDecl->isStaticDataMember() && varDecl->hasInit())
         doVarDecl(varDecl);
     }
-    else {
+    else if (!isa<FieldDecl>(subDecl)) {
       doDecl(subDecl);
     }
 }
