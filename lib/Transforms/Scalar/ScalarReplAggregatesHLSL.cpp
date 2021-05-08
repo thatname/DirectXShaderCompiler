@@ -334,12 +334,12 @@ static unsigned IsPtrUsedByLoweredFn(
             "otherwise, multiple uses in single call");
       }
 
-    } else if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(user)) {
+    } else if (GEPOperator *GEP = dyn_cast<GEPOperator>(user)) {
       // Not what we are looking for if GEP result is not [array of] struct.
       // If use is under struct member, we can still SROA the outer struct.
       if (!dxilutil::StripArrayTypes(GEP->getType()->getPointerElementType())
             ->isStructTy() ||
-          FindFirstStructMemberIdxInGEP(cast<GEPOperator>(GEP)))
+          FindFirstStructMemberIdxInGEP(GEP))
         continue;
       if (IsPtrUsedByLoweredFn(user, CollectedUses))
         bFound = true;
@@ -350,7 +350,7 @@ static unsigned IsPtrUsedByLoweredFn(
 
     } else if (ConstantExpr *CE = dyn_cast<ConstantExpr>(user)) {
       unsigned opcode = CE->getOpcode();
-      if (opcode == Instruction::AddrSpaceCast || opcode == Instruction::GetElementPtr)
+      if (opcode == Instruction::AddrSpaceCast)
         if (IsPtrUsedByLoweredFn(user, CollectedUses))
           bFound = true;
     }
@@ -5775,8 +5775,7 @@ void SROA_Parameter_HLSL::createFlattenedFunction(Function *F) {
   if (m_pHLModule->HasDxilFunctionProps(F)) {
     DxilFunctionProps &funcProps = m_pHLModule->GetDxilFunctionProps(F);
     std::unique_ptr<DxilFunctionProps> flatFuncProps = llvm::make_unique<DxilFunctionProps>();
-    flatFuncProps->shaderKind = funcProps.shaderKind;
-    flatFuncProps->ShaderProps = funcProps.ShaderProps;
+    *flatFuncProps = funcProps;
     m_pHLModule->AddDxilFunctionProps(flatF, flatFuncProps);
     if (funcProps.shaderKind == ShaderModel::Kind::Vertex) {
       auto &VS = funcProps.ShaderProps.VS;
