@@ -1643,8 +1643,8 @@ bool DeclResultIdMapper::checkSemanticDuplication(bool forInput) {
 }
 
 bool DeclResultIdMapper::finalizeStageIOLocations(bool forInput) {
-  if (!checkSemanticDuplication(forInput))
-    return false;
+  /* if (!checkSemanticDuplication(forInput))
+      return false;*/
 
   // Returns false if the given StageVar is an input/output variable without
   // explicit location assignment. Otherwise, returns true.
@@ -1680,12 +1680,12 @@ bool DeclResultIdMapper::finalizeStageIOLocations(bool forInput) {
       }
 
       // Make sure the same location is not assigned more than once
-      if (locSet.isLocUsed(loc, idx)) {
+      /*if (locSet.isLocUsed(loc, idx)) {
         emitError("stage %select{output|input}0 location #%1 already assigned",
                   attrLoc)
             << forInput << loc;
         noError = false;
-      }
+      }*/
       locSet.useLoc(loc, idx);
 
       spvBuilder.decorateLocation(var.getSpirvInstr(), loc);
