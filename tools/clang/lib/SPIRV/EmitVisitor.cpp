@@ -410,7 +410,7 @@ bool EmitVisitor::visit(SpirvFunction *fn, Phase phase) {
     if (fn->isRelaxedPrecision())
       typeHandler.emitDecoration(getOrAssignResultId<SpirvFunction>(fn),
                                  spv::Decoration::RelaxedPrecision, {});
-    if (fn->isDeclaration())
+    /*if (fn->isDeclaration())
     {
         auto words = string::encodeSPIRVString(fn->getFunctionName());
         words.push_back((uint32_t)spv::LinkageType::Import);
@@ -423,7 +423,7 @@ bool EmitVisitor::visit(SpirvFunction *fn, Phase phase) {
         words.push_back((uint32_t)spv::LinkageType::Export);
         typeHandler.emitDecoration(getOrAssignResultId<SpirvFunction>(fn),
             spv::Decoration::LinkageAttributes, llvm::ArrayRef<uint32_t>(words));
-    }
+    }*/
   }
   // After emitting the function
   else if (phase == Visitor::Phase::Done) {
