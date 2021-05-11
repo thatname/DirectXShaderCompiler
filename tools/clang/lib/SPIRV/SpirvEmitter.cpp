@@ -621,12 +621,13 @@ void SpirvEmitter::HandleTranslationUnit(ASTContext &context) {
         llvm::raw_string_ostream str(funcName);
         mangle->mangleName(entryInfo->funcDecl, str);
     }
+	std::vector<SpirvVariable *> variables;
     spvBuilder.addEntryPoint(
         getSpirvShaderStage(entryInfo->shaderModelKind),
-        entryInfo->entryFunction, funcName,
-        featureManager.isTargetEnvVulkan1p2OrAbove()
+        entryInfo->entryFunction, funcName, variables
+        /*featureManager.isTargetEnvVulkan1p2OrAbove()
             ? spvBuilder.getModule()->getVariables()
-            : llvm::ArrayRef<SpirvVariable *>(declIdMapper.collectStageVars()));
+            : llvm::ArrayRef<SpirvVariable *>(declIdMapper.collectStageVars())*/);
   }
 
   // Add Location decorations to stage input/output variables.
