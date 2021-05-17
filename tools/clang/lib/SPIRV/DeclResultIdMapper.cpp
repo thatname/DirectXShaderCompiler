@@ -1718,7 +1718,7 @@ bool DeclResultIdMapper::finalizeStageIOLocations(bool forInput) {
 
     // We should special rules for SV_Target: the location number comes from the
     // semantic string index.
-    if (semaInfo.isTarget()) {
+    if (semaInfo.isTarget() || semaInfo.name == "LOCATION") {
       spvBuilder.decorateLocation(var.getSpirvInstr(), semaInfo.index);
       locSet.useLoc(semaInfo.index);
     } else {
@@ -2281,7 +2281,7 @@ bool DeclResultIdMapper::createStageVars(
         sigPoint, *semanticToUse, builtinAttr, evalType,
         // For HS/DS/GS, we have already stripped the outmost arrayness on type.
         getLocationCount(astContext, type));
-    const auto name = namePrefix.str() + "." + stageVar.getSemanticStr();
+    const auto name = /*namePrefix.str()*/(std::string)decl->getName() + "." + stageVar.getSemanticStr();
     SpirvVariable *varInstr =
         createSpirvStageVar(&stageVar, decl, name, semanticToUse->loc);
 
@@ -2748,7 +2748,7 @@ bool DeclResultIdMapper::createPayloadStageVars(
   if (!type->isStructureType()) {
     StageVar stageVar(sigPoint, /*semaInfo=*/{}, /*builtinAttr=*/nullptr, type,
                       getLocationCount(astContext, type));
-    const auto name = namePrefix.str() + "." + decl->getNameAsString();
+    const auto name = /*namePrefix.str()*/ (std::string)decl->getName() + "." + decl->getNameAsString();
     SpirvVariable *varInstr =
         spvBuilder.addStageIOVar(type, sc, name, /*isPrecise=*/false, loc);
 
