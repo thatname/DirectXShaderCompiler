@@ -454,7 +454,7 @@ SpirvEmitter::SpirvEmitter(CompilerInstance &ci)
       declIdMapper(astContext, spvContext, spvBuilder, *this, featureManager,
                    spirvOptions),
       entryFunction(nullptr), curFunction(nullptr), curThis(nullptr),
-      seenPushConstantAt(), isSpecConstantMode(false), needsLegalization(false),
+      seenPushConstantAt(), isSpecConstantMode(false), needsLegalization(true),
       mangle(ItaniumMangleContext::create(ci.getASTContext(), diags)),
       beforeHlslLegalization(false), mainSourceFile(nullptr) {
 
@@ -12381,6 +12381,7 @@ bool SpirvEmitter::spirvToolsLegalize(std::vector<uint32_t> *mod,
   }
   optimizer.RegisterPass(spvtools::CreateReplaceInvalidOpcodePass());
   optimizer.RegisterPass(spvtools::CreateCompactIdsPass());
+  optimizer.RegisterPass(spvtools::CreateInterfaceRepairPass());
 
   return optimizer.Run(mod->data(), mod->size(), mod, options);
 }
