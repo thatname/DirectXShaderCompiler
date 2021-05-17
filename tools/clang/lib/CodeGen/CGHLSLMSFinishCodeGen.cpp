@@ -1014,10 +1014,10 @@ void CloneShaderEntry(Function *ShaderF, StringRef EntryName, HLModule &HLM) {
   Function *F = CloneFunction(ShaderF, "", HLM.GetModule(), HLM.GetTypeSystem(),
                               HLM.GetTypeSystem());
 
-  F->takeName(ShaderF);
+  // F->takeName(ShaderF);
   F->setLinkage(GlobalValue::LinkageTypes::InternalLinkage);
   // Set to name before mangled.
-  ShaderF->setName(EntryName);
+  // ShaderF->setName(EntryName);
 
   DxilFunctionAnnotation *annot = HLM.GetFunctionAnnotation(F);
   DxilParameterAnnotation &cloneRetAnnot = annot->GetRetTypeAnnotation();
